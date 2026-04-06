@@ -1,5 +1,7 @@
 import argparse
+import csv
 import math
+import os
 import time
 from datetime import datetime
 
@@ -61,6 +63,29 @@ def build_parser() -> argparse.ArgumentParser:
 		help="Scale factor to convert px to mm (set from your calibration)",
 	)
 	parser.add_argument("--draw-points", type=int, default=140, help="Maximum vectors drawn per frame")
+	parser.add_argument(
+		"--export-fullfield",
+		action="store_true",
+		help="Enable per-point CSV export (mode B)",
+	)
+	parser.add_argument(
+		"--export-every",
+		type=int,
+		default=2,
+		help="Write per-point CSV every N frames",
+	)
+	parser.add_argument(
+		"--export-dir",
+		type=str,
+		default="logs",
+		help="Directory for per-point CSV export",
+	)
+	parser.add_argument(
+		"--export-prefix",
+		type=str,
+		default="flow_points",
+		help="Prefix for per-point CSV file",
+	)
 	return parser
 
 
@@ -272,6 +297,77 @@ def estimate_mm_per_px_from_grid(points: np.ndarray, nn_distance_mm: float) -> f
 	return float(nn_distance_mm / nn_px)
 
 
+def open_fullfield_export(export_dir: str, export_prefix: str):
+	os.makedirs(export_dir, exist_ok=True)
+	ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+	path = os.path.join(export_dir, f"{export_prefix}_{ts}.csv")
+	fh = open(path, "w", newline="", encoding="utf-8")
+	writer = csv.writer(fh)
+	writer.writerow(
+		[
+			"time_s",
+			"frame",
+			"point_id",
+			"origin_x_px",
+			"origin_y_px",
+			"current_x_px",
+			"current_y_px",
+			"raw_dx_px",
+			"raw_dy_px",
+			"raw_disp_px",
+			"local_dx_px",
+			"local_dy_px",
+			"local_disp_px",
+			"raw_dx_mm",
+			"raw_dy_mm",
+			"raw_disp_mm",
+			"local_dx_mm",
+			"local_dy_mm",
+			"local_disp_mm",
+		]
+	)
+	return fh, writer, path
+
+
+def write_fullfield_rows(
+	writer,
+	time_s: float,
+	frame_index: int,
+	point_ids: np.ndarray,
+	origin_xy: np.ndarray,
+	current_xy: np.ndarray,
+	raw_xy: np.ndarray,
+	raw_mag_px: np.ndarray,
+	local_xy: np.ndarray,
+	local_mag_px: np.ndarray,
+	px_to_mm: float,
+) -> None:
+	for idx in range(len(point_ids)):
+		writer.writerow(
+			[
+				f"{time_s:.6f}",
+				int(frame_index),
+				int(point_ids[idx]),
+				f"{origin_xy[idx, 0]:.4f}",
+				f"{origin_xy[idx, 1]:.4f}",
+				f"{current_xy[idx, 0]:.4f}",
+				f"{current_xy[idx, 1]:.4f}",
+				f"{raw_xy[idx, 0]:.6f}",
+				f"{raw_xy[idx, 1]:.6f}",
+				f"{raw_mag_px[idx]:.6f}",
+				f"{local_xy[idx, 0]:.6f}",
+				f"{local_xy[idx, 1]:.6f}",
+				f"{local_mag_px[idx]:.6f}",
+				f"{raw_xy[idx, 0] * px_to_mm:.6f}",
+				f"{raw_xy[idx, 1] * px_to_mm:.6f}",
+				f"{raw_mag_px[idx] * px_to_mm:.6f}",
+				f"{local_xy[idx, 0] * px_to_mm:.6f}",
+				f"{local_xy[idx, 1] * px_to_mm:.6f}",
+				f"{local_mag_px[idx] * px_to_mm:.6f}",
+			]
+		)
+
+
 def main() -> None:
 	args = build_parser().parse_args()
 
@@ -286,7 +382,9 @@ def main() -> None:
 
 	prev_gray = None
 	prev_pts = None
+	prev_ids = None
 	origin_pts = None
+	origin_ids = None
 	origin_valid = False
 	roi_mask = None
 	last_mask = None
@@ -300,6 +398,12 @@ def main() -> None:
 	origin_inv_transform = np.eye(3, dtype=np.float64)
 	calibration_start_global_t = None
 	calibration_info = f"scale={px_to_mm:.6f} mm/px"
+	next_point_id = 0
+	export_every = max(1, int(args.export_every))
+	export_enabled = bool(args.export_fullfield)
+	export_file = None
+	export_writer = None
+	export_path = ""
 	lut_img = cv2.applyColorMap(np.arange(256, dtype=np.uint8).reshape(-1, 1), cv2.COLORMAP_TURBO)
 	turbo_lut = lut_img[:, 0, :]
 
@@ -307,7 +411,11 @@ def main() -> None:
 	last_t = time.perf_counter()
 
 	print("Running realtime optical flow.")
-	print("Keys: q/ESC=quit, r=reseed, o=set origin, c=move-calib, g=grid-calib, s=save")
+	print("Keys: q/ESC=quit, r=reseed, o=set origin, c=move-calib, g=grid-calib, e=export on/off, s=save")
+
+	if export_enabled:
+		export_file, export_writer, export_path = open_fullfield_export(args.export_dir, args.export_prefix)
+		print(f"Per-point export enabled: {export_path}")
 
 	try:
 		while True:
@@ -338,6 +446,7 @@ def main() -> None:
 			local_max_mm = 0.0
 			hotspot_text = "none"
 			origin_state = "origin:unset (press o)"
+			export_state = "export:off"
 
 			need_reseed = False
 			reseed_reason = ""
@@ -367,6 +476,9 @@ def main() -> None:
 
 				if points is not None and len(points) >= args.min_track_points:
 					prev_pts = points
+					n_pts = len(prev_pts)
+					prev_ids = np.arange(next_point_id, next_point_id + n_pts, dtype=np.int64)
+					next_point_id += n_pts
 					if args.auto_grid_calib:
 						est_scale = estimate_mm_per_px_from_grid(prev_pts, args.nn_distance_mm)
 						if est_scale is not None:
@@ -374,6 +486,7 @@ def main() -> None:
 							calibration_info = f"scale={px_to_mm:.6f} mm/px (auto-grid)"
 					if origin_valid:
 						origin_pts = None
+						origin_ids = None
 						origin_valid = False
 					prev_gray = gray
 					last_seed_frame = frame_index
@@ -385,7 +498,9 @@ def main() -> None:
 						cv2.circle(frame_bgr, (int(x), int(y)), 2, (255, 255, 0), -1, cv2.LINE_AA)
 				else:
 					prev_pts = None
+					prev_ids = None
 					origin_pts = None
+					origin_ids = None
 					origin_valid = False
 					prev_gray = gray
 					status = f"reseed-failed:{reseed_reason} det={detected_count}"
@@ -394,13 +509,22 @@ def main() -> None:
 
 			elif prev_gray is not None and prev_pts is not None and len(prev_pts) >= 4:
 				origin_xy = None
-				if origin_valid and origin_pts is not None and len(origin_pts) == len(prev_pts):
+				if (
+					origin_valid
+					and origin_pts is not None
+					and origin_ids is not None
+					and prev_ids is not None
+					and len(origin_pts) == len(prev_pts)
+					and len(origin_ids) == len(prev_ids)
+				):
 					origin_xy = origin_pts.reshape(-1, 2)
 
 				next_pts, st, _err = cv2.calcOpticalFlowPyrLK(prev_gray, gray, prev_pts, None, **LK_PARAMS)
 				if next_pts is None or st is None:
 					prev_pts = None
+					prev_ids = None
 					origin_pts = None
+					origin_ids = None
 					origin_valid = False
 					prev_gray = gray
 					status = "lk-failed"
@@ -408,7 +532,9 @@ def main() -> None:
 					ok = st.reshape(-1).astype(bool)
 					good_prev = prev_pts.reshape(-1, 2)[ok]
 					good_next = next_pts.reshape(-1, 2)[ok]
+					good_ids = prev_ids[ok] if prev_ids is not None else None
 					good_origin = origin_xy[ok] if origin_xy is not None else None
+					good_origin_ids = origin_ids[ok] if origin_ids is not None else None
 					tracked_count = int(len(good_next))
 
 					if tracked_count >= 4:
@@ -423,15 +549,23 @@ def main() -> None:
 							fb_ok = back_st.reshape(-1).astype(bool)
 							good_prev = good_prev[fb_ok]
 							good_next = good_next[fb_ok]
+							if good_ids is not None:
+								good_ids = good_ids[fb_ok]
 							if good_origin is not None:
 								good_origin = good_origin[fb_ok]
+							if good_origin_ids is not None:
+								good_origin_ids = good_origin_ids[fb_ok]
 							back_xy = back_pts.reshape(-1, 2)[fb_ok]
 							fb_error = np.linalg.norm(good_prev - back_xy, axis=1)
 							keep = fb_error <= args.fb_thresh
 							good_prev = good_prev[keep]
 							good_next = good_next[keep]
+							if good_ids is not None:
+								good_ids = good_ids[keep]
 							if good_origin is not None:
 								good_origin = good_origin[keep]
+							if good_origin_ids is not None:
+								good_origin_ids = good_origin_ids[keep]
 							tracked_count = int(len(good_next))
 
 					if tracked_count >= 4:
@@ -449,7 +583,9 @@ def main() -> None:
 							inliers = inlier_mask.reshape(-1).astype(bool)
 							in_prev = good_prev[inliers]
 							in_next = good_next[inliers]
+							in_ids = good_ids[inliers] if good_ids is not None else None
 							in_origin = good_origin[inliers] if good_origin is not None else None
+							in_origin_ids = good_origin_ids[inliers] if good_origin_ids is not None else None
 							inlier_count = int(len(in_next))
 
 							if inlier_count >= 3:
@@ -466,16 +602,21 @@ def main() -> None:
 									cv2.circle(frame_bgr, (x1, y1), 2, (0, 255, 0), -1, cv2.LINE_AA)
 
 								prev_pts = in_next.reshape(-1, 1, 2).astype(np.float32)
+								prev_ids = in_ids.copy() if in_ids is not None else None
 								if in_origin is not None:
 									origin_pts = in_origin.reshape(-1, 1, 2).astype(np.float32)
+									origin_ids = in_origin_ids.copy() if in_origin_ids is not None else None
 								else:
 									origin_pts = None
+									origin_ids = None
 									origin_valid = False
 								prev_gray = gray
 								status = "tracking"
 							else:
 								prev_pts = None
+								prev_ids = None
 								origin_pts = None
+								origin_ids = None
 								origin_valid = False
 								prev_gray = gray
 								status = "ransac-low-inliers"
@@ -493,17 +634,22 @@ def main() -> None:
 								cv2.circle(frame_bgr, (x1, y1), 2, (80, 255, 80), -1, cv2.LINE_AA)
 
 							prev_pts = good_next.reshape(-1, 1, 2).astype(np.float32)
+							prev_ids = good_ids.copy() if good_ids is not None else None
 							if good_origin is not None:
 								origin_pts = good_origin.reshape(-1, 1, 2).astype(np.float32)
+								origin_ids = good_origin_ids.copy() if good_origin_ids is not None else None
 							else:
 								origin_pts = None
+								origin_ids = None
 								origin_valid = False
 							prev_gray = gray
 							inlier_count = tracked_count
 							status = "tracking-no-ransac"
 					else:
 						prev_pts = None
+						prev_ids = None
 						origin_pts = None
+						origin_ids = None
 						origin_valid = False
 						prev_gray = gray
 						status = "too-few-good-points"
@@ -528,16 +674,32 @@ def main() -> None:
 			frame_mm_y = frame_dy * px_to_mm
 			absolute_mm_x = absolute_dx * px_to_mm
 			absolute_mm_y = absolute_dy * px_to_mm
+			export_payload = None
 
 			if (
 				origin_valid
 				and prev_pts is not None
+				and prev_ids is not None
 				and origin_pts is not None
+				and origin_ids is not None
 				and len(prev_pts) == len(origin_pts)
+				and len(prev_ids) == len(origin_ids)
 				and len(prev_pts) >= 4
 			):
 				current_xy = prev_pts.reshape(-1, 2).astype(np.float64)
+				current_ids = prev_ids.astype(np.int64)
 				origin_xy = origin_pts.reshape(-1, 2).astype(np.float64)
+				id_same = np.array_equal(current_ids, origin_ids.astype(np.int64))
+				if not id_same:
+					common_ids, idx_curr, idx_org = np.intersect1d(
+						current_ids,
+						origin_ids.astype(np.int64),
+						return_indices=True,
+					)
+					current_ids = common_ids
+					current_xy = current_xy[idx_curr]
+					origin_xy = origin_xy[idx_org]
+
 				_residual_xy, residual_mag_px = compute_local_deformation(
 					origin_xy,
 					current_xy,
@@ -545,13 +707,16 @@ def main() -> None:
 				)
 
 				if len(residual_mag_px) > 0:
+					raw_xy = current_xy - origin_xy
+					raw_mag_px = np.linalg.norm(raw_xy, axis=1)
 					residual_mag_mm = residual_mag_px * px_to_mm
 					local_mean_mm = float(np.mean(residual_mag_mm))
 					local_p95_mm = float(np.percentile(residual_mag_mm, 95))
 					hot_idx = int(np.argmax(residual_mag_mm))
 					local_max_mm = float(residual_mag_mm[hot_idx])
 					hot_xy = current_xy[hot_idx]
-					hotspot_text = f"{int(hot_xy[0])},{int(hot_xy[1])}"
+					hot_id = int(current_ids[hot_idx])
+					hotspot_text = f"id={hot_id}@{int(hot_xy[0])},{int(hot_xy[1])}"
 
 					draw_norm = max(1e-9, float(np.percentile(residual_mag_px, 95)))
 					draw_step = max(1, len(current_xy) // max(1, args.draw_points))
@@ -569,7 +734,47 @@ def main() -> None:
 
 					cv2.circle(frame_bgr, (int(hot_xy[0]), int(hot_xy[1])), 9, (0, 0, 255), 2, cv2.LINE_AA)
 
+					export_payload = (
+						current_ids,
+						origin_xy,
+						current_xy,
+						raw_xy,
+						raw_mag_px,
+						_residual_xy,
+						residual_mag_px,
+					)
+
 				origin_state = f"origin:locked pts={len(current_xy)}"
+
+			if export_enabled and export_writer is not None:
+				export_state = f"export:on/{export_every}"
+				if export_payload is not None and (frame_index % export_every == 0):
+					(
+						ids_for_export,
+						origin_xy_export,
+						current_xy_export,
+						raw_xy_export,
+						raw_mag_export,
+						local_xy_export,
+						local_mag_export,
+					) = export_payload
+					write_fullfield_rows(
+						export_writer,
+						time.time(),
+						frame_index,
+						ids_for_export,
+						origin_xy_export,
+						current_xy_export,
+						raw_xy_export,
+						raw_mag_export,
+						local_xy_export,
+						local_mag_export,
+						px_to_mm,
+					)
+					if frame_index % max(30, export_every * 10) == 0:
+						export_file.flush()
+			elif export_enabled:
+				export_state = "export:on(no-file)"
 
 			put_lines(
 				frame_bgr,
@@ -580,8 +785,8 @@ def main() -> None:
 					f"ABS=({absolute_mm_x:+8.3f},{absolute_mm_y:+8.3f}) mm  ABS_rot={absolute_angle:+6.2f}deg",
 					f"deform(mm) mean={local_mean_mm:6.3f} p95={local_p95_mm:6.3f} max={local_max_mm:6.3f}",
 					f"{origin_state} hotspot(px)={hotspot_text}  {calibration_info}",
-					f"frame_mm=({frame_mm_x:+6.3f},{frame_mm_y:+6.3f})",
-					"keys: q/ESC quit | r reseed | o origin | c move-calib | g grid-calib | s save",
+					f"frame_mm=({frame_mm_x:+6.3f},{frame_mm_y:+6.3f})  {export_state}",
+					"keys: q/ESC quit | r reseed | o origin | c move-calib | g grid-calib | e export | s save",
 				],
 			)
 
@@ -596,12 +801,14 @@ def main() -> None:
 				manual_reseed = True
 			if key == ord("o"):
 				origin_inv_transform = np.linalg.inv(global_transform)
-				if prev_pts is not None and len(prev_pts) >= 4:
+				if prev_pts is not None and prev_ids is not None and len(prev_pts) >= 4:
 					origin_pts = prev_pts.copy()
+					origin_ids = prev_ids.copy()
 					origin_valid = True
 					print("Origin set. ABS reset and local deformation baseline captured.")
 				else:
 					origin_pts = None
+					origin_ids = None
 					origin_valid = False
 					print("Origin set for ABS only. Press r, wait tracking, then press o again.")
 			if key == ord("c"):
@@ -648,6 +855,18 @@ def main() -> None:
 								"Grid calibration done: "
 								f"{args.nn_distance_mm:.3f} mm / {nn_px:.3f} px = {px_to_mm:.6f} mm/px"
 							)
+			if key == ord("e"):
+				export_enabled = not export_enabled
+				if export_enabled:
+					export_file, export_writer, export_path = open_fullfield_export(args.export_dir, args.export_prefix)
+					print(f"Per-point export enabled: {export_path}")
+				else:
+					if export_file is not None:
+						export_file.close()
+					export_file = None
+					export_writer = None
+					export_path = ""
+					print("Per-point export disabled.")
 			if key == ord("s"):
 				ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 				frame_name = f"flow_frame_{ts}.png"
@@ -657,6 +876,8 @@ def main() -> None:
 					cv2.imwrite(mask_name, last_mask)
 				print(f"Saved {frame_name} and {mask_name}")
 	finally:
+		if export_file is not None:
+			export_file.close()
 		cam.stop()
 		cv2.destroyAllWindows()
 
