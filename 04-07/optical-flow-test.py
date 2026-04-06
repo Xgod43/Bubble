@@ -106,6 +106,12 @@ def build_parser() -> argparse.ArgumentParser:
 		help="Radius in pixels for focus target region set by mouse click",
 	)
 	parser.add_argument(
+		"--hotspot-focus-span",
+		type=float,
+		default=0.9,
+		help="Half-range around current lens position used by hotspot autofocus (key h)",
+	)
+	parser.add_argument(
 		"--exposure-us",
 		type=int,
 		default=0,
@@ -692,7 +698,7 @@ def main() -> None:
 	print(
 		"Keys: q/ESC=quit, r=reseed, o=set origin, c=move-calib, g=grid-calib, "
 		"m=manual focus, a=continuous AF, f=AF+lock, z=sweep+lock, [/] lens step, "
-		"x=clear focus target, e=export, s=save"
+		"h=focus hotspot, x=clear focus target, e=export, s=save"
 	)
 	print("Focus target: left-click Optical Flow window to set ROI, right-click to clear.")
 
@@ -766,6 +772,8 @@ def main() -> None:
 			local_p95_mm = 0.0
 			local_max_mm = 0.0
 			hotspot_text = "none"
+			hotspot_xy_for_focus = None
+			hotspot_id_for_focus = None
 			origin_state = "origin:unset (press o)"
 			export_state = "export:off"
 
@@ -1038,6 +1046,8 @@ def main() -> None:
 					hot_xy = current_xy[hot_idx]
 					hot_id = int(current_ids[hot_idx])
 					hotspot_text = f"id={hot_id}@{int(hot_xy[0])},{int(hot_xy[1])}"
+					hotspot_xy_for_focus = (int(hot_xy[0]), int(hot_xy[1]))
+					hotspot_id_for_focus = hot_id
 
 					draw_norm = max(1e-9, float(np.percentile(residual_mag_px, 95)))
 					draw_step = max(1, len(current_xy) // max(1, args.draw_points))
@@ -1116,7 +1126,7 @@ def main() -> None:
 					f"deform(mm) mean={local_mean_mm:6.3f} p95={local_p95_mm:6.3f} max={local_max_mm:6.3f}",
 					f"{origin_state} hotspot(px)={hotspot_text}  {calibration_info}",
 					f"frame_mm=({frame_mm_x:+6.3f},{frame_mm_y:+6.3f})  {export_state}",
-					"keys: r/o/c/g | m/a/f/z/[/] focus | x clear-target | e export | s save | q quit",
+					"keys: r/o/c/g | m/a/f/z/h/[/] focus | x clear-target | e export | s save | q quit",
 				],
 			)
 
@@ -1172,6 +1182,54 @@ def main() -> None:
 				prev_pts = None
 				prev_ids = None
 				print(f"Focus sweep done. {focus_note}")
+			if key == ord("h"):
+				if hotspot_xy_for_focus is None:
+					print("Hotspot focus unavailable: no hotspot detected in current frame.")
+				else:
+					hx, hy = hotspot_xy_for_focus
+					focus_target["x"] = int(hx)
+					focus_target["y"] = int(hy)
+					focus_mode = "manual"
+
+					span = max(0.10, float(args.hotspot_focus_span))
+					sweep_lo = max(float(args.focus_sweep_min), float(lens_position - span))
+					sweep_hi = min(float(args.focus_sweep_max), float(lens_position + span))
+					if sweep_hi - sweep_lo < max(0.02, float(args.focus_sweep_step)):
+						sweep_lo = float(args.focus_sweep_min)
+						sweep_hi = float(args.focus_sweep_max)
+
+					print(
+						"Running hotspot focus sweep: "
+						f"id={hotspot_id_for_focus} at {hx},{hy} range=({sweep_lo:.2f},{sweep_hi:.2f})"
+					)
+					lens_position, sweep_score, sweep_results = run_focus_sweep(
+						cam,
+						sweep_lo,
+						sweep_hi,
+						args.focus_sweep_step,
+						args.focus_sweep_frames,
+						args.focus_sweep_settle_ms,
+						args.focus_sweep_center,
+						focus_target,
+					)
+					focus_note = (
+						f"hotspot id={hotspot_id_for_focus} lens={lens_position:.2f} "
+						f"sharp={sweep_score:.1f} n={len(sweep_results)}"
+					)
+					if len(sweep_results) >= 2:
+						sweep_scores = np.array([s for _lp, s in sweep_results], dtype=np.float64)
+						best_i = int(np.argmax(sweep_scores))
+						if best_i == 0 or best_i == len(sweep_results) - 1:
+							focus_note += " edge-range"
+							print(
+								"Sweep warning: best focus at range edge. "
+								"Try widening --focus-sweep-min/max or --hotspot-focus-span."
+							)
+					manual_reseed = True
+					prev_gray = None
+					prev_pts = None
+					prev_ids = None
+					print(f"Hotspot focus done. {focus_note}")
 			if key == ord("["):
 				focus_mode = "manual"
 				lens_position = set_manual_focus(cam, lens_position - focus_step)
