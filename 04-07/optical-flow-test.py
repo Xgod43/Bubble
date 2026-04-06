@@ -40,6 +40,37 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--fb-thresh", type=float, default=1.7, help="Forward-backward flow error threshold")
 	parser.add_argument("--ransac-thresh", type=float, default=3.2, help="RANSAC reprojection threshold")
 	parser.add_argument(
+		"--focus-mode",
+		type=str,
+		default="manual",
+		choices=["manual", "continuous", "auto"],
+		help="Focus mode: manual lock is recommended for deformation tracking",
+	)
+	parser.add_argument(
+		"--lens-position",
+		type=float,
+		default=4.5,
+		help="Manual lens position (higher is closer focus)",
+	)
+	parser.add_argument(
+		"--focus-step",
+		type=float,
+		default=0.20,
+		help="Lens position step for [ and ] hotkeys",
+	)
+	parser.add_argument(
+		"--exposure-us",
+		type=int,
+		default=0,
+		help="Manual exposure time in microseconds, 0 means auto",
+	)
+	parser.add_argument(
+		"--analogue-gain",
+		type=float,
+		default=0.0,
+		help="Manual analogue gain, 0 means auto",
+	)
+	parser.add_argument(
 		"--nn-distance-mm",
 		type=float,
 		default=7.071067811865,
@@ -174,15 +205,39 @@ def detect_dot_centers(
 	return points, binary, detected_count
 
 
-def open_camera(width: int, height: int, fps: float) -> Picamera2:
+def open_camera(
+	width: int,
+	height: int,
+	fps: float,
+	focus_mode: str,
+	lens_position: float,
+	exposure_us: int,
+	analogue_gain: float,
+) -> Picamera2:
 	cam = Picamera2()
 	config = cam.create_preview_configuration(main={"size": (width, height), "format": "RGB888"})
 	cam.configure(config)
 	cam.start()
 
 	controls_payload = {"FrameRate": float(max(1.0, fps))}
+	if exposure_us > 0:
+		controls_payload["ExposureTime"] = int(exposure_us)
+	if analogue_gain > 0:
+		controls_payload["AnalogueGain"] = float(analogue_gain)
+
 	if libcamera_controls is not None:
-		controls_payload["AfMode"] = libcamera_controls.AfModeEnum.Continuous
+		if focus_mode == "manual":
+			controls_payload["AfMode"] = libcamera_controls.AfModeEnum.Manual
+			controls_payload["LensPosition"] = float(max(0.0, lens_position))
+		elif focus_mode == "auto":
+			controls_payload["AfMode"] = libcamera_controls.AfModeEnum.Auto
+		else:
+			controls_payload["AfMode"] = libcamera_controls.AfModeEnum.Continuous
+	else:
+		mode_map = {"manual": 0, "auto": 1, "continuous": 2}
+		controls_payload["AfMode"] = mode_map.get(focus_mode, 0)
+		if focus_mode == "manual":
+			controls_payload["LensPosition"] = float(max(0.0, lens_position))
 	try:
 		cam.set_controls(controls_payload)
 	except Exception:
@@ -190,6 +245,62 @@ def open_camera(width: int, height: int, fps: float) -> Picamera2:
 
 	time.sleep(0.25)
 	return cam
+
+
+def read_lens_position(cam: Picamera2, fallback: float) -> float:
+	try:
+		md = cam.capture_metadata()
+		lp = md.get("LensPosition")
+		if lp is None:
+			return fallback
+		return float(lp)
+	except Exception:
+		return fallback
+
+
+def set_manual_focus(cam: Picamera2, lens_position: float) -> float:
+	new_pos = float(max(0.0, lens_position))
+	payload = {"LensPosition": new_pos}
+	if libcamera_controls is not None:
+		payload["AfMode"] = libcamera_controls.AfModeEnum.Manual
+	else:
+		payload["AfMode"] = 0
+	try:
+		cam.set_controls(payload)
+	except Exception:
+		pass
+	return new_pos
+
+
+def set_continuous_focus(cam: Picamera2) -> None:
+	payload = {}
+	if libcamera_controls is not None:
+		payload["AfMode"] = libcamera_controls.AfModeEnum.Continuous
+	else:
+		payload["AfMode"] = 2
+	try:
+		cam.set_controls(payload)
+	except Exception:
+		pass
+
+
+def trigger_autofocus_and_lock(cam: Picamera2, fallback_lens: float) -> float:
+	if libcamera_controls is None:
+		return fallback_lens
+	try:
+		cam.set_controls({"AfMode": libcamera_controls.AfModeEnum.Auto})
+		trigger_enum = getattr(libcamera_controls, "AfTriggerEnum", None)
+		if trigger_enum is not None:
+			cam.set_controls({"AfTrigger": trigger_enum.Start})
+		time.sleep(0.35)
+		best_lp = read_lens_position(cam, fallback_lens)
+		return set_manual_focus(cam, best_lp)
+	except Exception:
+		return fallback_lens
+
+
+def compute_focus_score(gray: np.ndarray) -> float:
+	return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
 def put_lines(frame: np.ndarray, lines) -> None:
@@ -373,8 +484,19 @@ def main() -> None:
 
 	clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 	roi_scale = clamp(args.roi_scale, 0.1, 1.0)
+	focus_mode = str(args.focus_mode)
+	lens_position = float(max(0.0, args.lens_position))
+	focus_step = float(max(0.01, args.focus_step))
 
-	cam = open_camera(args.width, args.height, args.fps)
+	cam = open_camera(
+		args.width,
+		args.height,
+		args.fps,
+		focus_mode,
+		lens_position,
+		args.exposure_us,
+		args.analogue_gain,
+	)
 	cv2.namedWindow(FLOW_WINDOW, cv2.WINDOW_NORMAL)
 	cv2.resizeWindow(FLOW_WINDOW, args.width, args.height)
 	cv2.namedWindow(MASK_WINDOW, cv2.WINDOW_NORMAL)
@@ -411,7 +533,10 @@ def main() -> None:
 	last_t = time.perf_counter()
 
 	print("Running realtime optical flow.")
-	print("Keys: q/ESC=quit, r=reseed, o=set origin, c=move-calib, g=grid-calib, e=export on/off, s=save")
+	print(
+		"Keys: q/ESC=quit, r=reseed, o=set origin, c=move-calib, g=grid-calib, "
+		"m=manual focus, a=continuous AF, f=AF+lock, [/] lens step, e=export, s=save"
+	)
 
 	if export_enabled:
 		export_file, export_writer, export_path = open_fullfield_export(args.export_dir, args.export_prefix)
@@ -421,6 +546,9 @@ def main() -> None:
 		while True:
 			frame_rgb = cam.capture_array()
 			gray = preprocess_gray(frame_rgb, clahe)
+			focus_score = compute_focus_score(gray)
+			if frame_index % 15 == 0:
+				lens_position = read_lens_position(cam, lens_position)
 
 			if roi_mask is None or roi_mask.shape != gray.shape:
 				roi_mask = build_roi_mask(gray.shape, roi_scale)
@@ -781,12 +909,13 @@ def main() -> None:
 				[
 					f"FPS:{smooth_fps:5.1f} status:{status}",
 					f"points tracked={tracked_count} inliers={inlier_count} active={(0 if prev_pts is None else len(prev_pts))}",
+					f"focus={focus_mode} lens={lens_position:4.2f} sharp={focus_score:8.1f}",
 					f"dX={frame_dx:+6.2f}px dY={frame_dy:+6.2f}px rot={frame_angle:+5.2f}deg",
 					f"ABS=({absolute_mm_x:+8.3f},{absolute_mm_y:+8.3f}) mm  ABS_rot={absolute_angle:+6.2f}deg",
 					f"deform(mm) mean={local_mean_mm:6.3f} p95={local_p95_mm:6.3f} max={local_max_mm:6.3f}",
 					f"{origin_state} hotspot(px)={hotspot_text}  {calibration_info}",
 					f"frame_mm=({frame_mm_x:+6.3f},{frame_mm_y:+6.3f})  {export_state}",
-					"keys: q/ESC quit | r reseed | o origin | c move-calib | g grid-calib | e export | s save",
+					"keys: r/o/c/g | m/a/f/[/] focus | e export | s save | q quit",
 				],
 			)
 
@@ -799,6 +928,26 @@ def main() -> None:
 				break
 			if key == ord("r"):
 				manual_reseed = True
+			if key == ord("m"):
+				focus_mode = "manual"
+				lens_position = set_manual_focus(cam, lens_position)
+				print(f"Focus mode manual, lens={lens_position:.2f}")
+			if key == ord("a"):
+				focus_mode = "continuous"
+				set_continuous_focus(cam)
+				print("Focus mode continuous AF")
+			if key == ord("f"):
+				lens_position = trigger_autofocus_and_lock(cam, lens_position)
+				focus_mode = "manual"
+				print(f"One-shot AF done, locked manual at lens={lens_position:.2f}")
+			if key == ord("["):
+				focus_mode = "manual"
+				lens_position = set_manual_focus(cam, lens_position - focus_step)
+				print(f"LensPosition -> {lens_position:.2f}")
+			if key == ord("]"):
+				focus_mode = "manual"
+				lens_position = set_manual_focus(cam, lens_position + focus_step)
+				print(f"LensPosition -> {lens_position:.2f}")
 			if key == ord("o"):
 				origin_inv_transform = np.linalg.inv(global_transform)
 				if prev_pts is not None and prev_ids is not None and len(prev_pts) >= 4:
