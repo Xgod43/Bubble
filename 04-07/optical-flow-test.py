@@ -59,6 +59,47 @@ def build_parser() -> argparse.ArgumentParser:
 		help="Lens position step for [ and ] hotkeys",
 	)
 	parser.add_argument(
+		"--focus-sweep-min",
+		type=float,
+		default=0.0,
+		help="Minimum lens position for auto focus sweep",
+	)
+	parser.add_argument(
+		"--focus-sweep-max",
+		type=float,
+		default=10.0,
+		help="Maximum lens position for auto focus sweep",
+	)
+	parser.add_argument(
+		"--focus-sweep-step",
+		type=float,
+		default=0.25,
+		help="Lens step used by auto focus sweep",
+	)
+	parser.add_argument(
+		"--focus-sweep-frames",
+		type=int,
+		default=2,
+		help="Number of frames averaged at each lens position during sweep",
+	)
+	parser.add_argument(
+		"--focus-sweep-settle-ms",
+		type=int,
+		default=70,
+		help="Settle time at each lens position during sweep (ms)",
+	)
+	parser.add_argument(
+		"--focus-sweep-center",
+		type=float,
+		default=0.60,
+		help="Center ROI ratio used for focus scoring during sweep",
+	)
+	parser.add_argument(
+		"--focus-sweep-on-start",
+		action="store_true",
+		help="Run auto focus sweep once at startup and lock best lens position",
+	)
+	parser.add_argument(
 		"--exposure-us",
 		type=int,
 		default=0,
@@ -303,6 +344,59 @@ def compute_focus_score(gray: np.ndarray) -> float:
 	return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
+def compute_focus_score_from_rgb(frame_rgb: np.ndarray, center_ratio: float) -> float:
+	gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
+	ratio = clamp(center_ratio, 0.2, 1.0)
+	if ratio < 0.999:
+		h, w = gray.shape[:2]
+		ch = max(20, int(h * ratio))
+		cw = max(20, int(w * ratio))
+		y0 = (h - ch) // 2
+		x0 = (w - cw) // 2
+		gray = gray[y0 : y0 + ch, x0 : x0 + cw]
+	return compute_focus_score(gray)
+
+
+def run_focus_sweep(
+	cam: Picamera2,
+	lens_min: float,
+	lens_max: float,
+	lens_step: float,
+	frames_per_pos: int,
+	settle_ms: int,
+	center_ratio: float,
+) -> tuple[float, float, list[tuple[float, float]]]:
+	lo = max(0.0, float(min(lens_min, lens_max)))
+	hi = max(0.0, float(max(lens_min, lens_max)))
+	step = max(0.02, float(abs(lens_step)))
+	frames_n = max(1, int(frames_per_pos))
+	wait_s = max(0.0, float(settle_ms) / 1000.0)
+
+	positions = np.arange(lo, hi + 0.5 * step, step, dtype=np.float64)
+	best_pos = float(lo)
+	best_score = -1.0
+	results = []
+
+	for pos in positions:
+		cur = set_manual_focus(cam, float(pos))
+		if wait_s > 0:
+			time.sleep(wait_s)
+
+		score_sum = 0.0
+		for _i in range(frames_n):
+			fr = cam.capture_array()
+			score_sum += compute_focus_score_from_rgb(fr, center_ratio)
+
+		score_avg = score_sum / float(frames_n)
+		results.append((float(cur), float(score_avg)))
+		if score_avg > best_score:
+			best_score = float(score_avg)
+			best_pos = float(cur)
+
+	best_pos = set_manual_focus(cam, best_pos)
+	return best_pos, best_score, results
+
+
 def put_lines(frame: np.ndarray, lines) -> None:
 	y = 26
 	for line in lines:
@@ -535,8 +629,24 @@ def main() -> None:
 	print("Running realtime optical flow.")
 	print(
 		"Keys: q/ESC=quit, r=reseed, o=set origin, c=move-calib, g=grid-calib, "
-		"m=manual focus, a=continuous AF, f=AF+lock, [/] lens step, e=export, s=save"
+		"m=manual focus, a=continuous AF, f=AF+lock, z=sweep+lock, [/] lens step, e=export, s=save"
 	)
+
+	focus_note = ""
+	if args.focus_sweep_on_start:
+		print("Running startup focus sweep...")
+		lens_position, sweep_score, sweep_results = run_focus_sweep(
+			cam,
+			args.focus_sweep_min,
+			args.focus_sweep_max,
+			args.focus_sweep_step,
+			args.focus_sweep_frames,
+			args.focus_sweep_settle_ms,
+			args.focus_sweep_center,
+		)
+		focus_mode = "manual"
+		focus_note = f"sweep best={lens_position:.2f} sharp={sweep_score:.1f} n={len(sweep_results)}"
+		print(f"Startup sweep done. {focus_note}")
 
 	if export_enabled:
 		export_file, export_writer, export_path = open_fullfield_export(args.export_dir, args.export_prefix)
@@ -909,13 +1019,13 @@ def main() -> None:
 				[
 					f"FPS:{smooth_fps:5.1f} status:{status}",
 					f"points tracked={tracked_count} inliers={inlier_count} active={(0 if prev_pts is None else len(prev_pts))}",
-					f"focus={focus_mode} lens={lens_position:4.2f} sharp={focus_score:8.1f}",
+					f"focus={focus_mode} lens={lens_position:4.2f} sharp={focus_score:8.1f} {focus_note}",
 					f"dX={frame_dx:+6.2f}px dY={frame_dy:+6.2f}px rot={frame_angle:+5.2f}deg",
 					f"ABS=({absolute_mm_x:+8.3f},{absolute_mm_y:+8.3f}) mm  ABS_rot={absolute_angle:+6.2f}deg",
 					f"deform(mm) mean={local_mean_mm:6.3f} p95={local_p95_mm:6.3f} max={local_max_mm:6.3f}",
 					f"{origin_state} hotspot(px)={hotspot_text}  {calibration_info}",
 					f"frame_mm=({frame_mm_x:+6.3f},{frame_mm_y:+6.3f})  {export_state}",
-					"keys: r/o/c/g | m/a/f/[/] focus | e export | s save | q quit",
+					"keys: r/o/c/g | m/a/f/z/[/] focus | e export | s save | q quit",
 				],
 			)
 
@@ -931,22 +1041,45 @@ def main() -> None:
 			if key == ord("m"):
 				focus_mode = "manual"
 				lens_position = set_manual_focus(cam, lens_position)
+				focus_note = ""
 				print(f"Focus mode manual, lens={lens_position:.2f}")
 			if key == ord("a"):
 				focus_mode = "continuous"
 				set_continuous_focus(cam)
+				focus_note = ""
 				print("Focus mode continuous AF")
 			if key == ord("f"):
 				lens_position = trigger_autofocus_and_lock(cam, lens_position)
 				focus_mode = "manual"
+				focus_note = ""
 				print(f"One-shot AF done, locked manual at lens={lens_position:.2f}")
+			if key == ord("z"):
+				focus_mode = "manual"
+				print("Running focus sweep...")
+				lens_position, sweep_score, sweep_results = run_focus_sweep(
+					cam,
+					args.focus_sweep_min,
+					args.focus_sweep_max,
+					args.focus_sweep_step,
+					args.focus_sweep_frames,
+					args.focus_sweep_settle_ms,
+					args.focus_sweep_center,
+				)
+				focus_note = f"sweep best={lens_position:.2f} sharp={sweep_score:.1f} n={len(sweep_results)}"
+				manual_reseed = True
+				prev_gray = None
+				prev_pts = None
+				prev_ids = None
+				print(f"Focus sweep done. {focus_note}")
 			if key == ord("["):
 				focus_mode = "manual"
 				lens_position = set_manual_focus(cam, lens_position - focus_step)
+				focus_note = ""
 				print(f"LensPosition -> {lens_position:.2f}")
 			if key == ord("]"):
 				focus_mode = "manual"
 				lens_position = set_manual_focus(cam, lens_position + focus_step)
+				focus_note = ""
 				print(f"LensPosition -> {lens_position:.2f}")
 			if key == ord("o"):
 				origin_inv_transform = np.linalg.inv(global_transform)
