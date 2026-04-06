@@ -202,6 +202,43 @@ def angle_deg_from_matrix(tf: np.ndarray) -> float:
 	return math.degrees(math.atan2(float(tf[1, 0]), float(tf[0, 0])))
 
 
+def apply_transform_to_points(tf: np.ndarray, points_xy: np.ndarray) -> np.ndarray:
+	ones = np.ones((points_xy.shape[0], 1), dtype=np.float64)
+	homo = np.hstack([points_xy.astype(np.float64), ones])
+	warped = (tf @ homo.T).T
+	return warped[:, :2]
+
+
+def compute_local_deformation(
+	origin_xy: np.ndarray,
+	current_xy: np.ndarray,
+	ransac_thresh: float,
+) -> tuple[np.ndarray, np.ndarray]:
+	if len(origin_xy) < 4 or len(current_xy) < 4:
+		residual_xy = current_xy - origin_xy
+		residual_mag_px = np.linalg.norm(residual_xy, axis=1)
+		return residual_xy, residual_mag_px
+
+	affine, _inlier_mask = cv2.estimateAffinePartial2D(
+		origin_xy,
+		current_xy,
+		method=cv2.RANSAC,
+		ransacReprojThreshold=ransac_thresh,
+		maxIters=500,
+		confidence=0.99,
+		refineIters=10,
+	)
+	if affine is None:
+		pred_xy = origin_xy
+	else:
+		rigid_tf = rigid_transform_from_affine_2x3(affine)
+		pred_xy = apply_transform_to_points(rigid_tf, origin_xy)
+
+	residual_xy = current_xy - pred_xy
+	residual_mag_px = np.linalg.norm(residual_xy, axis=1)
+	return residual_xy, residual_mag_px
+
+
 def estimate_nn_px(points: np.ndarray) -> float | None:
 	if points is None or len(points) < 4:
 		return None
@@ -249,6 +286,8 @@ def main() -> None:
 
 	prev_gray = None
 	prev_pts = None
+	origin_pts = None
+	origin_valid = False
 	roi_mask = None
 	last_mask = None
 
@@ -261,6 +300,8 @@ def main() -> None:
 	origin_inv_transform = np.eye(3, dtype=np.float64)
 	calibration_start_global_t = None
 	calibration_info = f"scale={px_to_mm:.6f} mm/px"
+	lut_img = cv2.applyColorMap(np.arange(256, dtype=np.uint8).reshape(-1, 1), cv2.COLORMAP_TURBO)
+	turbo_lut = lut_img[:, 0, :]
 
 	smooth_fps = 0.0
 	last_t = time.perf_counter()
@@ -292,6 +333,11 @@ def main() -> None:
 			tracked_count = 0
 			inlier_count = 0
 			status = "tracking"
+			local_mean_mm = 0.0
+			local_p95_mm = 0.0
+			local_max_mm = 0.0
+			hotspot_text = "none"
+			origin_state = "origin:unset (press o)"
 
 			need_reseed = False
 			reseed_reason = ""
@@ -301,7 +347,11 @@ def main() -> None:
 			elif prev_pts is None or len(prev_pts) < args.min_track_points:
 				need_reseed = True
 				reseed_reason = "low-points"
-			elif args.reseed_interval > 0 and (frame_index - last_seed_frame) >= args.reseed_interval:
+			elif (
+				not origin_valid
+				and args.reseed_interval > 0
+				and (frame_index - last_seed_frame) >= args.reseed_interval
+			):
 				need_reseed = True
 				reseed_reason = "periodic"
 
@@ -322,29 +372,43 @@ def main() -> None:
 						if est_scale is not None:
 							px_to_mm = est_scale
 							calibration_info = f"scale={px_to_mm:.6f} mm/px (auto-grid)"
+					if origin_valid:
+						origin_pts = None
+						origin_valid = False
 					prev_gray = gray
 					last_seed_frame = frame_index
 					status = f"reseed:{reseed_reason} det={detected_count} use={len(prev_pts)}"
+					if reseed_reason != "manual":
+						status += " origin-reset"
 					for pt in prev_pts:
 						x, y = pt[0]
 						cv2.circle(frame_bgr, (int(x), int(y)), 2, (255, 255, 0), -1, cv2.LINE_AA)
 				else:
 					prev_pts = None
+					origin_pts = None
+					origin_valid = False
 					prev_gray = gray
 					status = f"reseed-failed:{reseed_reason} det={detected_count}"
 
 				manual_reseed = False
 
 			elif prev_gray is not None and prev_pts is not None and len(prev_pts) >= 4:
+				origin_xy = None
+				if origin_valid and origin_pts is not None and len(origin_pts) == len(prev_pts):
+					origin_xy = origin_pts.reshape(-1, 2)
+
 				next_pts, st, _err = cv2.calcOpticalFlowPyrLK(prev_gray, gray, prev_pts, None, **LK_PARAMS)
 				if next_pts is None or st is None:
 					prev_pts = None
+					origin_pts = None
+					origin_valid = False
 					prev_gray = gray
 					status = "lk-failed"
 				else:
 					ok = st.reshape(-1).astype(bool)
 					good_prev = prev_pts.reshape(-1, 2)[ok]
 					good_next = next_pts.reshape(-1, 2)[ok]
+					good_origin = origin_xy[ok] if origin_xy is not None else None
 					tracked_count = int(len(good_next))
 
 					if tracked_count >= 4:
@@ -359,11 +423,15 @@ def main() -> None:
 							fb_ok = back_st.reshape(-1).astype(bool)
 							good_prev = good_prev[fb_ok]
 							good_next = good_next[fb_ok]
+							if good_origin is not None:
+								good_origin = good_origin[fb_ok]
 							back_xy = back_pts.reshape(-1, 2)[fb_ok]
 							fb_error = np.linalg.norm(good_prev - back_xy, axis=1)
 							keep = fb_error <= args.fb_thresh
 							good_prev = good_prev[keep]
 							good_next = good_next[keep]
+							if good_origin is not None:
+								good_origin = good_origin[keep]
 							tracked_count = int(len(good_next))
 
 					if tracked_count >= 4:
@@ -381,6 +449,7 @@ def main() -> None:
 							inliers = inlier_mask.reshape(-1).astype(bool)
 							in_prev = good_prev[inliers]
 							in_next = good_next[inliers]
+							in_origin = good_origin[inliers] if good_origin is not None else None
 							inlier_count = int(len(in_next))
 
 							if inlier_count >= 3:
@@ -397,10 +466,17 @@ def main() -> None:
 									cv2.circle(frame_bgr, (x1, y1), 2, (0, 255, 0), -1, cv2.LINE_AA)
 
 								prev_pts = in_next.reshape(-1, 1, 2).astype(np.float32)
+								if in_origin is not None:
+									origin_pts = in_origin.reshape(-1, 1, 2).astype(np.float32)
+								else:
+									origin_pts = None
+									origin_valid = False
 								prev_gray = gray
 								status = "tracking"
 							else:
 								prev_pts = None
+								origin_pts = None
+								origin_valid = False
 								prev_gray = gray
 								status = "ransac-low-inliers"
 						else:
@@ -417,11 +493,18 @@ def main() -> None:
 								cv2.circle(frame_bgr, (x1, y1), 2, (80, 255, 80), -1, cv2.LINE_AA)
 
 							prev_pts = good_next.reshape(-1, 1, 2).astype(np.float32)
+							if good_origin is not None:
+								origin_pts = good_origin.reshape(-1, 1, 2).astype(np.float32)
+							else:
+								origin_pts = None
+								origin_valid = False
 							prev_gray = gray
 							inlier_count = tracked_count
 							status = "tracking-no-ransac"
 					else:
 						prev_pts = None
+						origin_pts = None
+						origin_valid = False
 						prev_gray = gray
 						status = "too-few-good-points"
 			else:
@@ -446,6 +529,48 @@ def main() -> None:
 			absolute_mm_x = absolute_dx * px_to_mm
 			absolute_mm_y = absolute_dy * px_to_mm
 
+			if (
+				origin_valid
+				and prev_pts is not None
+				and origin_pts is not None
+				and len(prev_pts) == len(origin_pts)
+				and len(prev_pts) >= 4
+			):
+				current_xy = prev_pts.reshape(-1, 2).astype(np.float64)
+				origin_xy = origin_pts.reshape(-1, 2).astype(np.float64)
+				_residual_xy, residual_mag_px = compute_local_deformation(
+					origin_xy,
+					current_xy,
+					args.ransac_thresh,
+				)
+
+				if len(residual_mag_px) > 0:
+					residual_mag_mm = residual_mag_px * px_to_mm
+					local_mean_mm = float(np.mean(residual_mag_mm))
+					local_p95_mm = float(np.percentile(residual_mag_mm, 95))
+					hot_idx = int(np.argmax(residual_mag_mm))
+					local_max_mm = float(residual_mag_mm[hot_idx])
+					hot_xy = current_xy[hot_idx]
+					hotspot_text = f"{int(hot_xy[0])},{int(hot_xy[1])}"
+
+					draw_norm = max(1e-9, float(np.percentile(residual_mag_px, 95)))
+					draw_step = max(1, len(current_xy) // max(1, args.draw_points))
+					for pt_xy, mag_px in zip(current_xy[::draw_step], residual_mag_px[::draw_step]):
+						lut_idx = int(np.clip((mag_px / draw_norm) * 255.0, 0, 255))
+						bgr = turbo_lut[lut_idx]
+						cv2.circle(
+							frame_bgr,
+							(int(pt_xy[0]), int(pt_xy[1])),
+							3,
+							(int(bgr[0]), int(bgr[1]), int(bgr[2])),
+							-1,
+							cv2.LINE_AA,
+						)
+
+					cv2.circle(frame_bgr, (int(hot_xy[0]), int(hot_xy[1])), 9, (0, 0, 255), 2, cv2.LINE_AA)
+
+				origin_state = f"origin:locked pts={len(current_xy)}"
+
 			put_lines(
 				frame_bgr,
 				[
@@ -453,7 +578,9 @@ def main() -> None:
 					f"points tracked={tracked_count} inliers={inlier_count} active={(0 if prev_pts is None else len(prev_pts))}",
 					f"dX={frame_dx:+6.2f}px dY={frame_dy:+6.2f}px rot={frame_angle:+5.2f}deg",
 					f"ABS=({absolute_mm_x:+8.3f},{absolute_mm_y:+8.3f}) mm  ABS_rot={absolute_angle:+6.2f}deg",
-					f"frame_mm=({frame_mm_x:+6.3f},{frame_mm_y:+6.3f})  {calibration_info}",
+					f"deform(mm) mean={local_mean_mm:6.3f} p95={local_p95_mm:6.3f} max={local_max_mm:6.3f}",
+					f"{origin_state} hotspot(px)={hotspot_text}  {calibration_info}",
+					f"frame_mm=({frame_mm_x:+6.3f},{frame_mm_y:+6.3f})",
 					"keys: q/ESC quit | r reseed | o origin | c move-calib | g grid-calib | s save",
 				],
 			)
@@ -469,7 +596,14 @@ def main() -> None:
 				manual_reseed = True
 			if key == ord("o"):
 				origin_inv_transform = np.linalg.inv(global_transform)
-				print("Origin set at current pose. ABS displacement reset to 0,0 mm.")
+				if prev_pts is not None and len(prev_pts) >= 4:
+					origin_pts = prev_pts.copy()
+					origin_valid = True
+					print("Origin set. ABS reset and local deformation baseline captured.")
+				else:
+					origin_pts = None
+					origin_valid = False
+					print("Origin set for ABS only. Press r, wait tracking, then press o again.")
 			if key == ord("c"):
 				global_t = np.array([global_transform[0, 2], global_transform[1, 2]], dtype=np.float64)
 				if calibration_start_global_t is None:
