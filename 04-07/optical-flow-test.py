@@ -100,6 +100,12 @@ def build_parser() -> argparse.ArgumentParser:
 		help="Run auto focus sweep once at startup and lock best lens position",
 	)
 	parser.add_argument(
+		"--focus-target-radius",
+		type=int,
+		default=140,
+		help="Radius in pixels for focus target region set by mouse click",
+	)
+	parser.add_argument(
 		"--exposure-us",
 		type=int,
 		default=0,
@@ -344,16 +350,53 @@ def compute_focus_score(gray: np.ndarray) -> float:
 	return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
-def compute_focus_score_from_rgb(frame_rgb: np.ndarray, center_ratio: float) -> float:
+def build_focus_target_mask(shape, focus_target: dict | None) -> np.ndarray | None:
+	if focus_target is None:
+		return None
+	x = focus_target.get("x")
+	y = focus_target.get("y")
+	r = int(max(10, focus_target.get("r", 100)))
+	if x is None or y is None:
+		return None
+
+	h, w = shape[:2]
+	cx = int(clamp(int(x), 0, w - 1))
+	cy = int(clamp(int(y), 0, h - 1))
+	mask = np.zeros((h, w), dtype=np.uint8)
+	cv2.circle(mask, (cx, cy), r, 255, -1)
+	return mask
+
+
+def compute_focus_score_from_rgb(frame_rgb: np.ndarray, center_ratio: float, focus_target: dict | None = None) -> float:
 	gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
 	ratio = clamp(center_ratio, 0.2, 1.0)
-	if ratio < 0.999:
-		h, w = gray.shape[:2]
-		ch = max(20, int(h * ratio))
-		cw = max(20, int(w * ratio))
-		y0 = (h - ch) // 2
-		x0 = (w - cw) // 2
-		gray = gray[y0 : y0 + ch, x0 : x0 + cw]
+	center_mask = build_roi_mask(gray.shape, ratio)
+	target_mask = build_focus_target_mask(gray.shape, focus_target)
+	base_mask = target_mask if target_mask is not None else center_mask
+	tone_mask = cv2.inRange(gray, 25, 235)
+	valid_mask = cv2.bitwise_and(base_mask, tone_mask)
+
+	# Prefer sharpness where the dot pattern exists, not bright glare regions.
+	dot_mask = choose_dot_mask(gray)
+	dot_mask = cv2.bitwise_and(dot_mask, base_mask)
+
+	lap_abs = np.abs(cv2.Laplacian(gray, cv2.CV_64F))
+
+	def robust_score(mask: np.ndarray) -> float | None:
+		vals = lap_abs[mask > 0]
+		if vals.size < 200:
+			return None
+		return float(np.percentile(vals, 92.0))
+
+	s_valid = robust_score(valid_mask)
+	s_dot = robust_score(dot_mask)
+
+	if s_dot is not None and s_valid is not None:
+		return 0.70 * s_dot + 0.30 * s_valid
+	if s_dot is not None:
+		return s_dot
+	if s_valid is not None:
+		return s_valid
 	return compute_focus_score(gray)
 
 
@@ -365,6 +408,7 @@ def run_focus_sweep(
 	frames_per_pos: int,
 	settle_ms: int,
 	center_ratio: float,
+	focus_target: dict | None = None,
 ) -> tuple[float, float, list[tuple[float, float]]]:
 	lo = max(0.0, float(min(lens_min, lens_max)))
 	hi = max(0.0, float(max(lens_min, lens_max)))
@@ -385,7 +429,7 @@ def run_focus_sweep(
 		score_sum = 0.0
 		for _i in range(frames_n):
 			fr = cam.capture_array()
-			score_sum += compute_focus_score_from_rgb(fr, center_ratio)
+			score_sum += compute_focus_score_from_rgb(fr, center_ratio, focus_target)
 
 		score_avg = score_sum / float(frames_n)
 		results.append((float(cur), float(score_avg)))
@@ -395,6 +439,18 @@ def run_focus_sweep(
 
 	best_pos = set_manual_focus(cam, best_pos)
 	return best_pos, best_score, results
+
+
+def make_focus_mouse_callback(focus_target: dict):
+	def _callback(event, x, y, _flags, _param):
+		if event == cv2.EVENT_LBUTTONDOWN:
+			focus_target["x"] = int(x)
+			focus_target["y"] = int(y)
+		if event == cv2.EVENT_RBUTTONDOWN:
+			focus_target["x"] = None
+			focus_target["y"] = None
+
+	return _callback
 
 
 def put_lines(frame: np.ndarray, lines) -> None:
@@ -595,6 +651,12 @@ def main() -> None:
 	cv2.resizeWindow(FLOW_WINDOW, args.width, args.height)
 	cv2.namedWindow(MASK_WINDOW, cv2.WINDOW_NORMAL)
 	cv2.resizeWindow(MASK_WINDOW, max(420, args.width // 2), max(240, args.height // 2))
+	focus_target = {
+		"x": None,
+		"y": None,
+		"r": int(max(20, args.focus_target_radius)),
+	}
+	cv2.setMouseCallback(FLOW_WINDOW, make_focus_mouse_callback(focus_target))
 
 	prev_gray = None
 	prev_pts = None
@@ -629,8 +691,10 @@ def main() -> None:
 	print("Running realtime optical flow.")
 	print(
 		"Keys: q/ESC=quit, r=reseed, o=set origin, c=move-calib, g=grid-calib, "
-		"m=manual focus, a=continuous AF, f=AF+lock, z=sweep+lock, [/] lens step, e=export, s=save"
+		"m=manual focus, a=continuous AF, f=AF+lock, z=sweep+lock, [/] lens step, "
+		"x=clear focus target, e=export, s=save"
 	)
+	print("Focus target: left-click Optical Flow window to set ROI, right-click to clear.")
 
 	focus_note = ""
 	if args.focus_sweep_on_start:
@@ -643,9 +707,19 @@ def main() -> None:
 			args.focus_sweep_frames,
 			args.focus_sweep_settle_ms,
 			args.focus_sweep_center,
+			focus_target,
 		)
 		focus_mode = "manual"
 		focus_note = f"sweep best={lens_position:.2f} sharp={sweep_score:.1f} n={len(sweep_results)}"
+		if len(sweep_results) >= 2:
+			sweep_scores = np.array([s for _lp, s in sweep_results], dtype=np.float64)
+			best_i = int(np.argmax(sweep_scores))
+			if best_i == 0 or best_i == len(sweep_results) - 1:
+				focus_note += " edge-range"
+				print(
+					"Sweep warning: best focus at range edge. "
+					"Try widening --focus-sweep-min/max around your working distance."
+				)
 		print(f"Startup sweep done. {focus_note}")
 
 	if export_enabled:
@@ -664,6 +738,15 @@ def main() -> None:
 				roi_mask = build_roi_mask(gray.shape, roi_scale)
 
 			frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+			if focus_target.get("x") is not None and focus_target.get("y") is not None:
+				h, w = frame_bgr.shape[:2]
+				cx = int(clamp(int(focus_target["x"]), 0, w - 1))
+				cy = int(clamp(int(focus_target["y"]), 0, h - 1))
+				rad = int(max(10, focus_target.get("r", 100)))
+				focus_target["x"] = cx
+				focus_target["y"] = cy
+				cv2.circle(frame_bgr, (cx, cy), rad, (255, 140, 0), 1, cv2.LINE_AA)
+				cv2.drawMarker(frame_bgr, (cx, cy), (255, 140, 0), cv2.MARKER_CROSS, 14, 1, cv2.LINE_AA)
 
 			now = time.perf_counter()
 			dt = max(1e-6, now - last_t)
@@ -1014,18 +1097,26 @@ def main() -> None:
 			elif export_enabled:
 				export_state = "export:on(no-file)"
 
+			if focus_target.get("x") is None:
+				focus_target_label = "center"
+			else:
+				focus_target_label = f"{focus_target['x']},{focus_target['y']}"
+
 			put_lines(
 				frame_bgr,
 				[
 					f"FPS:{smooth_fps:5.1f} status:{status}",
 					f"points tracked={tracked_count} inliers={inlier_count} active={(0 if prev_pts is None else len(prev_pts))}",
-					f"focus={focus_mode} lens={lens_position:4.2f} sharp={focus_score:8.1f} {focus_note}",
+					(
+						f"focus={focus_mode} lens={lens_position:4.2f} sharp={focus_score:8.1f} "
+						f"target={focus_target_label} {focus_note}"
+					),
 					f"dX={frame_dx:+6.2f}px dY={frame_dy:+6.2f}px rot={frame_angle:+5.2f}deg",
 					f"ABS=({absolute_mm_x:+8.3f},{absolute_mm_y:+8.3f}) mm  ABS_rot={absolute_angle:+6.2f}deg",
 					f"deform(mm) mean={local_mean_mm:6.3f} p95={local_p95_mm:6.3f} max={local_max_mm:6.3f}",
 					f"{origin_state} hotspot(px)={hotspot_text}  {calibration_info}",
 					f"frame_mm=({frame_mm_x:+6.3f},{frame_mm_y:+6.3f})  {export_state}",
-					"keys: r/o/c/g | m/a/f/z/[/] focus | e export | s save | q quit",
+					"keys: r/o/c/g | m/a/f/z/[/] focus | x clear-target | e export | s save | q quit",
 				],
 			)
 
@@ -1064,8 +1155,18 @@ def main() -> None:
 					args.focus_sweep_frames,
 					args.focus_sweep_settle_ms,
 					args.focus_sweep_center,
+					focus_target,
 				)
 				focus_note = f"sweep best={lens_position:.2f} sharp={sweep_score:.1f} n={len(sweep_results)}"
+				if len(sweep_results) >= 2:
+					sweep_scores = np.array([s for _lp, s in sweep_results], dtype=np.float64)
+					best_i = int(np.argmax(sweep_scores))
+					if best_i == 0 or best_i == len(sweep_results) - 1:
+						focus_note += " edge-range"
+						print(
+							"Sweep warning: best focus at range edge. "
+							"Try widening --focus-sweep-min/max around your working distance."
+						)
 				manual_reseed = True
 				prev_gray = None
 				prev_pts = None
@@ -1081,6 +1182,11 @@ def main() -> None:
 				lens_position = set_manual_focus(cam, lens_position + focus_step)
 				focus_note = ""
 				print(f"LensPosition -> {lens_position:.2f}")
+			if key == ord("x"):
+				focus_target["x"] = None
+				focus_target["y"] = None
+				focus_note = ""
+				print("Focus target cleared. Sweep will use center ROI.")
 			if key == ord("o"):
 				origin_inv_transform = np.linalg.inv(global_transform)
 				if prev_pts is not None and prev_ids is not None and len(prev_pts) >= 4:
