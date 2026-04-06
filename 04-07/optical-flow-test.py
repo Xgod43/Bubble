@@ -2,6 +2,7 @@ import argparse
 import csv
 import math
 import os
+import sys
 import time
 from datetime import datetime
 
@@ -110,6 +111,29 @@ def build_parser() -> argparse.ArgumentParser:
 		type=float,
 		default=0.9,
 		help="Half-range around current lens position used by hotspot autofocus (key h)",
+	)
+	parser.add_argument(
+		"--auto-hotspot-focus",
+		action="store_true",
+		help="Auto-run hotspot focus sweep when deformation max reaches a new peak",
+	)
+	parser.add_argument(
+		"--auto-hotspot-thresh-mm",
+		type=float,
+		default=0.35,
+		help="Minimum local max deformation (mm) to allow auto hotspot focus",
+	)
+	parser.add_argument(
+		"--auto-hotspot-min-rise-mm",
+		type=float,
+		default=0.08,
+		help="Required rise over last auto trigger peak (mm)",
+	)
+	parser.add_argument(
+		"--auto-hotspot-cooldown",
+		type=int,
+		default=80,
+		help="Minimum frame gap between auto hotspot focus sweeps",
 	)
 	parser.add_argument(
 		"--exposure-us",
@@ -447,6 +471,63 @@ def run_focus_sweep(
 	return best_pos, best_score, results
 
 
+def run_hotspot_focus_sweep(
+	cam: Picamera2,
+	lens_position: float,
+	hotspot_xy: tuple[int, int],
+	hotspot_id: int | None,
+	focus_target: dict,
+	sweep_min: float,
+	sweep_max: float,
+	sweep_step: float,
+	sweep_frames: int,
+	sweep_settle_ms: int,
+	sweep_center: float,
+	hotspot_focus_span: float,
+	trigger_label: str,
+) -> tuple[float, str, bool]:
+	# วิธีใช้: ฟังก์ชันนี้ทำงานเหมือนกดปุ่ม h โดยจะย้าย focus target ไปที่ hotspot แล้ว sweep หาเลนส์ที่คมที่สุด
+	hx, hy = hotspot_xy
+	focus_target["x"] = int(hx)
+	focus_target["y"] = int(hy)
+
+	span = max(0.10, float(hotspot_focus_span))
+	sweep_lo = max(float(sweep_min), float(lens_position - span))
+	sweep_hi = min(float(sweep_max), float(lens_position + span))
+	if sweep_hi - sweep_lo < max(0.02, float(sweep_step)):
+		sweep_lo = float(sweep_min)
+		sweep_hi = float(sweep_max)
+
+	print(
+		f"{trigger_label} hotspot focus sweep: "
+		f"id={hotspot_id} at {hx},{hy} range=({sweep_lo:.2f},{sweep_hi:.2f})"
+	)
+	lens_position, sweep_score, sweep_results = run_focus_sweep(
+		cam,
+		sweep_lo,
+		sweep_hi,
+		sweep_step,
+		sweep_frames,
+		sweep_settle_ms,
+		sweep_center,
+		focus_target,
+	)
+	focus_note = (
+		f"hotspot id={hotspot_id} lens={lens_position:.2f} "
+		f"sharp={sweep_score:.1f} n={len(sweep_results)}"
+	)
+
+	edge_range = False
+	if len(sweep_results) >= 2:
+		sweep_scores = np.array([s for _lp, s in sweep_results], dtype=np.float64)
+		best_i = int(np.argmax(sweep_scores))
+		if best_i == 0 or best_i == len(sweep_results) - 1:
+			edge_range = True
+			focus_note += " edge-range"
+
+	return lens_position, focus_note, edge_range
+
+
 def make_focus_mouse_callback(focus_target: dict):
 	def _callback(event, x, y, _flags, _param):
 		if event == cv2.EVENT_LBUTTONDOWN:
@@ -678,10 +759,17 @@ def main() -> None:
 	manual_reseed = True
 
 	px_to_mm = float(max(1e-9, args.px_to_mm))
+	px_to_mm_from_cli = "--px-to-mm" in sys.argv[1:]
+	scale_is_calibrated = bool(px_to_mm_from_cli)
 	global_transform = np.eye(3, dtype=np.float64)
 	origin_inv_transform = np.eye(3, dtype=np.float64)
 	calibration_start_global_t = None
-	calibration_info = f"scale={px_to_mm:.6f} mm/px"
+	if scale_is_calibrated:
+		calibration_info = f"scale={px_to_mm:.6f} mm/px (cli)"
+	else:
+		calibration_info = f"scale={px_to_mm:.6f} mm/px"
+	auto_hotspot_last_focus_frame = -1_000_000_000
+	auto_hotspot_last_trigger_peak_mm = 0.0
 	next_point_id = 0
 	export_every = max(1, int(args.export_every))
 	export_enabled = bool(args.export_fullfield)
@@ -701,6 +789,13 @@ def main() -> None:
 		"h=focus hotspot, x=clear focus target, e=export, s=save"
 	)
 	print("Focus target: left-click Optical Flow window to set ROI, right-click to clear.")
+	# วิธีใช้ (TH): ตั้ง baseline ด้วยปุ่ม o, คาลิเบรต mm/px ด้วยปุ่ม g หรือ c,
+	# แล้วใช้ h เพื่อโฟกัส hotspot ทันที หรือเปิด --auto-hotspot-focus ให้ระบบสั่งเองอัตโนมัติ
+	if args.auto_hotspot_focus:
+		print(
+			"Auto hotspot focus ON: triggers focus sweep on new deformation peak "
+			f"(th={args.auto_hotspot_thresh_mm:.3f}mm, rise={args.auto_hotspot_min_rise_mm:.3f}mm, cd={int(args.auto_hotspot_cooldown)}f)."
+		)
 
 	focus_note = ""
 	if args.focus_sweep_on_start:
@@ -812,6 +907,7 @@ def main() -> None:
 						est_scale = estimate_mm_per_px_from_grid(prev_pts, args.nn_distance_mm)
 						if est_scale is not None:
 							px_to_mm = est_scale
+							scale_is_calibrated = True
 							calibration_info = f"scale={px_to_mm:.6f} mm/px (auto-grid)"
 					if origin_valid:
 						origin_pts = None
@@ -1107,6 +1203,44 @@ def main() -> None:
 			elif export_enabled:
 				export_state = "export:on(no-file)"
 
+			# โหมดอัตโนมัติ: ทำงานเหมือนกดปุ่ม h เมื่อ hotspot ใหม่แรงขึ้นและพ้นช่วง cooldown
+			if (
+				args.auto_hotspot_focus
+				and hotspot_xy_for_focus is not None
+				and local_max_mm >= float(args.auto_hotspot_thresh_mm)
+				and local_max_mm >= (auto_hotspot_last_trigger_peak_mm + float(args.auto_hotspot_min_rise_mm))
+				and (frame_index - auto_hotspot_last_focus_frame) >= int(max(1, args.auto_hotspot_cooldown))
+			):
+				focus_mode = "manual"
+				lens_position, focus_note, edge_range = run_hotspot_focus_sweep(
+					cam,
+					lens_position,
+					hotspot_xy_for_focus,
+					hotspot_id_for_focus,
+					focus_target,
+					args.focus_sweep_min,
+					args.focus_sweep_max,
+					args.focus_sweep_step,
+					args.focus_sweep_frames,
+					args.focus_sweep_settle_ms,
+					args.focus_sweep_center,
+					args.hotspot_focus_span,
+					"AUTO",
+				)
+				if edge_range:
+					print(
+						"Sweep warning: best focus at range edge. "
+						"Try widening --focus-sweep-min/max or --hotspot-focus-span."
+					)
+				manual_reseed = True
+				prev_gray = None
+				prev_pts = None
+				prev_ids = None
+				auto_hotspot_last_focus_frame = frame_index
+				auto_hotspot_last_trigger_peak_mm = local_max_mm
+				status = "auto-hotspot-focus"
+				print(f"Auto hotspot focus done. {focus_note}")
+
 			if focus_target.get("x") is None:
 				focus_target_label = "center"
 			else:
@@ -1129,6 +1263,27 @@ def main() -> None:
 					"keys: r/o/c/g | m/a/f/z/h/[/] focus | x clear-target | e export | s save | q quit",
 				],
 			)
+
+			warning_lines = []
+			# เตือนสถานะที่ยังไม่พร้อมสำหรับการวัดเป็นหน่วย mm
+			if not origin_valid:
+				warning_lines.append("WARNING: origin is not set (press o)")
+			if not scale_is_calibrated:
+				warning_lines.append("WARNING: mm scale is not calibrated (press g or c)")
+			if warning_lines:
+				warn_y = 246
+				for warn in warning_lines:
+					cv2.putText(
+						frame_bgr,
+						warn,
+						(10, warn_y),
+						cv2.FONT_HERSHEY_SIMPLEX,
+						0.68,
+						(0, 0, 255),
+						2,
+						cv2.LINE_AA,
+					)
+					warn_y += 28
 
 			cv2.imshow(FLOW_WINDOW, frame_bgr)
 			if last_mask is not None:
@@ -1186,49 +1341,36 @@ def main() -> None:
 				if hotspot_xy_for_focus is None:
 					print("Hotspot focus unavailable: no hotspot detected in current frame.")
 				else:
-					hx, hy = hotspot_xy_for_focus
-					focus_target["x"] = int(hx)
-					focus_target["y"] = int(hy)
 					focus_mode = "manual"
-
-					span = max(0.10, float(args.hotspot_focus_span))
-					sweep_lo = max(float(args.focus_sweep_min), float(lens_position - span))
-					sweep_hi = min(float(args.focus_sweep_max), float(lens_position + span))
-					if sweep_hi - sweep_lo < max(0.02, float(args.focus_sweep_step)):
-						sweep_lo = float(args.focus_sweep_min)
-						sweep_hi = float(args.focus_sweep_max)
-
-					print(
-						"Running hotspot focus sweep: "
-						f"id={hotspot_id_for_focus} at {hx},{hy} range=({sweep_lo:.2f},{sweep_hi:.2f})"
-					)
-					lens_position, sweep_score, sweep_results = run_focus_sweep(
+					lens_position, focus_note, edge_range = run_hotspot_focus_sweep(
 						cam,
-						sweep_lo,
-						sweep_hi,
+						lens_position,
+						hotspot_xy_for_focus,
+						hotspot_id_for_focus,
+						focus_target,
+						args.focus_sweep_min,
+						args.focus_sweep_max,
 						args.focus_sweep_step,
 						args.focus_sweep_frames,
 						args.focus_sweep_settle_ms,
 						args.focus_sweep_center,
-						focus_target,
+						args.hotspot_focus_span,
+						"MANUAL",
 					)
-					focus_note = (
-						f"hotspot id={hotspot_id_for_focus} lens={lens_position:.2f} "
-						f"sharp={sweep_score:.1f} n={len(sweep_results)}"
-					)
-					if len(sweep_results) >= 2:
-						sweep_scores = np.array([s for _lp, s in sweep_results], dtype=np.float64)
-						best_i = int(np.argmax(sweep_scores))
-						if best_i == 0 or best_i == len(sweep_results) - 1:
-							focus_note += " edge-range"
-							print(
-								"Sweep warning: best focus at range edge. "
-								"Try widening --focus-sweep-min/max or --hotspot-focus-span."
-							)
+					if edge_range:
+						print(
+							"Sweep warning: best focus at range edge. "
+							"Try widening --focus-sweep-min/max or --hotspot-focus-span."
+						)
 					manual_reseed = True
 					prev_gray = None
 					prev_pts = None
 					prev_ids = None
+					auto_hotspot_last_focus_frame = frame_index
+					auto_hotspot_last_trigger_peak_mm = max(
+						auto_hotspot_last_trigger_peak_mm,
+						local_max_mm,
+					)
 					print(f"Hotspot focus done. {focus_note}")
 			if key == ord("["):
 				focus_mode = "manual"
@@ -1247,6 +1389,7 @@ def main() -> None:
 				print("Focus target cleared. Sweep will use center ROI.")
 			if key == ord("o"):
 				origin_inv_transform = np.linalg.inv(global_transform)
+				auto_hotspot_last_trigger_peak_mm = 0.0
 				if prev_pts is not None and prev_ids is not None and len(prev_pts) >= 4:
 					origin_pts = prev_pts.copy()
 					origin_ids = prev_ids.copy()
@@ -1275,6 +1418,7 @@ def main() -> None:
 						print("Calibration failed: measured movement < 1 px.")
 					else:
 						px_to_mm = float(args.calib_distance_mm / delta_px)
+						scale_is_calibrated = True
 						calibration_info = f"scale={px_to_mm:.6f} mm/px (calibrated)"
 						print(
 							"Calibration done: "
@@ -1292,6 +1436,7 @@ def main() -> None:
 						calibration_info = "grid-calib failed: no nn estimate"
 					else:
 						px_to_mm = est_scale
+						scale_is_calibrated = True
 						nn_px = estimate_nn_px(prev_pts)
 						calibration_info = f"scale={px_to_mm:.6f} mm/px (grid {args.nn_distance_mm:.3f}mm)"
 						if nn_px is None:
