@@ -38,6 +38,23 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--fb-thresh", type=float, default=1.7, help="Forward-backward flow error threshold")
 	parser.add_argument("--ransac-thresh", type=float, default=3.2, help="RANSAC reprojection threshold")
 	parser.add_argument(
+		"--nn-distance-mm",
+		type=float,
+		default=7.071067811865,
+		help="Known nearest-neighbor dot spacing in mm (ScreenType1 ~= 7.07 mm)",
+	)
+	parser.add_argument(
+		"--auto-grid-calib",
+		action="store_true",
+		help="Auto-update mm/px from detected nearest-neighbor spacing on reseed",
+	)
+	parser.add_argument(
+		"--calib-distance-mm",
+		type=float,
+		default=10.0,
+		help="Known movement distance used by calibration key c (mm)",
+	)
+	parser.add_argument(
 		"--px-to-mm",
 		type=float,
 		default=1.0,
@@ -157,6 +174,67 @@ def put_lines(frame: np.ndarray, lines) -> None:
 		y += 24
 
 
+def rigid_transform_from_affine_2x3(affine_2x3: np.ndarray) -> np.ndarray:
+	a = float(affine_2x3[0, 0])
+	b = float(affine_2x3[1, 0])
+	norm = max(1e-9, math.hypot(a, b))
+	cos_theta = a / norm
+	sin_theta = b / norm
+
+	out = np.eye(3, dtype=np.float64)
+	out[0, 0] = cos_theta
+	out[0, 1] = -sin_theta
+	out[1, 0] = sin_theta
+	out[1, 1] = cos_theta
+	out[0, 2] = float(affine_2x3[0, 2])
+	out[1, 2] = float(affine_2x3[1, 2])
+	return out
+
+
+def translation_matrix(dx: float, dy: float) -> np.ndarray:
+	out = np.eye(3, dtype=np.float64)
+	out[0, 2] = float(dx)
+	out[1, 2] = float(dy)
+	return out
+
+
+def angle_deg_from_matrix(tf: np.ndarray) -> float:
+	return math.degrees(math.atan2(float(tf[1, 0]), float(tf[0, 0])))
+
+
+def estimate_nn_px(points: np.ndarray) -> float | None:
+	if points is None or len(points) < 4:
+		return None
+
+	xy = points.reshape(-1, 2).astype(np.float64)
+	diff = xy[:, None, :] - xy[None, :, :]
+	dist = np.sqrt(np.sum(diff * diff, axis=2))
+	n = dist.shape[0]
+	dist[np.arange(n), np.arange(n)] = np.inf
+	nn = np.min(dist, axis=1)
+	nn = nn[np.isfinite(nn)]
+	if len(nn) < 4:
+		return None
+
+	q1, q3 = np.percentile(nn, [25, 75])
+	iqr = max(1e-9, float(q3 - q1))
+	lo = float(q1 - 1.5 * iqr)
+	hi = float(q3 + 1.5 * iqr)
+	keep = (nn >= lo) & (nn <= hi)
+	filtered = nn[keep]
+	if len(filtered) < 4:
+		filtered = nn
+
+	return float(np.median(filtered))
+
+
+def estimate_mm_per_px_from_grid(points: np.ndarray, nn_distance_mm: float) -> float | None:
+	nn_px = estimate_nn_px(points)
+	if nn_px is None or nn_px <= 1e-9:
+		return None
+	return float(nn_distance_mm / nn_px)
+
+
 def main() -> None:
 	args = build_parser().parse_args()
 
@@ -178,12 +256,17 @@ def main() -> None:
 	last_seed_frame = -1
 	manual_reseed = True
 
-	cumulative_dx = 0.0
-	cumulative_dy = 0.0
+	px_to_mm = float(max(1e-9, args.px_to_mm))
+	global_transform = np.eye(3, dtype=np.float64)
+	origin_inv_transform = np.eye(3, dtype=np.float64)
+	calibration_start_global_t = None
+	calibration_info = f"scale={px_to_mm:.6f} mm/px"
+
 	smooth_fps = 0.0
 	last_t = time.perf_counter()
 
-	print("Running realtime optical flow. Keys: q/ESC=quit, r=reseed, s=save frame")
+	print("Running realtime optical flow.")
+	print("Keys: q/ESC=quit, r=reseed, o=set origin, c=move-calib, g=grid-calib, s=save")
 
 	try:
 		while True:
@@ -205,6 +288,7 @@ def main() -> None:
 			frame_dx = 0.0
 			frame_dy = 0.0
 			frame_angle = 0.0
+			step_transform = None
 			tracked_count = 0
 			inlier_count = 0
 			status = "tracking"
@@ -233,6 +317,11 @@ def main() -> None:
 
 				if points is not None and len(points) >= args.min_track_points:
 					prev_pts = points
+					if args.auto_grid_calib:
+						est_scale = estimate_mm_per_px_from_grid(prev_pts, args.nn_distance_mm)
+						if est_scale is not None:
+							px_to_mm = est_scale
+							calibration_info = f"scale={px_to_mm:.6f} mm/px (auto-grid)"
 					prev_gray = gray
 					last_seed_frame = frame_index
 					status = f"reseed:{reseed_reason} det={detected_count} use={len(prev_pts)}"
@@ -298,8 +387,7 @@ def main() -> None:
 								frame_dx = float(affine[0, 2])
 								frame_dy = float(affine[1, 2])
 								frame_angle = math.degrees(math.atan2(float(affine[1, 0]), float(affine[0, 0])))
-								cumulative_dx += frame_dx
-								cumulative_dy += frame_dy
+								step_transform = rigid_transform_from_affine_2x3(affine)
 
 								draw_step = max(1, len(in_next) // max(1, args.draw_points))
 								for p0, p1 in zip(in_prev[::draw_step], in_next[::draw_step]):
@@ -319,8 +407,7 @@ def main() -> None:
 							flow = good_next - good_prev
 							frame_dx = float(np.median(flow[:, 0]))
 							frame_dy = float(np.median(flow[:, 1]))
-							cumulative_dx += frame_dx
-							cumulative_dy += frame_dy
+							step_transform = translation_matrix(frame_dx, frame_dy)
 
 							draw_step = max(1, len(good_next) // max(1, args.draw_points))
 							for p0, p1 in zip(good_prev[::draw_step], good_next[::draw_step]):
@@ -341,15 +428,23 @@ def main() -> None:
 				prev_gray = gray
 				status = "waiting-for-seed"
 
+			if step_transform is not None:
+				global_transform = step_transform @ global_transform
+
+			absolute_transform = global_transform @ origin_inv_transform
+			absolute_dx = float(absolute_transform[0, 2])
+			absolute_dy = float(absolute_transform[1, 2])
+			absolute_angle = angle_deg_from_matrix(absolute_transform)
+
 			h, w = frame_bgr.shape[:2]
 			if roi_scale < 0.999:
 				roi_axes = (max(10, int(w * roi_scale * 0.5)), max(10, int(h * roi_scale * 0.5)))
 				cv2.ellipse(frame_bgr, (w // 2, h // 2), roi_axes, 0, 0, 360, (255, 180, 0), 1, cv2.LINE_AA)
 
-			frame_mm_x = frame_dx * args.px_to_mm
-			frame_mm_y = frame_dy * args.px_to_mm
-			cumulative_mm_x = cumulative_dx * args.px_to_mm
-			cumulative_mm_y = cumulative_dy * args.px_to_mm
+			frame_mm_x = frame_dx * px_to_mm
+			frame_mm_y = frame_dy * px_to_mm
+			absolute_mm_x = absolute_dx * px_to_mm
+			absolute_mm_y = absolute_dy * px_to_mm
 
 			put_lines(
 				frame_bgr,
@@ -357,8 +452,9 @@ def main() -> None:
 					f"FPS:{smooth_fps:5.1f} status:{status}",
 					f"points tracked={tracked_count} inliers={inlier_count} active={(0 if prev_pts is None else len(prev_pts))}",
 					f"dX={frame_dx:+6.2f}px dY={frame_dy:+6.2f}px rot={frame_angle:+5.2f}deg",
-					f"dX={frame_mm_x:+6.3f}mm dY={frame_mm_y:+6.3f}mm cum=({cumulative_mm_x:+7.3f},{cumulative_mm_y:+7.3f})mm",
-					"keys: q/ESC quit | r reseed | s save",
+					f"ABS=({absolute_mm_x:+8.3f},{absolute_mm_y:+8.3f}) mm  ABS_rot={absolute_angle:+6.2f}deg",
+					f"frame_mm=({frame_mm_x:+6.3f},{frame_mm_y:+6.3f})  {calibration_info}",
+					"keys: q/ESC quit | r reseed | o origin | c move-calib | g grid-calib | s save",
 				],
 			)
 
@@ -371,6 +467,53 @@ def main() -> None:
 				break
 			if key == ord("r"):
 				manual_reseed = True
+			if key == ord("o"):
+				origin_inv_transform = np.linalg.inv(global_transform)
+				print("Origin set at current pose. ABS displacement reset to 0,0 mm.")
+			if key == ord("c"):
+				global_t = np.array([global_transform[0, 2], global_transform[1, 2]], dtype=np.float64)
+				if calibration_start_global_t is None:
+					calibration_start_global_t = global_t
+					calibration_info = (
+						f"calib armed: move {args.calib_distance_mm:.3f} mm then press c again"
+					)
+					print(
+						f"Calibration armed. Move by {args.calib_distance_mm:.3f} mm and press c again to finish."
+					)
+				else:
+					delta = global_t - calibration_start_global_t
+					delta_px = float(np.linalg.norm(delta))
+					if delta_px < 1.0:
+						calibration_info = "calib failed: move too small"
+						print("Calibration failed: measured movement < 1 px.")
+					else:
+						px_to_mm = float(args.calib_distance_mm / delta_px)
+						calibration_info = f"scale={px_to_mm:.6f} mm/px (calibrated)"
+						print(
+							"Calibration done: "
+							f"{args.calib_distance_mm:.3f} mm / {delta_px:.3f} px = {px_to_mm:.6f} mm/px"
+						)
+					calibration_start_global_t = None
+			if key == ord("g"):
+				if prev_pts is None or len(prev_pts) < 4:
+					print("Grid calibration failed: not enough active points.")
+					calibration_info = "grid-calib failed: low points"
+				else:
+					est_scale = estimate_mm_per_px_from_grid(prev_pts, args.nn_distance_mm)
+					if est_scale is None:
+						print("Grid calibration failed: could not estimate nearest-neighbor px distance.")
+						calibration_info = "grid-calib failed: no nn estimate"
+					else:
+						px_to_mm = est_scale
+						nn_px = estimate_nn_px(prev_pts)
+						calibration_info = f"scale={px_to_mm:.6f} mm/px (grid {args.nn_distance_mm:.3f}mm)"
+						if nn_px is None:
+							print(f"Grid calibration done: scale={px_to_mm:.6f} mm/px")
+						else:
+							print(
+								"Grid calibration done: "
+								f"{args.nn_distance_mm:.3f} mm / {nn_px:.3f} px = {px_to_mm:.6f} mm/px"
+							)
 			if key == ord("s"):
 				ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 				frame_name = f"flow_frame_{ts}.png"
