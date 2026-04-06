@@ -1,0 +1,208 @@
+2026-03-23 22:20:13,712 | INFO | Starting combined plot script
+2026-03-23 22:20:13,712 | INFO | Log file: /home/bubble/Desktop/AerkKungCNX/Pi/logs/test1.log
+2026-03-23 22:20:13,712 | INFO | PNG file: /home/bubble/Desktop/AerkKungCNX/Pi/logs/testplot1.png
+2026-03-23 22:20:13,713 | INFO | Run config: interrupt=True duration=20.00 sample_interval=0.500 plot_refresh=0.100
+2026-03-23 22:20:13,721 | INFO | Pressure sensor initialized
+2026-03-23 22:20:16,108 | INFO | HX711 initialized and reset
+2026-03-23 22:20:16,109 | INFO | Remove all weight from the scale...
+2026-03-23 22:20:19,755 | DEBUG | Raw average computed: -197055.750000 from 20 samples (requested=20)
+2026-03-23 22:20:19,755 | INFO | Tare offset: -197055.75
+2026-03-23 22:20:19,755 | INFO | Place 80.00 g on the scale...
+2026-03-23 22:20:24,440 | DEBUG | Raw average computed: -197049.800000 from 20 samples (requested=20)
+2026-03-23 22:20:24,440 | INFO | Calibration complete. counts_per_gram = 0.074375
+2026-03-23 22:20:24,440 | DEBUG | Calibration details: loaded_raw=-197049.800000, offset=-197055.750000, delta=5.950000, known_weight=80.000000
+2026-03-23 22:20:24,441 | INFO | HX711 interrupt callback enabled
+2026-03-23 22:20:24,475 | INFO | Displaying live plot window
+2026-03-23 22:20:26,293 | INFO | t=01s | weight_g=-662.185 | pressure_hpa=1080.750
+2026-03-23 22:20:28,823 | INFO | t=04s | weight_g=1162013.445 | pressure_hpa=1093.698
+2026-03-23 22:20:31,195 | INFO | t=06s | weight_g=1901589.916 | pressure_hpa=1097.317
+2026-03-23 22:20:33,664 | INFO | t=09s | weight_g=296870.588 | pressure_hpa=1086.584
+2026-03-23 22:20:35,608 | INFO | t=11s | weight_g=2215122.689 | pressure_hpa=1098.060
+2026-03-23 22:20:37,510 | INFO | t=13s | weight_g=174221.849 | pressure_hpa=1083.782
+2026-03-23 22:20:39,470 | INFO | t=15s | weight_g=847673.950 | pressure_hpa=1080.635
+2026-03-23 22:20:41,463 | INFO | t=17s | weight_g=1801031.933 | pressure_hpa=1096.584
+2026-03-23 22:20:43,391 | INFO | t=18s | weight_g=37912.605 | pressure_hpa=1081.785
+2026-03-23 22:20:45,395 | INFO | t=20s | weight_g=2096440.336 | pressure_hpa=1097.392
+2026-03-23 22:20:47,339 | INFO | Duration reached (20.93s). Closing plot.
+2026-03-23 22:20:53,008 | INFO | Saved plot PNG: /home/bubble/Desktop/AerkKungCNX/Pi/logs/testplot1.png
+2026-03-23 22:20:53,018 | INFO | Run finished
+2026-03-23 22:20:53,028 | INFO | HX711 callback count: 330
+2026-03-23 22:20:53,038 | INFO | Actual sample interval | n=9 min=1.902s max=2.530s mean=2.122s
+2026-03-23 22:20:53,049 | INFO | Weight summary | n=10 min=-662.185 max=2215122.689 mean=1053221.513
+2026-03-23 22:20:53,059 | INFO | Pressure summary | n=10 min=1080.635 max=1098.060 mean=1089.659
+2026-03-23 22:20:53,069 | INFO | HX711 callback disabled
+2026-03-23 22:20:53,180 | INFO | GPIO cleanup complete
+2026-03-23 22:21:39,871 | INFO | Starting combined plot script
+2026-03-23 22:21:39,871 | INFO | Log file: /home/bubble/Desktop/AerkKungCNX/Pi/logs/test1.log
+2026-03-23 22:21:39,872 | INFO | PNG file: /home/bubble/Desktop/AerkKungCNX/Pi/logs/testplot1.png
+2026-03-23 22:21:39,872 | INFO | Run config: interrupt=True duration=20.00 sample_interval=0.500 plot_refresh=0.100
+2026-03-23 22:21:39,880 | INFO | Pressure sensor initialized
+2026-03-23 22:21:42,268 | INFO | HX711 initialized and reset
+2026-03-23 22:21:42,268 | INFO | Remove all weight from the scale...
+2026-03-23 22:21:45,915 | DEBUG | Raw average computed: -207134.550000 from 20 samples (requested=20)
+2026-03-23 22:21:45,915 | INFO | Tare offset: -207134.55
+2026-03-23 22:21:45,915 | INFO | Place 80.00 g on the scale...
+2026-03-23 22:21:50,600 | DEBUG | Raw average computed: -197069.300000 from 20 samples (requested=20)
+2026-03-23 22:21:50,601 | INFO | Calibration complete. counts_per_gram = 125.815625
+2026-03-23 22:21:50,601 | DEBUG | Calibration details: loaded_raw=-197069.300000, offset=-207134.550000, delta=10065.250000, known_weight=80.000000
+2026-03-23 22:21:50,601 | INFO | HX711 interrupt callback enabled
+2026-03-23 22:21:50,637 | INFO | Displaying live plot window
+2026-03-23 22:21:52,694 | INFO | t=02s | weight_g=12.682 | pressure_hpa=1079.186
+2026-03-23 22:21:55,170 | INFO | t=04s | weight_g=1029.042 | pressure_hpa=1095.909
+2026-03-23 22:21:57,783 | INFO | t=07s | weight_g=962.254 | pressure_hpa=1100.375
+2026-03-23 22:21:59,662 | INFO | t=09s | weight_g=1265.666 | pressure_hpa=1082.486
+2026-03-23 22:22:01,472 | INFO | t=10s | weight_g=1218.526 | pressure_hpa=1099.820
+2026-03-23 22:22:03,290 | INFO | t=12s | weight_g=1385.882 | pressure_hpa=1081.550
+2026-03-23 22:22:05,185 | INFO | t=14s | weight_g=2022.297 | pressure_hpa=1104.868
+2026-03-23 22:22:07,260 | INFO | t=16s | weight_g=1646.326 | pressure_hpa=1082.013
+2026-03-23 22:22:09,116 | INFO | t=18s | weight_g=2183.565 | pressure_hpa=1106.760
+2026-03-23 22:22:11,075 | INFO | t=20s | weight_g=172.717 | pressure_hpa=1084.355
+2026-03-23 22:22:13,063 | INFO | Duration reached (20.45s). Closing plot.
+2026-03-23 22:22:18,952 | INFO | Saved plot PNG: /home/bubble/Desktop/AerkKungCNX/Pi/logs/testplot1.png
+2026-03-23 22:22:18,962 | INFO | Run finished
+2026-03-23 22:22:18,973 | INFO | HX711 callback count: 313
+2026-03-23 22:22:18,973 | INFO | Actual sample interval | n=9 min=1.810s max=2.612s mean=2.042s
+2026-03-23 22:22:18,973 | INFO | Weight summary | n=10 min=12.682 max=2183.565 mean=1189.896
+2026-03-23 22:22:18,973 | INFO | Pressure summary | n=10 min=1079.186 max=1106.760 mean=1091.732
+2026-03-23 22:22:18,973 | INFO | HX711 callback disabled
+2026-03-23 22:22:19,074 | INFO | GPIO cleanup complete
+2026-03-23 22:22:58,695 | INFO | Starting combined plot script
+2026-03-23 22:22:58,695 | INFO | Log file: /home/bubble/Desktop/AerkKungCNX/Pi/logs/test1.log
+2026-03-23 22:22:58,695 | INFO | PNG file: /home/bubble/Desktop/AerkKungCNX/Pi/logs/testplot1.png
+2026-03-23 22:22:58,695 | INFO | Run config: interrupt=True duration=20.00 sample_interval=0.500 plot_refresh=0.100
+2026-03-23 22:22:58,704 | INFO | Pressure sensor initialized
+2026-03-23 22:23:01,091 | INFO | HX711 initialized and reset
+2026-03-23 22:23:01,091 | INFO | Remove all weight from the scale...
+2026-03-23 22:23:04,738 | DEBUG | Raw average computed: -207051.500000 from 20 samples (requested=20)
+2026-03-23 22:23:04,738 | INFO | Tare offset: -207051.50
+2026-03-23 22:23:04,738 | INFO | Place 80.00 g on the scale...
+2026-03-23 22:23:09,423 | DEBUG | Raw average computed: -196959.750000 from 20 samples (requested=20)
+2026-03-23 22:23:09,423 | INFO | Calibration complete. counts_per_gram = 126.146875
+2026-03-23 22:23:09,423 | DEBUG | Calibration details: loaded_raw=-196959.750000, offset=-207051.500000, delta=10091.750000, known_weight=80.000000
+2026-03-23 22:23:09,424 | INFO | HX711 interrupt callback enabled
+2026-03-23 22:23:09,458 | INFO | Displaying live plot window
+2026-03-23 22:23:11,348 | INFO | t=01s | weight_g=0.178 | pressure_hpa=1077.106
+2026-03-23 22:23:14,017 | INFO | t=04s | weight_g=145.208 | pressure_hpa=1079.205
+2026-03-23 22:23:16,015 | INFO | t=06s | weight_g=1503.545 | pressure_hpa=1097.405
+2026-03-23 22:23:18,012 | INFO | t=08s | weight_g=441.180 | pressure_hpa=1084.281
+2026-03-23 22:23:19,726 | INFO | t=10s | weight_g=1074.307 | pressure_hpa=1093.454
+2026-03-23 22:23:21,301 | INFO | t=11s | weight_g=1930.801 | pressure_hpa=1102.561
+2026-03-23 22:23:23,054 | INFO | t=13s | weight_g=1379.420 | pressure_hpa=1094.086
+2026-03-23 22:23:24,811 | INFO | t=15s | weight_g=861.571 | pressure_hpa=1088.218
+2026-03-23 22:23:26,555 | INFO | t=17s | weight_g=464.566 | pressure_hpa=1080.940
+2026-03-23 22:23:28,236 | INFO | t=18s | weight_g=153.690 | pressure_hpa=1078.106
+2026-03-23 22:23:29,995 | INFO | t=20s | weight_g=1789.814 | pressure_hpa=1096.340
+2026-03-23 22:23:31,593 | INFO | Duration reached (20.55s). Closing plot.
+2026-03-23 22:23:37,155 | INFO | Saved plot PNG: /home/bubble/Desktop/AerkKungCNX/Pi/logs/testplot1.png
+2026-03-23 22:23:37,166 | INFO | Run finished
+2026-03-23 22:23:37,176 | INFO | HX711 callback count: 316
+2026-03-23 22:23:37,186 | INFO | Actual sample interval | n=10 min=1.575s max=2.669s mean=1.865s
+2026-03-23 22:23:37,196 | INFO | Weight summary | n=11 min=0.178 max=1930.801 mean=885.844
+2026-03-23 22:23:37,207 | INFO | Pressure summary | n=11 min=1077.106 max=1102.561 mean=1088.336
+2026-03-23 22:23:37,217 | INFO | HX711 callback disabled
+2026-03-23 22:23:37,328 | INFO | GPIO cleanup complete
+2026-03-23 22:24:06,346 | INFO | Starting combined plot script
+2026-03-23 22:24:06,346 | INFO | Log file: /home/bubble/Desktop/AerkKungCNX/Pi/logs/test1.log
+2026-03-23 22:24:06,346 | INFO | PNG file: /home/bubble/Desktop/AerkKungCNX/Pi/logs/testplot1.png
+2026-03-23 22:24:06,346 | INFO | Run config: interrupt=True duration=20.00 sample_interval=0.500 plot_refresh=0.100
+2026-03-23 22:24:06,354 | INFO | Pressure sensor initialized
+2026-03-23 22:24:08,742 | INFO | HX711 initialized and reset
+2026-03-23 22:24:08,742 | INFO | Remove all weight from the scale...
+2026-03-23 22:24:12,388 | DEBUG | Raw average computed: -206933.650000 from 20 samples (requested=20)
+2026-03-23 22:24:12,388 | INFO | Tare offset: -206933.65
+2026-03-23 22:24:12,388 | INFO | Place 80.00 g on the scale...
+2026-03-23 22:24:17,074 | DEBUG | Raw average computed: -196924.500000 from 20 samples (requested=20)
+2026-03-23 22:24:17,074 | INFO | Calibration complete. counts_per_gram = 125.114375
+2026-03-23 22:24:17,074 | DEBUG | Calibration details: loaded_raw=-196924.500000, offset=-206933.650000, delta=10009.150000, known_weight=80.000000
+2026-03-23 22:24:17,074 | INFO | HX711 interrupt callback enabled
+2026-03-23 22:24:17,110 | INFO | Displaying live plot window
+2026-03-23 22:24:19,011 | INFO | t=01s | weight_g=0.573 | pressure_hpa=1074.500
+2026-03-23 22:24:21,609 | INFO | t=04s | weight_g=1361.695 | pressure_hpa=1092.255
+2026-03-23 22:24:24,223 | INFO | t=07s | weight_g=1071.808 | pressure_hpa=1090.419
+2026-03-23 22:24:26,147 | INFO | t=09s | weight_g=207.375 | pressure_hpa=1078.620
+2026-03-23 22:24:28,117 | INFO | t=11s | weight_g=1259.988 | pressure_hpa=1092.802
+2026-03-23 22:24:29,954 | INFO | t=12s | weight_g=1850.912 | pressure_hpa=1100.329
+2026-03-23 22:24:32,129 | INFO | t=15s | weight_g=1907.476 | pressure_hpa=1095.792
+2026-03-23 22:24:33,742 | INFO | t=16s | weight_g=849.668 | pressure_hpa=1085.231
+2026-03-23 22:24:35,380 | INFO | t=18s | weight_g=283.378 | pressure_hpa=1077.105
+2026-03-23 22:24:37,057 | INFO | t=19s | weight_g=793.751 | pressure_hpa=1089.654
+2026-03-23 22:24:38,629 | INFO | t=21s | weight_g=1926.155 | pressure_hpa=1100.123
+2026-03-23 22:24:40,256 | INFO | Duration reached (21.53s). Closing plot.
+2026-03-23 22:24:45,190 | INFO | Saved plot PNG: /home/bubble/Desktop/AerkKungCNX/Pi/logs/testplot1.png
+2026-03-23 22:24:45,201 | INFO | Run finished
+2026-03-23 22:24:45,211 | INFO | HX711 callback count: 321
+2026-03-23 22:24:45,221 | INFO | Actual sample interval | n=10 min=1.573s max=2.615s mean=1.962s
+2026-03-23 22:24:45,232 | INFO | Weight summary | n=11 min=0.573 max=1926.155 mean=1046.616
+2026-03-23 22:24:45,242 | INFO | Pressure summary | n=11 min=1074.500 max=1100.329 mean=1088.803
+2026-03-23 22:24:45,252 | INFO | HX711 callback disabled
+2026-03-23 22:24:45,363 | INFO | GPIO cleanup complete
+2026-03-23 22:25:05,084 | INFO | Starting combined plot script
+2026-03-23 22:25:05,084 | INFO | Log file: /home/bubble/Desktop/AerkKungCNX/Pi/logs/test1.log
+2026-03-23 22:25:05,084 | INFO | PNG file: /home/bubble/Desktop/AerkKungCNX/Pi/logs/testplot1.png
+2026-03-23 22:25:05,084 | INFO | Run config: interrupt=True duration=20.00 sample_interval=0.500 plot_refresh=0.100
+2026-03-23 22:25:05,093 | INFO | Pressure sensor initialized
+2026-03-23 22:25:07,480 | INFO | HX711 initialized and reset
+2026-03-23 22:25:07,480 | INFO | Remove all weight from the scale...
+2026-03-23 22:25:11,426 | DEBUG | Raw average computed: -206289.950000 from 20 samples (requested=20)
+2026-03-23 22:25:11,427 | INFO | Tare offset: -206289.95
+2026-03-23 22:25:11,427 | INFO | Place 80.00 g on the scale...
+2026-03-23 22:25:16,112 | DEBUG | Raw average computed: -196788.350000 from 20 samples (requested=20)
+2026-03-23 22:25:16,112 | INFO | Calibration complete. counts_per_gram = 118.770000
+2026-03-23 22:25:16,112 | DEBUG | Calibration details: loaded_raw=-196788.350000, offset=-206289.950000, delta=9501.600000, known_weight=80.000000
+2026-03-23 22:25:16,113 | INFO | HX711 interrupt callback enabled
+2026-03-23 22:25:16,147 | INFO | Displaying live plot window
+2026-03-23 22:25:17,983 | INFO | t=01s | weight_g=-5.086 | pressure_hpa=1071.507
+2026-03-23 22:25:20,861 | INFO | t=04s | weight_g=939.277 | pressure_hpa=1076.663
+2026-03-23 22:25:23,064 | INFO | t=06s | weight_g=1436.650 | pressure_hpa=1092.647
+2026-03-23 22:25:24,935 | INFO | t=08s | weight_g=182.655 | pressure_hpa=1073.461
+2026-03-23 22:25:26,608 | INFO | t=10s | weight_g=1424.703 | pressure_hpa=1093.300
+2026-03-23 22:25:28,350 | INFO | t=12s | weight_g=194.182 | pressure_hpa=1072.092
+2026-03-23 22:25:30,177 | INFO | t=14s | weight_g=1678.993 | pressure_hpa=1097.254
+2026-03-23 22:25:32,173 | INFO | t=16s | weight_g=79.464 | pressure_hpa=1071.799
+2026-03-23 22:25:33,970 | INFO | t=17s | weight_g=2196.320 | pressure_hpa=1102.952
+2026-03-23 22:25:35,872 | INFO | t=19s | weight_g=2817.083 | pressure_hpa=1108.433
+2026-03-23 22:25:37,748 | INFO | t=21s | weight_g=2897.928 | pressure_hpa=1108.711
+2026-03-23 22:25:39,606 | INFO | Duration reached (21.61s). Closing plot.
+2026-03-23 22:25:45,241 | INFO | Saved plot PNG: /home/bubble/Desktop/AerkKungCNX/Pi/logs/testplot1.png
+2026-03-23 22:25:45,251 | INFO | Run finished
+2026-03-23 22:25:45,261 | INFO | HX711 callback count: 333
+2026-03-23 22:25:45,272 | INFO | Actual sample interval | n=10 min=1.668s max=2.878s mean=1.977s
+2026-03-23 22:25:45,282 | INFO | Weight summary | n=11 min=-5.086 max=2897.928 mean=1258.379
+2026-03-23 22:25:45,292 | INFO | Pressure summary | n=11 min=1071.507 max=1108.711 mean=1088.074
+2026-03-23 22:25:45,303 | INFO | HX711 callback disabled
+2026-03-23 22:25:45,414 | INFO | GPIO cleanup complete
+2026-03-23 22:26:33,310 | INFO | Starting combined plot script
+2026-03-23 22:26:33,310 | INFO | Log file: /home/bubble/Desktop/AerkKungCNX/Pi/logs/test1.log
+2026-03-23 22:26:33,310 | INFO | PNG file: /home/bubble/Desktop/AerkKungCNX/Pi/logs/testplot1.png
+2026-03-23 22:26:33,310 | INFO | Run config: interrupt=True duration=20.00 sample_interval=0.500 plot_refresh=0.100
+2026-03-23 22:26:33,318 | INFO | Pressure sensor initialized
+2026-03-23 22:26:35,706 | INFO | HX711 initialized and reset
+2026-03-23 22:26:35,706 | INFO | Remove all weight from the scale...
+2026-03-23 22:26:39,352 | DEBUG | Raw average computed: -201940.800000 from 20 samples (requested=20)
+2026-03-23 22:26:39,352 | INFO | Tare offset: -201940.80
+2026-03-23 22:26:39,353 | INFO | Place 80.00 g on the scale...
+2026-03-23 22:26:44,038 | DEBUG | Raw average computed: -196871.600000 from 20 samples (requested=20)
+2026-03-23 22:26:44,038 | INFO | Calibration complete. counts_per_gram = 63.365000
+2026-03-23 22:26:44,038 | DEBUG | Calibration details: loaded_raw=-196871.600000, offset=-201940.800000, delta=5069.200000, known_weight=80.000000
+2026-03-23 22:26:44,038 | INFO | HX711 interrupt callback enabled
+2026-03-23 22:26:44,073 | INFO | Displaying live plot window
+2026-03-23 22:26:45,961 | INFO | t=01s | weight_g=-79.022 | pressure_hpa=1067.751
+2026-03-23 22:26:48,480 | INFO | t=04s | weight_g=4221.192 | pressure_hpa=1100.789
+2026-03-23 22:26:50,592 | INFO | t=06s | weight_g=5538.749 | pressure_hpa=1107.252
+2026-03-23 22:26:52,571 | INFO | t=08s | weight_g=5679.426 | pressure_hpa=1106.820
+2026-03-23 22:26:54,304 | INFO | t=10s | weight_g=3550.301 | pressure_hpa=1091.906
+2026-03-23 22:26:56,041 | INFO | t=11s | weight_g=1990.512 | pressure_hpa=1081.158
+2026-03-23 22:26:57,816 | INFO | t=13s | weight_g=1062.318 | pressure_hpa=1073.736
+2026-03-23 22:26:59,615 | INFO | t=15s | weight_g=543.641 | pressure_hpa=1074.013
+2026-03-23 22:27:01,430 | INFO | t=17s | weight_g=2910.342 | pressure_hpa=1089.331
+2026-03-23 22:27:03,214 | INFO | t=19s | weight_g=3341.542 | pressure_hpa=1091.802
+2026-03-23 22:27:04,882 | INFO | t=20s | weight_g=1202.190 | pressure_hpa=1076.830
+2026-03-23 22:27:06,629 | INFO | Duration reached (20.82s). Closing plot.
+2026-03-23 22:27:11,651 | INFO | Saved plot PNG: /home/bubble/Desktop/AerkKungCNX/Pi/logs/testplot1.png
+2026-03-23 22:27:11,662 | INFO | Run finished
+2026-03-23 22:27:11,672 | INFO | HX711 callback count: 312
+2026-03-23 22:27:11,682 | INFO | Actual sample interval | n=10 min=1.663s max=2.529s mean=1.893s
+2026-03-23 22:27:11,692 | INFO | Weight summary | n=11 min=-79.022 max=5679.426 mean=2723.745
+2026-03-23 22:27:11,703 | INFO | Pressure summary | n=11 min=1067.751 max=1107.252 mean=1087.399
+2026-03-23 22:27:11,713 | INFO | HX711 callback disabled
+2026-03-23 22:27:11,824 | INFO | GPIO cleanup complete
