@@ -18,6 +18,7 @@ except Exception:
 
 FLOW_WINDOW = "Optical Flow"
 MASK_WINDOW = "Dot Mask"
+DEPTH_WINDOW = "Depth Graph"
 
 LK_PARAMS = dict(
 	winSize=(21, 21),
@@ -169,6 +170,18 @@ def build_parser() -> argparse.ArgumentParser:
 		type=float,
 		default=1.0,
 		help="Scale factor to convert px to mm (set from your calibration)",
+	)
+	parser.add_argument(
+		"--depth-graph-height",
+		type=int,
+		default=280,
+		help="Depth graph window height in pixels",
+	)
+	parser.add_argument(
+		"--depth-graph-max-mm",
+		type=float,
+		default=0.0,
+		help="Fixed Y-axis max for depth graph in mm, 0 = auto",
 	)
 	parser.add_argument("--draw-points", type=int, default=140, help="Maximum vectors drawn per frame")
 	parser.add_argument(
@@ -547,6 +560,97 @@ def put_lines(frame: np.ndarray, lines) -> None:
 		y += 24
 
 
+def build_depth_graph_image(
+	current_xy: np.ndarray | None,
+	depth_mm: np.ndarray | None,
+	width: int,
+	height: int,
+	max_mm_hint: float,
+) -> np.ndarray:
+	# หมายเหตุ: กราฟนี้เป็น "depth proxy" จาก local deformation (ไม่ใช่ความลึกจริงแบบ 3D)
+	graph_h = int(max(180, height))
+	graph_w = int(max(420, width))
+	img = np.full((graph_h, graph_w, 3), 18, dtype=np.uint8)
+
+	left = 56
+	right = 16
+	top = 26
+	bottom = 34
+	plot_w = max(10, graph_w - left - right)
+	plot_h = max(10, graph_h - top - bottom)
+
+	cv2.rectangle(img, (left, top), (left + plot_w, top + plot_h), (60, 60, 60), 1, cv2.LINE_AA)
+	cv2.putText(
+		img,
+		"Depth Graph (proxy from local deformation)",
+		(12, 18),
+		cv2.FONT_HERSHEY_SIMPLEX,
+		0.52,
+		(220, 220, 220),
+		1,
+		cv2.LINE_AA,
+	)
+
+	if current_xy is None or depth_mm is None or len(depth_mm) < 2:
+		cv2.putText(
+			img,
+			"Depth proxy unavailable: set origin (o) and keep stable tracked points",
+			(12, graph_h - 12),
+			cv2.FONT_HERSHEY_SIMPLEX,
+			0.48,
+			(170, 170, 170),
+			1,
+			cv2.LINE_AA,
+		)
+		return img
+
+	depth_vals = depth_mm.astype(np.float64)
+	xy_vals = current_xy.astype(np.float64)
+	order = np.argsort(xy_vals[:, 0])
+	depth_sorted = depth_vals[order]
+
+	auto_max = float(np.percentile(depth_sorted, 98.0))
+	auto_max = max(1e-6, auto_max)
+	if max_mm_hint > 0:
+		y_max = max(float(max_mm_hint), auto_max)
+	else:
+		y_max = auto_max
+
+	pts = []
+	n = len(depth_sorted)
+	for i, val in enumerate(depth_sorted):
+		x = left + int((plot_w - 1) * i / max(1, n - 1))
+		r = float(np.clip(val / y_max, 0.0, 1.0))
+		y = top + int((1.0 - r) * (plot_h - 1))
+		pts.append((x, y))
+
+	if len(pts) >= 2:
+		cv2.polylines(img, [np.array(pts, dtype=np.int32)], False, (70, 220, 255), 2, cv2.LINE_AA)
+
+	step = max(1, len(pts) // 80)
+	for i in range(0, len(pts), step):
+		cv2.circle(img, pts[i], 2, (0, 180, 255), -1, cv2.LINE_AA)
+
+	mean_v = float(np.mean(depth_sorted))
+	p95_v = float(np.percentile(depth_sorted, 95.0))
+	max_v = float(np.max(depth_sorted))
+
+	cv2.putText(img, f"{y_max:.3f} mm", (8, top + 6), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (190, 190, 190), 1, cv2.LINE_AA)
+	cv2.putText(img, "0", (30, top + plot_h), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (190, 190, 190), 1, cv2.LINE_AA)
+	cv2.putText(
+		img,
+		f"mean={mean_v:.3f}mm p95={p95_v:.3f}mm max={max_v:.3f}mm n={len(depth_sorted)}",
+		(12, graph_h - 12),
+		cv2.FONT_HERSHEY_SIMPLEX,
+		0.50,
+		(210, 210, 210),
+		1,
+		cv2.LINE_AA,
+	)
+
+	return img
+
+
 def rigid_transform_from_affine_2x3(affine_2x3: np.ndarray) -> np.ndarray:
 	a = float(affine_2x3[0, 0])
 	b = float(affine_2x3[1, 0])
@@ -738,6 +842,8 @@ def main() -> None:
 	cv2.resizeWindow(FLOW_WINDOW, args.width, args.height)
 	cv2.namedWindow(MASK_WINDOW, cv2.WINDOW_NORMAL)
 	cv2.resizeWindow(MASK_WINDOW, max(420, args.width // 2), max(240, args.height // 2))
+	cv2.namedWindow(DEPTH_WINDOW, cv2.WINDOW_NORMAL)
+	cv2.resizeWindow(DEPTH_WINDOW, max(520, args.width), max(180, args.depth_graph_height))
 	focus_target = {
 		"x": None,
 		"y": None,
@@ -871,6 +977,8 @@ def main() -> None:
 			hotspot_id_for_focus = None
 			origin_state = "origin:unset (press o)"
 			export_state = "export:off"
+			depth_graph_xy = None
+			depth_graph_mm = None
 
 			need_reseed = False
 			reseed_reason = ""
@@ -1135,6 +1243,8 @@ def main() -> None:
 					raw_xy = current_xy - origin_xy
 					raw_mag_px = np.linalg.norm(raw_xy, axis=1)
 					residual_mag_mm = residual_mag_px * px_to_mm
+					depth_graph_xy = current_xy
+					depth_graph_mm = residual_mag_mm
 					local_mean_mm = float(np.mean(residual_mag_mm))
 					local_p95_mm = float(np.percentile(residual_mag_mm, 95))
 					hot_idx = int(np.argmax(residual_mag_mm))
@@ -1285,9 +1395,18 @@ def main() -> None:
 					)
 					warn_y += 28
 
+			depth_graph_img = build_depth_graph_image(
+				depth_graph_xy,
+				depth_graph_mm,
+				args.width,
+				args.depth_graph_height,
+				float(max(0.0, args.depth_graph_max_mm)),
+			)
+
 			cv2.imshow(FLOW_WINDOW, frame_bgr)
 			if last_mask is not None:
 				cv2.imshow(MASK_WINDOW, last_mask)
+			cv2.imshow(DEPTH_WINDOW, depth_graph_img)
 
 			key = cv2.waitKey(1) & 0xFF
 			if key in (ord("q"), 27):
@@ -1462,10 +1581,12 @@ def main() -> None:
 				ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 				frame_name = f"flow_frame_{ts}.png"
 				mask_name = f"flow_mask_{ts}.png"
+				depth_name = f"flow_depth_{ts}.png"
 				cv2.imwrite(frame_name, frame_bgr)
 				if last_mask is not None:
 					cv2.imwrite(mask_name, last_mask)
-				print(f"Saved {frame_name} and {mask_name}")
+				cv2.imwrite(depth_name, depth_graph_img)
+				print(f"Saved {frame_name}, {mask_name}, and {depth_name}")
 	finally:
 		if export_file is not None:
 			export_file.close()
