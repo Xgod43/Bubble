@@ -19,6 +19,7 @@ except Exception:
 FLOW_WINDOW = "Optical Flow"
 MASK_WINDOW = "Dot Mask"
 DEPTH_WINDOW = "Depth Graph"
+DEPTH3D_WINDOW = "Depth Graph 3D"
 
 LK_PARAMS = dict(
 	winSize=(21, 21),
@@ -182,6 +183,30 @@ def build_parser() -> argparse.ArgumentParser:
 		type=float,
 		default=0.0,
 		help="Fixed Y-axis max for depth graph in mm, 0 = auto",
+	)
+	parser.add_argument(
+		"--depth-graph-3d-height",
+		type=int,
+		default=360,
+		help="Depth 3D graph window height in pixels",
+	)
+	parser.add_argument(
+		"--depth-graph-3d-z-scale",
+		type=float,
+		default=1.0,
+		help="Vertical exaggeration for 3D depth graph",
+	)
+	parser.add_argument(
+		"--depth-graph-3d-grid-x",
+		type=int,
+		default=24,
+		help="Grid resolution X for 3D depth graph",
+	)
+	parser.add_argument(
+		"--depth-graph-3d-grid-y",
+		type=int,
+		default=14,
+		help="Grid resolution Y for 3D depth graph",
 	)
 	parser.add_argument("--draw-points", type=int, default=140, help="Maximum vectors drawn per frame")
 	parser.add_argument(
@@ -651,6 +676,176 @@ def build_depth_graph_image(
 	return img
 
 
+def build_depth_graph_3d_image(
+	current_xy: np.ndarray | None,
+	depth_mm: np.ndarray | None,
+	frame_width: int,
+	frame_height: int,
+	graph_height: int,
+	max_mm_hint: float,
+	z_scale: float,
+	grid_x: int,
+	grid_y: int,
+) -> np.ndarray:
+	# หมายเหตุ: กราฟนี้เป็น 3D visualization ของ depth proxy จาก deformation (ไม่ใช่ depth จริงจากเซนเซอร์เชิงลึก)
+	graph_h = int(max(220, graph_height))
+	graph_w = int(max(560, frame_width))
+	img = np.full((graph_h, graph_w, 3), 16, dtype=np.uint8)
+
+	left = 14
+	right = 14
+	top = 30
+	bottom = 36
+	plot_w = max(20, graph_w - left - right)
+	plot_h = max(20, graph_h - top - bottom)
+
+	cv2.putText(
+		img,
+		"Depth Graph 3D (proxy surface)",
+		(14, 20),
+		cv2.FONT_HERSHEY_SIMPLEX,
+		0.56,
+		(220, 220, 220),
+		1,
+		cv2.LINE_AA,
+	)
+
+	if current_xy is None or depth_mm is None or len(depth_mm) < 8:
+		cv2.putText(
+			img,
+			"Depth proxy unavailable: set origin (o) and keep stable tracked points",
+			(14, graph_h - 12),
+			cv2.FONT_HERSHEY_SIMPLEX,
+			0.50,
+			(170, 170, 170),
+			1,
+			cv2.LINE_AA,
+		)
+		return img
+
+	gx = int(max(6, grid_x))
+	gy = int(max(4, grid_y))
+
+	xy = current_xy.astype(np.float64)
+	z = depth_mm.astype(np.float64)
+	x = np.clip(xy[:, 0], 0.0, float(max(1, frame_width - 1)))
+	y = np.clip(xy[:, 1], 0.0, float(max(1, frame_height - 1)))
+
+	ix = np.clip(np.round((x / float(max(1, frame_width - 1))) * (gx - 1)).astype(np.int32), 0, gx - 1)
+	iy = np.clip(np.round((y / float(max(1, frame_height - 1))) * (gy - 1)).astype(np.int32), 0, gy - 1)
+
+	z_sum = np.zeros((gy, gx), dtype=np.float64)
+	z_cnt = np.zeros((gy, gx), dtype=np.int32)
+	for k in range(len(z)):
+		cx = int(ix[k])
+		cy = int(iy[k])
+		z_sum[cy, cx] += float(z[k])
+		z_cnt[cy, cx] += 1
+
+	z_mean = np.full((gy, gx), np.nan, dtype=np.float64)
+	mask = z_cnt > 0
+	z_mean[mask] = z_sum[mask] / z_cnt[mask]
+
+	auto_max = float(np.nanpercentile(z_mean, 98.0)) if np.any(mask) else 1e-6
+	auto_max = max(1e-6, auto_max)
+	if max_mm_hint > 0:
+		z_max_mm = max(float(max_mm_hint), auto_max)
+	else:
+		z_max_mm = auto_max
+
+	cx0 = left + plot_w * 0.50
+	cy0 = top + plot_h * 0.76
+	scale_xy = min(plot_w, plot_h) * 0.53
+	scale_z = min(plot_h, plot_w) * 0.55 * max(0.2, float(z_scale))
+
+	def project(i: int, j: int, zr: float) -> tuple[int, int]:
+		xn = 0.0 if gx <= 1 else float(i) / float(gx - 1)
+		yn = 0.0 if gy <= 1 else float(j) / float(gy - 1)
+		xw = (xn - 0.5) * 2.0
+		yw = (yn - 0.5) * 2.0
+		sx = int(cx0 + (xw - yw) * scale_xy * 0.62)
+		sy = int(cy0 + (xw + yw) * scale_xy * 0.28 - float(np.clip(zr, 0.0, 1.0)) * scale_z)
+		return sx, sy
+
+	def color_from_ratio(r: float) -> tuple[int, int, int]:
+		r = float(np.clip(r, 0.0, 1.0))
+		b = int(255 * (1.0 - r))
+		g = int(190 * (1.0 - abs(2.0 * r - 1.0)) + 50)
+		rr = int(255 * r)
+		return (b, g, rr)
+
+	base_quad = [
+		project(0, 0, 0.0),
+		project(gx - 1, 0, 0.0),
+		project(gx - 1, gy - 1, 0.0),
+		project(0, gy - 1, 0.0),
+	]
+	cv2.polylines(img, [np.array(base_quad, dtype=np.int32)], True, (60, 60, 60), 1, cv2.LINE_AA)
+
+	peak_val = -1.0
+	peak_ij = None
+
+	for j in range(gy):
+		prev_p = None
+		prev_ratio = 0.0
+		for i in range(gx):
+			if not mask[j, i]:
+				prev_p = None
+				continue
+			val = float(z_mean[j, i])
+			ratio = float(np.clip(val / z_max_mm, 0.0, 1.0))
+			p = project(i, j, ratio)
+			if prev_p is not None:
+				c = color_from_ratio(0.5 * (prev_ratio + ratio))
+				cv2.line(img, prev_p, p, c, 1, cv2.LINE_AA)
+			prev_p = p
+			prev_ratio = ratio
+			if val > peak_val:
+				peak_val = val
+				peak_ij = (i, j, ratio)
+
+	for i in range(gx):
+		prev_p = None
+		prev_ratio = 0.0
+		for j in range(gy):
+			if not mask[j, i]:
+				prev_p = None
+				continue
+			val = float(z_mean[j, i])
+			ratio = float(np.clip(val / z_max_mm, 0.0, 1.0))
+			p = project(i, j, ratio)
+			if prev_p is not None:
+				c = color_from_ratio(0.5 * (prev_ratio + ratio))
+				cv2.line(img, prev_p, p, c, 1, cv2.LINE_AA)
+			prev_p = p
+			prev_ratio = ratio
+
+	if peak_ij is not None:
+		pi, pj, pr = peak_ij
+		p_peak = project(int(pi), int(pj), float(pr))
+		cv2.circle(img, p_peak, 5, (0, 0, 255), 2, cv2.LINE_AA)
+
+	z_axis_bottom = project(0, gy - 1, 0.0)
+	z_axis_top = project(0, gy - 1, 1.0)
+	cv2.arrowedLine(img, z_axis_bottom, z_axis_top, (170, 170, 170), 1, cv2.LINE_AA, tipLength=0.08)
+
+	mean_v = float(np.mean(z))
+	p95_v = float(np.percentile(z, 95.0))
+	max_v = float(np.max(z))
+	cv2.putText(
+		img,
+		f"z-max={z_max_mm:.3f}mm  mean={mean_v:.3f}mm  p95={p95_v:.3f}mm  max={max_v:.3f}mm",
+		(14, graph_h - 12),
+		cv2.FONT_HERSHEY_SIMPLEX,
+		0.50,
+		(210, 210, 210),
+		1,
+		cv2.LINE_AA,
+	)
+
+	return img
+
+
 def rigid_transform_from_affine_2x3(affine_2x3: np.ndarray) -> np.ndarray:
 	a = float(affine_2x3[0, 0])
 	b = float(affine_2x3[1, 0])
@@ -844,6 +1039,8 @@ def main() -> None:
 	cv2.resizeWindow(MASK_WINDOW, max(420, args.width // 2), max(240, args.height // 2))
 	cv2.namedWindow(DEPTH_WINDOW, cv2.WINDOW_NORMAL)
 	cv2.resizeWindow(DEPTH_WINDOW, max(520, args.width), max(180, args.depth_graph_height))
+	cv2.namedWindow(DEPTH3D_WINDOW, cv2.WINDOW_NORMAL)
+	cv2.resizeWindow(DEPTH3D_WINDOW, max(560, args.width), max(220, args.depth_graph_3d_height))
 	focus_target = {
 		"x": None,
 		"y": None,
@@ -1402,11 +1599,23 @@ def main() -> None:
 				args.depth_graph_height,
 				float(max(0.0, args.depth_graph_max_mm)),
 			)
+			depth_graph_3d_img = build_depth_graph_3d_image(
+				depth_graph_xy,
+				depth_graph_mm,
+				args.width,
+				args.height,
+				args.depth_graph_3d_height,
+				float(max(0.0, args.depth_graph_max_mm)),
+				float(max(0.1, args.depth_graph_3d_z_scale)),
+				int(max(6, args.depth_graph_3d_grid_x)),
+				int(max(4, args.depth_graph_3d_grid_y)),
+			)
 
 			cv2.imshow(FLOW_WINDOW, frame_bgr)
 			if last_mask is not None:
 				cv2.imshow(MASK_WINDOW, last_mask)
 			cv2.imshow(DEPTH_WINDOW, depth_graph_img)
+			cv2.imshow(DEPTH3D_WINDOW, depth_graph_3d_img)
 
 			key = cv2.waitKey(1) & 0xFF
 			if key in (ord("q"), 27):
@@ -1582,11 +1791,13 @@ def main() -> None:
 				frame_name = f"flow_frame_{ts}.png"
 				mask_name = f"flow_mask_{ts}.png"
 				depth_name = f"flow_depth_{ts}.png"
+				depth3d_name = f"flow_depth3d_{ts}.png"
 				cv2.imwrite(frame_name, frame_bgr)
 				if last_mask is not None:
 					cv2.imwrite(mask_name, last_mask)
 				cv2.imwrite(depth_name, depth_graph_img)
-				print(f"Saved {frame_name}, {mask_name}, and {depth_name}")
+				cv2.imwrite(depth3d_name, depth_graph_3d_img)
+				print(f"Saved {frame_name}, {mask_name}, {depth_name}, and {depth3d_name}")
 	finally:
 		if export_file is not None:
 			export_file.close()
