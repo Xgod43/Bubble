@@ -32,6 +32,12 @@ def build_parser() -> argparse.ArgumentParser:
 	parser = argparse.ArgumentParser(description="Realtime dot-pattern optical flow for Pi Camera v3")
 	parser.add_argument("--width", type=int, default=1280, help="Preview width")
 	parser.add_argument("--height", type=int, default=720, help="Preview height")
+	parser.add_argument(
+		"--window-scale",
+		type=float,
+		default=0.62,
+		help="Display scale for OpenCV windows (smaller makes all windows more compact)",
+	)
 	parser.add_argument("--fps", type=float, default=60.0, help="Requested camera frame rate")
 	parser.add_argument("--roi-scale", type=float, default=0.96, help="Ellipse ROI scale in [0.1, 1.0]")
 	parser.add_argument("--max-points", type=int, default=260, help="Max points kept after reseed")
@@ -113,6 +119,30 @@ def build_parser() -> argparse.ArgumentParser:
 		type=float,
 		default=0.9,
 		help="Half-range around current lens position used by hotspot autofocus (key h)",
+	)
+	parser.add_argument(
+		"--hotspot-confirm-frames",
+		type=int,
+		default=3,
+		help="Consecutive frames required to confirm hotspot marker",
+	)
+	parser.add_argument(
+		"--hotspot-sigma-thresh",
+		type=float,
+		default=3.0,
+		help="Hotspot outlier threshold in robust sigma units",
+	)
+	parser.add_argument(
+		"--hotspot-roi-guard",
+		type=float,
+		default=0.92,
+		help="Keep hotspot away from ellipse edge (normalized radius^2 limit)",
+	)
+	parser.add_argument(
+		"--hotspot-ema",
+		type=float,
+		default=0.65,
+		help="EMA smoothing factor for hotspot marker position",
 	)
 	parser.add_argument(
 		"--auto-hotspot-focus",
@@ -237,6 +267,54 @@ def build_parser() -> argparse.ArgumentParser:
 		default="ellipsoid",
 		choices=["ellipsoid", "paraboloid"],
 		help="Reference dome shape for 3D graph",
+	)
+	parser.add_argument(
+		"--auto-origin",
+		action=argparse.BooleanOptionalAction,
+		default=True,
+		help="Automatically set origin after stable tracking window",
+	)
+	parser.add_argument(
+		"--auto-origin-stable-frames",
+		type=int,
+		default=18,
+		help="Number of consecutive stable frames required before auto origin set",
+	)
+	parser.add_argument(
+		"--auto-origin-min-points",
+		type=int,
+		default=48,
+		help="Minimum active points required for auto origin",
+	)
+	parser.add_argument(
+		"--auto-origin-max-frame-px",
+		type=float,
+		default=0.75,
+		help="Maximum frame translation in px for stability check",
+	)
+	parser.add_argument(
+		"--auto-origin-max-frame-mm",
+		type=float,
+		default=0.08,
+		help="Maximum frame translation in mm for stability check when scale is calibrated",
+	)
+	parser.add_argument(
+		"--auto-origin-max-rot-deg",
+		type=float,
+		default=0.28,
+		help="Maximum frame rotation in degrees for stability check",
+	)
+	parser.add_argument(
+		"--auto-origin-cooldown",
+		type=int,
+		default=140,
+		help="Minimum frame gap between automatic origin attempts",
+	)
+	parser.add_argument(
+		"--auto-origin-require-calibrated",
+		action=argparse.BooleanOptionalAction,
+		default=False,
+		help="Require calibrated mm scale before auto origin can trigger",
 	)
 	parser.add_argument("--draw-points", type=int, default=140, help="Maximum vectors drawn per frame")
 	parser.add_argument(
@@ -663,6 +741,10 @@ def build_depth_graph_image(
 	xy_vals = current_xy.astype(np.float64)
 	order = np.argsort(xy_vals[:, 0])
 	depth_sorted = depth_vals[order]
+	if len(depth_sorted) >= 5:
+		# Smooth the 1D profile so idle-state noise does not look like sharp zig-zag.
+		kernel = np.ones(5, dtype=np.float64) / 5.0
+		depth_sorted = np.convolve(depth_sorted, kernel, mode="same")
 
 	auto_max = float(np.percentile(depth_sorted, 98.0))
 	auto_max = max(1e-6, auto_max)
@@ -878,6 +960,19 @@ def build_depth_graph_3d_image(
 			xn = 0.0 if gx <= 1 else (float(i) / float(gx - 1)) * 2.0 - 1.0
 			yn = 0.0 if gy <= 1 else (float(j) / float(gy - 1)) * 2.0 - 1.0
 			xy_inside[j, i] = (xn * xn + yn * yn) <= 1.0
+
+	# Suppress isolated spikes and smooth the surface so pre-press frame looks flatter.
+	inside_vals = z_fill[xy_inside & np.isfinite(z_fill)]
+	if inside_vals.size >= 8:
+		hi_clip = float(np.percentile(inside_vals, 98.5))
+		z_fill = np.minimum(z_fill, hi_clip)
+	z_fill = cv2.GaussianBlur(
+		z_fill.astype(np.float32),
+		ksize=(0, 0),
+		sigmaX=1.05,
+		sigmaY=1.05,
+		borderType=cv2.BORDER_REPLICATE,
+	).astype(np.float64)
 
 	auto_max = float(np.nanpercentile(z_fill, 98.0)) if np.any(np.isfinite(z_fill)) else 1e-6
 	auto_max = max(1e-6, auto_max)
@@ -1195,6 +1290,17 @@ def write_fullfield_rows(
 		)
 
 
+def snapshot_origin(
+	global_transform: np.ndarray,
+	points: np.ndarray | None,
+	point_ids: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, bool]:
+	origin_inv_transform = np.linalg.inv(global_transform)
+	if points is None or point_ids is None or len(points) < 4:
+		return origin_inv_transform, None, None, False
+	return origin_inv_transform, points.copy(), point_ids.copy(), True
+
+
 def main() -> None:
 	args = build_parser().parse_args()
 
@@ -1213,14 +1319,19 @@ def main() -> None:
 		args.exposure_us,
 		args.analogue_gain,
 	)
+	window_scale = clamp(float(args.window_scale), 0.20, 1.00)
+	ui_w = int(max(420, round(args.width * window_scale)))
+	ui_h = int(max(240, round(args.height * window_scale)))
+	depth_ui_h = int(max(220, round(args.depth_graph_height * window_scale)))
+	depth3d_ui_h = int(max(220, round(args.depth_graph_3d_height * window_scale)))
 	cv2.namedWindow(FLOW_WINDOW, cv2.WINDOW_NORMAL)
-	cv2.resizeWindow(FLOW_WINDOW, args.width, args.height)
+	cv2.resizeWindow(FLOW_WINDOW, ui_w, ui_h)
 	cv2.namedWindow(MASK_WINDOW, cv2.WINDOW_NORMAL)
-	cv2.resizeWindow(MASK_WINDOW, max(420, args.width // 2), max(240, args.height // 2))
+	cv2.resizeWindow(MASK_WINDOW, ui_w, ui_h)
 	cv2.namedWindow(DEPTH_WINDOW, cv2.WINDOW_NORMAL)
-	cv2.resizeWindow(DEPTH_WINDOW, max(520, args.width), max(180, args.depth_graph_height))
+	cv2.resizeWindow(DEPTH_WINDOW, ui_w, depth_ui_h)
 	cv2.namedWindow(DEPTH3D_WINDOW, cv2.WINDOW_NORMAL)
-	cv2.resizeWindow(DEPTH3D_WINDOW, max(560, args.width), max(220, args.depth_graph_3d_height))
+	cv2.resizeWindow(DEPTH3D_WINDOW, ui_w, depth3d_ui_h)
 	focus_target = {
 		"x": None,
 		"y": None,
@@ -1253,6 +1364,11 @@ def main() -> None:
 		calibration_info = f"scale={px_to_mm:.6f} mm/px"
 	auto_hotspot_last_focus_frame = -1_000_000_000
 	auto_hotspot_last_trigger_peak_mm = 0.0
+	hotspot_lock_id = None
+	hotspot_lock_count = 0
+	hotspot_lock_xy = None
+	auto_origin_stable_count = 0
+	auto_origin_last_set_frame = -1_000_000_000
 	next_point_id = 0
 	export_every = max(1, int(args.export_every))
 	export_enabled = bool(args.export_fullfield)
@@ -1279,6 +1395,16 @@ def main() -> None:
 	print("Focus target: left-click Optical Flow window to set ROI, right-click to clear.")
 	# วิธีใช้ (TH): ตั้ง baseline ด้วยปุ่ม o, คาลิเบรต mm/px ด้วยปุ่ม g หรือ c,
 	# แล้วใช้ h เพื่อโฟกัส hotspot ทันที หรือเปิด --auto-hotspot-focus ให้ระบบสั่งเองอัตโนมัติ
+	if args.auto_origin:
+		print(
+			"Auto origin ON: "
+			f"stable={int(max(1, args.auto_origin_stable_frames))}f "
+			f"min_pts={int(max(4, args.auto_origin_min_points))} "
+			f"max_px={float(max(1e-6, args.auto_origin_max_frame_px)):.3f} "
+			f"max_rot={float(max(1e-6, args.auto_origin_max_rot_deg)):.3f}deg"
+		)
+	else:
+		print("Auto origin OFF (use key o to set manually).")
 	if args.auto_hotspot_focus:
 		print(
 			"Auto hotspot focus ON: triggers focus sweep on new deformation peak "
@@ -1327,8 +1453,8 @@ def main() -> None:
 				roi_mask = build_roi_mask(gray.shape, roi_scale)
 
 			frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+			h, w = frame_bgr.shape[:2]
 			if focus_target.get("x") is not None and focus_target.get("y") is not None:
-				h, w = frame_bgr.shape[:2]
 				cx = int(clamp(int(focus_target["x"]), 0, w - 1))
 				cy = int(clamp(int(focus_target["y"]), 0, h - 1))
 				rad = int(max(10, focus_target.get("r", 100)))
@@ -1357,6 +1483,11 @@ def main() -> None:
 			hotspot_text = "none"
 			hotspot_xy_for_focus = None
 			hotspot_id_for_focus = None
+			hotspot_candidate_xy = None
+			hotspot_candidate_id = None
+			hotspot_candidate_score = 0.0
+			hotspot_candidate_z = 0.0
+			hotspot_candidate_ok = False
 			origin_state = "origin:unset (press o)"
 			export_state = "export:off"
 			depth_graph_xy = None
@@ -1632,16 +1763,42 @@ def main() -> None:
 					raw_mag_px = np.linalg.norm(raw_xy, axis=1)
 					residual_mag_mm = residual_mag_px * px_to_mm
 					depth_graph_xy = current_xy
-					depth_graph_mm = residual_mag_mm
-					local_mean_mm = float(np.mean(residual_mag_mm))
-					local_p95_mm = float(np.percentile(residual_mag_mm, 95))
-					hot_idx = int(np.argmax(residual_mag_mm))
-					local_max_mm = float(residual_mag_mm[hot_idx])
+					# Remove per-frame floor noise so idle surface appears flatter before pressing.
+					noise_floor = float(np.percentile(residual_mag_mm, 55.0))
+					depth_proxy_mm = np.maximum(residual_mag_mm - noise_floor, 0.0)
+					if len(depth_proxy_mm) >= 8:
+						hi_clip = float(np.percentile(depth_proxy_mm, 99.0))
+						depth_proxy_mm = np.minimum(depth_proxy_mm, hi_clip)
+					depth_graph_mm = depth_proxy_mm
+					local_mean_mm = float(np.mean(depth_proxy_mm))
+					local_p95_mm = float(np.percentile(depth_proxy_mm, 95))
+					hot_idx = int(np.argmax(depth_proxy_mm))
+					local_max_mm = float(depth_proxy_mm[hot_idx])
 					hot_xy = current_xy[hot_idx]
 					hot_id = int(current_ids[hot_idx])
-					hotspot_text = f"id={hot_id}@{int(hot_xy[0])},{int(hot_xy[1])}"
-					hotspot_xy_for_focus = (int(hot_xy[0]), int(hot_xy[1]))
-					hotspot_id_for_focus = hot_id
+
+					proxy_med = float(np.median(depth_proxy_mm))
+					proxy_mad = float(np.median(np.abs(depth_proxy_mm - proxy_med)))
+					proxy_sigma = max(1e-9, 1.4826 * proxy_mad)
+					hot_z = float((local_max_mm - proxy_med) / proxy_sigma)
+					proxy_spread = float(np.percentile(depth_proxy_mm, 95) - np.percentile(depth_proxy_mm, 50))
+
+					cx_roi = 0.5 * float(w - 1)
+					cy_roi = 0.5 * float(h - 1)
+					ax_roi = max(10.0, float(w) * roi_scale * 0.5)
+					ay_roi = max(10.0, float(h) * roi_scale * 0.5)
+					nx = (float(hot_xy[0]) - cx_roi) / ax_roi
+					ny = (float(hot_xy[1]) - cy_roi) / ay_roi
+					ellipse_r2 = nx * nx + ny * ny
+					edge_ok = ellipse_r2 <= float(clamp(args.hotspot_roi_guard, 0.55, 0.99))
+					z_ok = hot_z >= float(max(0.5, args.hotspot_sigma_thresh))
+					spread_ok = proxy_spread > 1e-9
+
+					hotspot_candidate_ok = edge_ok and z_ok and spread_ok and (local_max_mm > 0.0)
+					hotspot_candidate_id = hot_id
+					hotspot_candidate_xy = (float(hot_xy[0]), float(hot_xy[1]))
+					hotspot_candidate_score = local_max_mm
+					hotspot_candidate_z = hot_z
 
 					draw_norm = max(1e-9, float(np.percentile(residual_mag_px, 95)))
 					draw_step = max(1, len(current_xy) // max(1, args.draw_points))
@@ -1656,8 +1813,6 @@ def main() -> None:
 							-1,
 							cv2.LINE_AA,
 						)
-
-					cv2.circle(frame_bgr, (int(hot_xy[0]), int(hot_xy[1])), 9, (0, 0, 255), 2, cv2.LINE_AA)
 
 					export_payload = (
 						current_ids,
@@ -1701,6 +1856,47 @@ def main() -> None:
 			elif export_enabled:
 				export_state = "export:on(no-file)"
 
+			req_confirm = int(max(1, args.hotspot_confirm_frames))
+			ema_alpha = float(clamp(args.hotspot_ema, 0.0, 1.0))
+			if hotspot_candidate_ok and hotspot_candidate_id is not None and hotspot_candidate_xy is not None:
+				cand_id = int(hotspot_candidate_id)
+				cand_xy = hotspot_candidate_xy
+
+				if hotspot_lock_id == cand_id:
+					hotspot_lock_count += 1
+				else:
+					hotspot_lock_id = cand_id
+					hotspot_lock_count = 1
+					hotspot_lock_xy = cand_xy
+
+				if hotspot_lock_xy is None:
+					hotspot_lock_xy = cand_xy
+				else:
+					hotspot_lock_xy = (
+						(1.0 - ema_alpha) * float(hotspot_lock_xy[0]) + ema_alpha * float(cand_xy[0]),
+						(1.0 - ema_alpha) * float(hotspot_lock_xy[1]) + ema_alpha * float(cand_xy[1]),
+					)
+
+				if hotspot_lock_count >= req_confirm and hotspot_lock_xy is not None:
+					px = int(clamp(round(hotspot_lock_xy[0]), 0, w - 1))
+					py = int(clamp(round(hotspot_lock_xy[1]), 0, h - 1))
+					hotspot_xy_for_focus = (px, py)
+					hotspot_id_for_focus = cand_id
+					hotspot_text = f"id={cand_id}@{px},{py} z={hotspot_candidate_z:.1f}"
+					cv2.circle(frame_bgr, (px, py), 9, (0, 0, 255), 2, cv2.LINE_AA)
+				elif hotspot_lock_xy is not None:
+					px = int(clamp(round(hotspot_lock_xy[0]), 0, w - 1))
+					py = int(clamp(round(hotspot_lock_xy[1]), 0, h - 1))
+					hotspot_text = f"pending {hotspot_lock_count}/{req_confirm} id={cand_id} z={hotspot_candidate_z:.1f}"
+					cv2.circle(frame_bgr, (px, py), 7, (0, 165, 255), 1, cv2.LINE_AA)
+			else:
+				if hotspot_lock_count > 0:
+					hotspot_lock_count -= 1
+				if hotspot_lock_count <= 0:
+					hotspot_lock_count = 0
+					hotspot_lock_id = None
+					hotspot_lock_xy = None
+
 			# โหมดอัตโนมัติ: ทำงานเหมือนกดปุ่ม h เมื่อ hotspot ใหม่แรงขึ้นและพ้นช่วง cooldown
 			if (
 				args.auto_hotspot_focus
@@ -1739,6 +1935,62 @@ def main() -> None:
 				status = "auto-hotspot-focus"
 				print(f"Auto hotspot focus done. {focus_note}")
 
+			active_points = 0 if prev_pts is None else int(len(prev_pts))
+			frame_shift_px = float(math.hypot(frame_dx, frame_dy))
+			frame_shift_mm = float(frame_shift_px * px_to_mm)
+			auto_origin_state = "auto-origin:off"
+
+			if args.auto_origin:
+				auto_origin_state = "auto-origin:wait"
+				if origin_valid:
+					auto_origin_state = "auto-origin:locked"
+					auto_origin_stable_count = 0
+				else:
+					if args.auto_origin_require_calibrated and not scale_is_calibrated:
+						auto_origin_state = "auto-origin:wait-scale"
+						auto_origin_stable_count = 0
+					else:
+						motion_ok = frame_shift_px <= float(max(1e-6, args.auto_origin_max_frame_px))
+						if scale_is_calibrated:
+							motion_ok = motion_ok and (
+								frame_shift_mm <= float(max(1e-6, args.auto_origin_max_frame_mm))
+							)
+						motion_ok = motion_ok and (
+							abs(frame_angle) <= float(max(1e-6, args.auto_origin_max_rot_deg))
+						)
+						tracking_ok = status.startswith("tracking") or status.startswith("reseed")
+						points_ok = active_points >= int(max(4, args.auto_origin_min_points))
+						cooldown_ok = (
+							(frame_index - auto_origin_last_set_frame)
+							>= int(max(1, args.auto_origin_cooldown))
+						)
+
+						if motion_ok and tracking_ok and points_ok and cooldown_ok:
+							auto_origin_stable_count += 1
+						else:
+							auto_origin_stable_count = 0
+
+						req_frames = int(max(1, args.auto_origin_stable_frames))
+						auto_origin_state = f"auto-origin:{auto_origin_stable_count}/{req_frames}"
+
+						if auto_origin_stable_count >= req_frames:
+							(
+								origin_inv_transform,
+								origin_pts,
+								origin_ids,
+								origin_valid,
+							) = snapshot_origin(global_transform, prev_pts, prev_ids)
+							auto_origin_last_set_frame = frame_index
+							auto_origin_stable_count = 0
+							auto_hotspot_last_trigger_peak_mm = 0.0
+							if origin_valid and origin_pts is not None:
+								auto_origin_state = "auto-origin:set"
+								status = "auto-origin"
+								print("Auto origin set: ABS reset and deformation baseline captured.")
+							else:
+								auto_origin_state = "auto-origin:failed"
+								print("Auto origin failed: low points.")
+
 			if focus_target.get("x") is None:
 				focus_target_label = "center"
 			else:
@@ -1757,7 +2009,7 @@ def main() -> None:
 					f"ABS=({absolute_mm_x:+8.3f},{absolute_mm_y:+8.3f}) mm  ABS_rot={absolute_angle:+6.2f}deg",
 					f"deform(mm) mean={local_mean_mm:6.3f} p95={local_p95_mm:6.3f} max={local_max_mm:6.3f}",
 					f"{origin_state} hotspot(px)={hotspot_text}  {calibration_info}",
-					f"frame_mm=({frame_mm_x:+6.3f},{frame_mm_y:+6.3f})  {export_state}",
+					f"frame_mm=({frame_mm_x:+6.3f},{frame_mm_y:+6.3f})  {export_state}  {auto_origin_state}",
 					"keys: r/o/c/g | m/a/f/z/h/[/] focus | x clear-target | e export | s save | q quit",
 				],
 			)
@@ -1916,17 +2168,18 @@ def main() -> None:
 				focus_note = ""
 				print("Focus target cleared. Sweep will use center ROI.")
 			if key == ord("o"):
-				origin_inv_transform = np.linalg.inv(global_transform)
+				(
+					origin_inv_transform,
+					origin_pts,
+					origin_ids,
+					origin_valid,
+				) = snapshot_origin(global_transform, prev_pts, prev_ids)
 				auto_hotspot_last_trigger_peak_mm = 0.0
-				if prev_pts is not None and prev_ids is not None and len(prev_pts) >= 4:
-					origin_pts = prev_pts.copy()
-					origin_ids = prev_ids.copy()
-					origin_valid = True
+				auto_origin_last_set_frame = frame_index
+				auto_origin_stable_count = 0
+				if origin_valid and origin_pts is not None:
 					print("Origin set. ABS reset and local deformation baseline captured.")
 				else:
-					origin_pts = None
-					origin_ids = None
-					origin_valid = False
 					print("Origin set for ABS only. Press r, wait tracking, then press o again.")
 			if key == ord("c"):
 				global_t = np.array([global_transform[0, 2], global_transform[1, 2]], dtype=np.float64)
