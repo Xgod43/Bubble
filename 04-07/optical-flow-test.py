@@ -208,6 +208,36 @@ def build_parser() -> argparse.ArgumentParser:
 		default=14,
 		help="Grid resolution Y for 3D depth graph",
 	)
+	parser.add_argument(
+		"--bubble-major-mm",
+		type=float,
+		default=110.0,
+		help="Real bubble major axis in mm",
+	)
+	parser.add_argument(
+		"--bubble-minor-mm",
+		type=float,
+		default=70.0,
+		help="Real bubble minor axis in mm",
+	)
+	parser.add_argument(
+		"--bubble-depth-mm",
+		type=float,
+		default=35.0,
+		help="Real bubble max depth in mm",
+	)
+	parser.add_argument(
+		"--depth-graph-3d-show-reference",
+		action="store_true",
+		help="Overlay reference dome from bubble geometry on 3D graph",
+	)
+	parser.add_argument(
+		"--depth-graph-3d-reference-shape",
+		type=str,
+		default="ellipsoid",
+		choices=["ellipsoid", "paraboloid"],
+		help="Reference dome shape for 3D graph",
+	)
 	parser.add_argument("--draw-points", type=int, default=140, help="Maximum vectors drawn per frame")
 	parser.add_argument(
 		"--export-fullfield",
@@ -676,6 +706,79 @@ def build_depth_graph_image(
 	return img
 
 
+def estimate_bubble_ellipse_pose(points_xy: np.ndarray | None):
+	if points_xy is None or len(points_xy) < 5:
+		return None
+
+	try:
+		pts = points_xy.astype(np.float32).reshape(-1, 1, 2)
+		(center_xy, axes_wh, angle_deg) = cv2.fitEllipse(pts)
+	except Exception:
+		return None
+
+	cx, cy = float(center_xy[0]), float(center_xy[1])
+	w, h = float(axes_wh[0]), float(axes_wh[1])
+	if w <= 1e-6 or h <= 1e-6:
+		return None
+
+	if w >= h:
+		a_px = 0.5 * w
+		b_px = 0.5 * h
+		theta_deg = angle_deg
+	else:
+		a_px = 0.5 * h
+		b_px = 0.5 * w
+		theta_deg = angle_deg + 90.0
+
+	return {
+		"cx": cx,
+		"cy": cy,
+		"a_px": float(max(1e-6, a_px)),
+		"b_px": float(max(1e-6, b_px)),
+		"theta": float(math.radians(theta_deg)),
+	}
+
+
+def point_xy_to_bubble_uv(points_xy: np.ndarray, bubble_pose: dict) -> np.ndarray:
+	dx = points_xy[:, 0] - float(bubble_pose["cx"])
+	dy = points_xy[:, 1] - float(bubble_pose["cy"])
+	ct = math.cos(float(bubble_pose["theta"]))
+	st = math.sin(float(bubble_pose["theta"]))
+
+	xr = ct * dx + st * dy
+	yr = -st * dx + ct * dy
+
+	u = xr / float(max(1e-6, bubble_pose["a_px"]))
+	v = yr / float(max(1e-6, bubble_pose["b_px"]))
+	return np.column_stack([u, v])
+
+
+def fill_nan_cells(z_grid: np.ndarray, passes: int = 5) -> np.ndarray:
+	out = z_grid.copy()
+	h, w = out.shape[:2]
+	for _ in range(max(1, int(passes))):
+		nan_idx = np.argwhere(~np.isfinite(out))
+		if len(nan_idx) == 0:
+			break
+
+		changed = 0
+		for y, x in nan_idx:
+			y0 = max(0, int(y) - 1)
+			y1 = min(h, int(y) + 2)
+			x0 = max(0, int(x) - 1)
+			x1 = min(w, int(x) + 2)
+			neigh = out[y0:y1, x0:x1]
+			vals = neigh[np.isfinite(neigh)]
+			if vals.size > 0:
+				out[y, x] = float(np.mean(vals))
+				changed += 1
+
+		if changed == 0:
+			break
+
+	return out
+
+
 def build_depth_graph_3d_image(
 	current_xy: np.ndarray | None,
 	depth_mm: np.ndarray | None,
@@ -686,6 +789,12 @@ def build_depth_graph_3d_image(
 	z_scale: float,
 	grid_x: int,
 	grid_y: int,
+	bubble_pose: dict | None,
+	bubble_major_mm: float,
+	bubble_minor_mm: float,
+	bubble_depth_mm: float,
+	show_reference: bool,
+	reference_shape: str,
 ) -> np.ndarray:
 	# หมายเหตุ: กราฟนี้เป็น 3D visualization ของ depth proxy จาก deformation (ไม่ใช่ depth จริงจากเซนเซอร์เชิงลึก)
 	graph_h = int(max(220, graph_height))
@@ -701,7 +810,7 @@ def build_depth_graph_3d_image(
 
 	cv2.putText(
 		img,
-		"Depth Graph 3D (proxy surface)",
+		"Depth Graph 3D (proxy surface, bubble-scaled)",
 		(14, 20),
 		cv2.FONT_HERSHEY_SIMPLEX,
 		0.56,
@@ -725,33 +834,59 @@ def build_depth_graph_3d_image(
 
 	gx = int(max(6, grid_x))
 	gy = int(max(4, grid_y))
+	b_major = float(max(1e-6, bubble_major_mm))
+	b_minor = float(max(1e-6, bubble_minor_mm))
+	b_depth = float(max(1e-6, bubble_depth_mm))
 
 	xy = current_xy.astype(np.float64)
 	z = depth_mm.astype(np.float64)
-	x = np.clip(xy[:, 0], 0.0, float(max(1, frame_width - 1)))
-	y = np.clip(xy[:, 1], 0.0, float(max(1, frame_height - 1)))
 
-	ix = np.clip(np.round((x / float(max(1, frame_width - 1))) * (gx - 1)).astype(np.int32), 0, gx - 1)
-	iy = np.clip(np.round((y / float(max(1, frame_height - 1))) * (gy - 1)).astype(np.int32), 0, gy - 1)
+	if bubble_pose is not None:
+		uv = point_xy_to_bubble_uv(xy, bubble_pose)
+	else:
+		xn = (xy[:, 0] / float(max(1, frame_width - 1))) * 2.0 - 1.0
+		yn = (xy[:, 1] / float(max(1, frame_height - 1))) * 2.0 - 1.0
+		uv = np.column_stack([xn, yn])
+
+	inside = np.sum(uv * uv, axis=1) <= 1.25
+	if np.count_nonzero(inside) >= 8:
+		uv_use = uv[inside]
+		z_use = z[inside]
+	else:
+		uv_use = uv
+		z_use = z
+
+	ix = np.clip(np.round((uv_use[:, 0] + 1.0) * 0.5 * (gx - 1)).astype(np.int32), 0, gx - 1)
+	iy = np.clip(np.round((uv_use[:, 1] + 1.0) * 0.5 * (gy - 1)).astype(np.int32), 0, gy - 1)
 
 	z_sum = np.zeros((gy, gx), dtype=np.float64)
 	z_cnt = np.zeros((gy, gx), dtype=np.int32)
-	for k in range(len(z)):
+	for k in range(len(z_use)):
 		cx = int(ix[k])
 		cy = int(iy[k])
-		z_sum[cy, cx] += float(z[k])
+		z_sum[cy, cx] += float(z_use[k])
 		z_cnt[cy, cx] += 1
 
 	z_mean = np.full((gy, gx), np.nan, dtype=np.float64)
 	mask = z_cnt > 0
 	z_mean[mask] = z_sum[mask] / z_cnt[mask]
+	z_fill = fill_nan_cells(z_mean, passes=6)
 
-	auto_max = float(np.nanpercentile(z_mean, 98.0)) if np.any(mask) else 1e-6
+	xy_inside = np.zeros((gy, gx), dtype=bool)
+	for j in range(gy):
+		for i in range(gx):
+			xn = 0.0 if gx <= 1 else (float(i) / float(gx - 1)) * 2.0 - 1.0
+			yn = 0.0 if gy <= 1 else (float(j) / float(gy - 1)) * 2.0 - 1.0
+			xy_inside[j, i] = (xn * xn + yn * yn) <= 1.0
+
+	auto_max = float(np.nanpercentile(z_fill, 98.0)) if np.any(np.isfinite(z_fill)) else 1e-6
 	auto_max = max(1e-6, auto_max)
+	z_max_mm = auto_max
 	if max_mm_hint > 0:
-		z_max_mm = max(float(max_mm_hint), auto_max)
-	else:
-		z_max_mm = auto_max
+		z_max_mm = max(z_max_mm, float(max_mm_hint))
+	if show_reference:
+		z_max_mm = max(z_max_mm, b_depth)
+	z_max_mm = max(1e-6, z_max_mm)
 
 	cx0 = left + plot_w * 0.50
 	cy0 = top + plot_h * 0.76
@@ -774,6 +909,18 @@ def build_depth_graph_3d_image(
 		rr = int(255 * r)
 		return (b, g, rr)
 
+	def ref_ratio_for_cell(i: int, j: int) -> float:
+		xn = 0.0 if gx <= 1 else (float(i) / float(gx - 1)) * 2.0 - 1.0
+		yn = 0.0 if gy <= 1 else (float(j) / float(gy - 1)) * 2.0 - 1.0
+		r2 = xn * xn + yn * yn
+		if r2 >= 1.0:
+			return 0.0
+		if reference_shape == "paraboloid":
+			zr = 1.0 - r2
+		else:
+			zr = math.sqrt(max(0.0, 1.0 - r2))
+		return float(np.clip((zr * b_depth) / z_max_mm, 0.0, 1.0))
+
 	base_quad = [
 		project(0, 0, 0.0),
 		project(gx - 1, 0, 0.0),
@@ -782,6 +929,29 @@ def build_depth_graph_3d_image(
 	]
 	cv2.polylines(img, [np.array(base_quad, dtype=np.int32)], True, (60, 60, 60), 1, cv2.LINE_AA)
 
+	if show_reference:
+		for j in range(gy):
+			prev_p = None
+			for i in range(gx):
+				if not xy_inside[j, i]:
+					prev_p = None
+					continue
+				p = project(i, j, ref_ratio_for_cell(i, j))
+				if prev_p is not None:
+					cv2.line(img, prev_p, p, (80, 80, 80), 1, cv2.LINE_AA)
+				prev_p = p
+
+		for i in range(gx):
+			prev_p = None
+			for j in range(gy):
+				if not xy_inside[j, i]:
+					prev_p = None
+					continue
+				p = project(i, j, ref_ratio_for_cell(i, j))
+				if prev_p is not None:
+					cv2.line(img, prev_p, p, (80, 80, 80), 1, cv2.LINE_AA)
+				prev_p = p
+
 	peak_val = -1.0
 	peak_ij = None
 
@@ -789,10 +959,10 @@ def build_depth_graph_3d_image(
 		prev_p = None
 		prev_ratio = 0.0
 		for i in range(gx):
-			if not mask[j, i]:
+			if not xy_inside[j, i] or not np.isfinite(z_fill[j, i]):
 				prev_p = None
 				continue
-			val = float(z_mean[j, i])
+			val = float(z_fill[j, i])
 			ratio = float(np.clip(val / z_max_mm, 0.0, 1.0))
 			p = project(i, j, ratio)
 			if prev_p is not None:
@@ -808,10 +978,10 @@ def build_depth_graph_3d_image(
 		prev_p = None
 		prev_ratio = 0.0
 		for j in range(gy):
-			if not mask[j, i]:
+			if not xy_inside[j, i] or not np.isfinite(z_fill[j, i]):
 				prev_p = None
 				continue
-			val = float(z_mean[j, i])
+			val = float(z_fill[j, i])
 			ratio = float(np.clip(val / z_max_mm, 0.0, 1.0))
 			p = project(i, j, ratio)
 			if prev_p is not None:
@@ -834,7 +1004,17 @@ def build_depth_graph_3d_image(
 	max_v = float(np.max(z))
 	cv2.putText(
 		img,
-		f"z-max={z_max_mm:.3f}mm  mean={mean_v:.3f}mm  p95={p95_v:.3f}mm  max={max_v:.3f}mm",
+		f"bubble={b_major:.1f}x{b_minor:.1f}mm depth={b_depth:.1f}mm  z-max={z_max_mm:.3f}mm",
+		(14, graph_h - 32),
+		cv2.FONT_HERSHEY_SIMPLEX,
+		0.48,
+		(190, 190, 190),
+		1,
+		cv2.LINE_AA,
+	)
+	cv2.putText(
+		img,
+		f"measured proxy: mean={mean_v:.3f}mm  p95={p95_v:.3f}mm  max={max_v:.3f}mm",
 		(14, graph_h - 12),
 		cv2.FONT_HERSHEY_SIMPLEX,
 		0.50,
@@ -1091,6 +1271,11 @@ def main() -> None:
 		"m=manual focus, a=continuous AF, f=AF+lock, z=sweep+lock, [/] lens step, "
 		"h=focus hotspot, x=clear focus target, e=export, s=save"
 	)
+	print(
+		"Bubble geometry: "
+		f"{float(args.bubble_major_mm):.1f}x{float(args.bubble_minor_mm):.1f} mm, "
+		f"depth={float(args.bubble_depth_mm):.1f} mm"
+	)
 	print("Focus target: left-click Optical Flow window to set ROI, right-click to clear.")
 	# วิธีใช้ (TH): ตั้ง baseline ด้วยปุ่ม o, คาลิเบรต mm/px ด้วยปุ่ม g หรือ c,
 	# แล้วใช้ h เพื่อโฟกัส hotspot ทันที หรือเปิด --auto-hotspot-focus ให้ระบบสั่งเองอัตโนมัติ
@@ -1176,6 +1361,7 @@ def main() -> None:
 			export_state = "export:off"
 			depth_graph_xy = None
 			depth_graph_mm = None
+			bubble_pose_for_3d = None
 
 			need_reseed = False
 			reseed_reason = ""
@@ -1430,6 +1616,11 @@ def main() -> None:
 					current_xy = current_xy[idx_curr]
 					origin_xy = origin_xy[idx_org]
 
+				if len(origin_xy) >= 5:
+					bubble_pose_for_3d = estimate_bubble_ellipse_pose(origin_xy)
+				elif len(current_xy) >= 5:
+					bubble_pose_for_3d = estimate_bubble_ellipse_pose(current_xy)
+
 				_residual_xy, residual_mag_px = compute_local_deformation(
 					origin_xy,
 					current_xy,
@@ -1592,6 +1783,9 @@ def main() -> None:
 					)
 					warn_y += 28
 
+			if bubble_pose_for_3d is None and prev_pts is not None and len(prev_pts) >= 5:
+				bubble_pose_for_3d = estimate_bubble_ellipse_pose(prev_pts.reshape(-1, 2).astype(np.float64))
+
 			depth_graph_img = build_depth_graph_image(
 				depth_graph_xy,
 				depth_graph_mm,
@@ -1609,6 +1803,12 @@ def main() -> None:
 				float(max(0.1, args.depth_graph_3d_z_scale)),
 				int(max(6, args.depth_graph_3d_grid_x)),
 				int(max(4, args.depth_graph_3d_grid_y)),
+				bubble_pose_for_3d,
+				float(max(1e-6, args.bubble_major_mm)),
+				float(max(1e-6, args.bubble_minor_mm)),
+				float(max(1e-6, args.bubble_depth_mm)),
+				bool(args.depth_graph_3d_show_reference),
+				str(args.depth_graph_3d_reference_shape),
 			)
 
 			cv2.imshow(FLOW_WINDOW, frame_bgr)
