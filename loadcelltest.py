@@ -7,8 +7,11 @@ import RPi.GPIO as GPIO
 HX711_LIB_DIR = Path(__file__).resolve().parent / "library" / "hx711py"
 if str(HX711_LIB_DIR) not in sys.path:
     sys.path.insert(0, str(HX711_LIB_DIR))
-
+#import hx711
+#from hx711 import HX711
 from hx711v0_5_1 import HX711
+#import adafruit_hx711
+#from adafruit_hx711.hx711 import HX711
 
 DT_PIN = 5
 SCK_PIN = 6

@@ -2,7 +2,7 @@
 
 #define LED_PIN     6
 #define NUM_LEDS    4
-#define BRIGHTNESS  80
+#define BRIGHTNESS  10
 #define LED_TYPE    WS2812B
 #define COLOR_ORDER GRB
 
@@ -20,9 +20,9 @@ void setup() {
 }
 
 void loop() {
-  fillAll(CRGB::Red);   delay(500);
-  fillAll(CRGB::Green); delay(500);
-  fillAll(CRGB::Blue);  delay(500);
+  //fillAll(CRGB::Red);   delay(500);
+  //fillAll(CRGB::Green); delay(500);
+  //fillAll(CRGB::Blue);  delay(500);
   fillAll(CRGB::White); delay(500);
-  fillAll(CRGB::Black); delay(500);
+  //fillAll(CRGB::Black); delay(500);
 }
