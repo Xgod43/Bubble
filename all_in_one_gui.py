@@ -542,28 +542,28 @@ class AllInOneTesterGUI:
 
         self.blob_camera_backend_var = tk.StringVar(value="auto")
         self.blob_camera_index_var = tk.StringVar(value="0")
-        self.blob_cam_width_var = tk.StringVar(value="2304")
-        self.blob_cam_height_var = tk.StringVar(value="1296")
+        self.blob_cam_width_var = tk.StringVar(value="1280")
+        self.blob_cam_height_var = tk.StringVar(value="720")
         self.blob_autofocus_var = tk.StringVar(value="continuous")
         self.blob_lens_position_var = tk.StringVar(value="1.0")
         self.blob_exposure_ev_var = tk.StringVar(value="0.8")
 
         self.blob_mode_var = tk.StringVar(value="dark")
-        self.blob_min_area_var = tk.StringVar(value="220")
-        self.blob_max_area_var = tk.StringVar(value="3600")
-        self.blob_min_circularity_var = tk.StringVar(value="0.32")
+        self.blob_min_area_var = tk.StringVar(value="260")
+        self.blob_max_area_var = tk.StringVar(value="3200")
+        self.blob_min_circularity_var = tk.StringVar(value="0.35")
         self.blob_use_roi_var = tk.BooleanVar(value=True)
-        self.blob_roi_percent_var = tk.StringVar(value="68")
-        self.blob_proc_scale_var = tk.StringVar(value="1.0")
-        self.blob_match_dist_var = tk.StringVar(value="8.0")
+        self.blob_roi_percent_var = tk.StringVar(value="62")
+        self.blob_proc_scale_var = tk.StringVar(value="0.65")
+        self.blob_match_dist_var = tk.StringVar(value="9.0")
         self.blob_mosaic_scale_var = tk.StringVar(value="0.6")
-        self.blob_use_pointcloud_var = tk.BooleanVar(value=True)
-        self.blob_use_mosaic_var = tk.BooleanVar(value=True)
+        self.blob_use_pointcloud_var = tk.BooleanVar(value=False)
+        self.blob_use_mosaic_var = tk.BooleanVar(value=False)
         self.blob_run_robust_test_var = tk.BooleanVar(value=False)
-        self.blob_profile_var = tk.StringVar(value="balanced")
-        self.blob_view_type_var = tk.StringVar(value="auto")
+        self.blob_profile_var = tk.StringVar(value="fast")
+        self.blob_view_type_var = tk.StringVar(value="overlay")
         self.blob_use_illum_norm_var = tk.BooleanVar(value=True)
-        self.blob_illum_method_var = tk.StringVar(value="clahe_bg")
+        self.blob_illum_method_var = tk.StringVar(value="clahe")
         self.blob_distance_scale_var = tk.StringVar(value="1.0")
         self.blob_distance_unit_var = tk.StringVar(value="px")
 
@@ -2605,31 +2605,50 @@ class AllInOneTesterGUI:
                     else 0.0
                 )
 
-                blob_vis = pipe.build_blob_view(binary, frame_bgr)
-                vector_vis = pipe.draw_displacement_vectors(blob_vis, reference_centroids, displacements)
-                heatmap = pipe.build_displacement_heatmap(frame_bgr.shape, reference_centroids, displacements)
-                heatmap_vis = pipe.overlay_heatmap(frame_bgr, heatmap)
                 view_type = params.get("view_type", "auto")
+                display_mode = view_type
+                if view_type == "auto":
+                    if params["use_mosaic"]:
+                        display_mode = "mosaic"
+                    elif params["use_pointcloud"]:
+                        display_mode = "pointcloud"
+                    else:
+                        display_mode = "overlay"
+
                 distance_text = ""
                 flow_distance_mean = None
                 flow_distance_max = None
-                pointcloud_vis = pipe.build_pointcloud_view(
-                    frame_bgr.shape,
-                    reference_centroids,
-                    displacements,
-                )
 
-                if view_type == "binary":
+                blob_vis = None
+                vector_vis = None
+                heatmap_vis = None
+                pointcloud_vis = None
+
+                if display_mode in {"blob", "vector", "overlay", "mosaic"}:
+                    blob_vis = pipe.build_blob_view(binary, frame_bgr)
+                if display_mode in {"vector", "overlay", "mosaic"}:
+                    vector_vis = pipe.draw_displacement_vectors(blob_vis, reference_centroids, displacements)
+                if display_mode in {"heatmap", "overlay", "mosaic"}:
+                    heatmap = pipe.build_displacement_heatmap(frame_bgr.shape, reference_centroids, displacements)
+                    heatmap_vis = pipe.overlay_heatmap(frame_bgr, heatmap)
+                if display_mode in {"pointcloud", "mosaic"}:
+                    pointcloud_vis = pipe.build_pointcloud_view(
+                        frame_bgr.shape,
+                        reference_centroids,
+                        displacements,
+                    )
+
+                if display_mode == "binary":
                     display_bgr = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
-                elif view_type == "blob":
+                elif display_mode == "blob":
                     display_bgr = blob_vis
-                elif view_type == "vector":
+                elif display_mode == "vector":
                     display_bgr = vector_vis
-                elif view_type == "heatmap":
+                elif display_mode == "heatmap":
                     display_bgr = heatmap_vis
-                elif view_type == "pointcloud":
+                elif display_mode == "pointcloud":
                     display_bgr = pointcloud_vis
-                elif view_type in {"optical_flow_2d", "optical_flow_3d"}:
+                elif display_mode in {"optical_flow_2d", "optical_flow_3d"}:
                     flow_gray = cv2.cvtColor(frame_for_detection, cv2.COLOR_BGR2GRAY)
                     display_bgr = frame_bgr.copy()
                     flow_reseed_counter += 1
@@ -2800,32 +2819,19 @@ class AllInOneTesterGUI:
                         )
 
                     flow_prev_gray = flow_gray
-                elif view_type == "mosaic":
+                elif display_mode == "mosaic":
                     display_bgr = pipe.build_mosaic(
                         pre,
                         binary,
                         vector_vis,
                         heatmap_vis,
-                        pointcloud_vis=pointcloud_vis if params["use_pointcloud"] else None,
+                        pointcloud_vis=pointcloud_vis,
                         scale=params["mosaic_scale"],
                     )
-                elif view_type == "overlay":
+                elif display_mode == "overlay":
                     display_bgr = cv2.addWeighted(vector_vis, 0.65, heatmap_vis, 0.35, 0)
                 else:
-                    if params["use_mosaic"]:
-                        display_bgr = pipe.build_mosaic(
-                            pre,
-                            binary,
-                            vector_vis,
-                            heatmap_vis,
-                            pointcloud_vis=pointcloud_vis if params["use_pointcloud"] else None,
-                            scale=params["mosaic_scale"],
-                        )
-                    elif params["use_pointcloud"]:
-                        overlay = cv2.addWeighted(vector_vis, 0.6, heatmap_vis, 0.4, 0)
-                        display_bgr = cv2.addWeighted(overlay, 0.8, pointcloud_vis, 0.2, 0)
-                    else:
-                        display_bgr = cv2.addWeighted(vector_vis, 0.65, heatmap_vis, 0.35, 0)
+                    display_bgr = cv2.addWeighted(vector_vis, 0.65, heatmap_vis, 0.35, 0)
 
                 if params["run_robust_test"]:
                     robust_countdown += 1
@@ -2850,7 +2856,7 @@ class AllInOneTesterGUI:
 
                 payload_mean_disp = mean_disp if flow_distance_mean is None else flow_distance_mean
                 payload_max_disp = max_disp if flow_distance_max is None else flow_distance_max
-                payload_mode = f"{params['mode']} | {view_type}"
+                payload_mode = f"{params['mode']} | {display_mode}"
 
                 self._enqueue_blob_frame(
                     {
