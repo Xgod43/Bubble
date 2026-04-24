@@ -941,6 +941,7 @@ class AllInOneTesterGUI:
         self.flow_cam_height_var = tk.StringVar(value="720")
         self.flow_proc_scale_var = tk.StringVar(value="1.0")
         self.flow_roi_scale_var = tk.StringVar(value="0.96")
+        self.flow_3d_roi_scale_var = tk.StringVar(value="0.40")
         self.flow_max_points_var = tk.StringVar(value="260")
         self.flow_quality_var = tk.StringVar(value="0.02")
         self.flow_min_distance_var = tk.StringVar(value="7")
@@ -1561,7 +1562,7 @@ class AllInOneTesterGUI:
 
         dialog = tk.Toplevel(self.root)
         dialog.title("Optical Flow Settings")
-        dialog.geometry("460x420")
+        dialog.geometry("460x460")
         dialog.transient(self.root)
         dialog.grab_set()
 
@@ -1576,6 +1577,7 @@ class AllInOneTesterGUI:
             ("Height", self.flow_cam_height_var),
             ("Proc Scale", self.flow_proc_scale_var),
             ("ROI Scale", self.flow_roi_scale_var),
+            ("3D ROI Scale", self.flow_3d_roi_scale_var),
             ("Max Points", self.flow_max_points_var),
             ("Quality", self.flow_quality_var),
             ("Min Distance", self.flow_min_distance_var),
@@ -1604,6 +1606,7 @@ class AllInOneTesterGUI:
         height = int(self.flow_cam_height_var.get().strip())
         proc_scale = float(self.flow_proc_scale_var.get().strip())
         roi_scale = float(self.flow_roi_scale_var.get().strip())
+        roi_3d_scale = float(self.flow_3d_roi_scale_var.get().strip())
         max_points = int(self.flow_max_points_var.get().strip())
         quality = float(self.flow_quality_var.get().strip())
         min_distance = float(self.flow_min_distance_var.get().strip())
@@ -1617,6 +1620,8 @@ class AllInOneTesterGUI:
             raise ValueError("Flow processing scale must be between 0.2 and 1.0.")
         if not (0.1 <= roi_scale <= 1.0):
             raise ValueError("Flow ROI scale must be between 0.1 and 1.0.")
+        if not (0.1 <= roi_3d_scale <= 1.0):
+            raise ValueError("3D flow ROI scale must be between 0.1 and 1.0.")
         if max_points <= 0:
             raise ValueError("Flow max points must be > 0.")
         if not (0.001 <= quality <= 0.5):
@@ -1633,6 +1638,7 @@ class AllInOneTesterGUI:
             "height": height,
             "proc_scale": proc_scale,
             "roi_scale": roi_scale,
+            "roi_3d_scale": roi_3d_scale,
             "max_points": max_points,
             "quality": quality,
             "min_distance": min_distance,
@@ -2479,6 +2485,11 @@ class AllInOneTesterGUI:
         flow_prev_pts = None
         flow_reseed_counter = 0
         flow_mag_ema = None
+        flow_3d_refresh_counter = 0
+        flow_3d_display_cache = None
+        flow_3d_distance_text_cache = ""
+        flow_3d_mean_cache = None
+        flow_3d_max_cache = None
 
         try:
             pipe = self.blob_module
@@ -2738,85 +2749,144 @@ class AllInOneTesterGUI:
                             flow_prev_pts = None
 
                     if view_type == "optical_flow_3d" and flow_prev_gray is not None:
-                        dense_flow = cv2.calcOpticalFlowFarneback(
-                            flow_prev_gray,
-                            flow_gray,
-                            None,
-                            0.5,
-                            3,
-                            21,
-                            3,
-                            5,
-                            1.2,
-                            cv2.OPTFLOW_FARNEBACK_GAUSSIAN,
-                        )
+                        flow_3d_refresh_counter += 1
+                        refresh_3d = flow_3d_display_cache is None or flow_3d_refresh_counter >= 3
 
-                        dense_dx = dense_flow[..., 0].astype(np.float32)
-                        dense_dy = dense_flow[..., 1].astype(np.float32)
-                        valid_mask = np.ones(flow_gray.shape, dtype=bool)
+                        if refresh_3d:
+                            flow_3d_refresh_counter = 0
 
-                        if flow_roi_mask is not None:
-                            roi_valid = flow_roi_mask > 0
-                            valid_mask &= roi_valid
-                            dense_dx = np.where(roi_valid, dense_dx, 0.0)
-                            dense_dy = np.where(roi_valid, dense_dy, 0.0)
+                            dense_prev_gray = flow_prev_gray
+                            dense_gray = flow_gray
+                            dense_roi_mask = flow_roi_mask
 
-                        # Suppress low-texture regions where dense optical flow is unstable.
-                        gx = cv2.Sobel(flow_gray, cv2.CV_32F, 1, 0, ksize=3)
-                        gy = cv2.Sobel(flow_gray, cv2.CV_32F, 0, 1, ksize=3)
-                        grad_mag = cv2.magnitude(gx, gy)
-                        grad_pool = grad_mag[valid_mask] if np.any(valid_mask) else grad_mag.reshape(-1)
-                        grad_thresh = float(np.percentile(grad_pool, 45.0)) if grad_pool.size > 0 else 0.0
-                        texture_mask = grad_mag >= grad_thresh
-                        valid_mask &= texture_mask
+                            if dense_gray.shape[0] >= 360 or dense_gray.shape[1] >= 640:
+                                dense_prev_gray = cv2.resize(
+                                    flow_prev_gray,
+                                    None,
+                                    fx=0.5,
+                                    fy=0.5,
+                                    interpolation=cv2.INTER_AREA,
+                                )
+                                dense_gray = cv2.resize(
+                                    flow_gray,
+                                    None,
+                                    fx=0.5,
+                                    fy=0.5,
+                                    interpolation=cv2.INTER_AREA,
+                                )
+                                if flow_roi_mask is not None:
+                                    dense_roi_mask = cv2.resize(
+                                        flow_roi_mask,
+                                        (dense_gray.shape[1], dense_gray.shape[0]),
+                                        interpolation=cv2.INTER_NEAREST,
+                                    )
 
-                        if np.any(valid_mask):
-                            # Remove global camera jitter so remaining magnitude better reflects deformation.
-                            global_dx = float(np.median(dense_dx[valid_mask]))
-                            global_dy = float(np.median(dense_dy[valid_mask]))
-                            dense_dx = dense_dx - global_dx
-                            dense_dy = dense_dy - global_dy
+                            dense_roi_scale = float(params.get("roi_3d_scale", params.get("roi_scale", 1.0)))
+                            dense_h, dense_w = dense_gray.shape[:2]
+                            dense_cx = dense_w // 2
+                            dense_cy = dense_h // 2
+                            dense_rx = max(8, int((dense_w * dense_roi_scale) * 0.5))
+                            dense_ry = max(8, int((dense_h * dense_roi_scale) * 0.5))
+                            dense_x0 = max(0, dense_cx - dense_rx)
+                            dense_x1 = min(dense_w, dense_cx + dense_rx)
+                            dense_y0 = max(0, dense_cy - dense_ry)
+                            dense_y1 = min(dense_h, dense_cy + dense_ry)
 
-                        dense_mag = cv2.magnitude(dense_dx, dense_dy)
-                        dense_mag = np.where(valid_mask, dense_mag, 0.0)
+                            dense_prev_gray = dense_prev_gray[dense_y0:dense_y1, dense_x0:dense_x1]
+                            dense_gray = dense_gray[dense_y0:dense_y1, dense_x0:dense_x1]
+                            if dense_roi_mask is not None:
+                                dense_roi_mask = dense_roi_mask[dense_y0:dense_y1, dense_x0:dense_x1]
 
-                        valid_mag = dense_mag[valid_mask] if np.any(valid_mask) else dense_mag.reshape(-1)
-                        if valid_mag.size > 0:
-                            clip_hi = float(np.percentile(valid_mag, 98.0))
-                            if clip_hi > 0:
-                                dense_mag = np.clip(dense_mag, 0.0, clip_hi)
+                            dense_flow = cv2.calcOpticalFlowFarneback(
+                                dense_prev_gray,
+                                dense_gray,
+                                None,
+                                0.5,
+                                2,
+                                15,
+                                2,
+                                5,
+                                1.1,
+                                cv2.OPTFLOW_FARNEBACK_GAUSSIAN,
+                            )
 
-                        dense_mag = cv2.GaussianBlur(dense_mag, (0, 0), sigmaX=1.4, sigmaY=1.4)
+                            dense_dx = dense_flow[..., 0].astype(np.float32)
+                            dense_dy = dense_flow[..., 1].astype(np.float32)
+                            valid_mask = np.ones(dense_gray.shape, dtype=bool)
 
-                        if flow_mag_ema is None or flow_mag_ema.shape != dense_mag.shape:
-                            flow_mag_ema = dense_mag
-                        else:
-                            flow_mag_ema = cv2.addWeighted(flow_mag_ema, 0.80, dense_mag, 0.20, 0.0)
+                            if dense_roi_mask is not None:
+                                roi_valid = dense_roi_mask > 0
+                                valid_mask &= roi_valid
+                                dense_dx = np.where(roi_valid, dense_dx, 0.0)
+                                dense_dy = np.where(roi_valid, dense_dy, 0.0)
 
-                        display_bgr = self._build_flow_3d_plot(flow_gray, flow_mag_ema, cv2, roi_mask=flow_roi_mask)
+                            # Suppress low-texture regions where dense optical flow is unstable.
+                            gx = cv2.Sobel(dense_gray, cv2.CV_32F, 1, 0, ksize=3)
+                            gy = cv2.Sobel(dense_gray, cv2.CV_32F, 0, 1, ksize=3)
+                            grad_mag = cv2.magnitude(gx, gy)
+                            grad_pool = grad_mag[valid_mask] if np.any(valid_mask) else grad_mag.reshape(-1)
+                            grad_thresh = float(np.percentile(grad_pool, 45.0)) if grad_pool.size > 0 else 0.0
+                            texture_mask = grad_mag >= grad_thresh
+                            valid_mask &= texture_mask
 
-                        scale = float(params.get("distance_scale", 1.0))
-                        unit = str(params.get("distance_unit", "px"))
-                        ema_valid_mag = flow_mag_ema[valid_mask] if np.any(valid_mask) else flow_mag_ema.reshape(-1)
-                        if ema_valid_mag.size > 0:
-                            flow_distance_mean = float(np.mean(ema_valid_mag)) * scale
-                            flow_distance_max = float(np.max(ema_valid_mag)) * scale
-                        else:
-                            flow_distance_mean = 0.0
-                            flow_distance_max = 0.0
-                        distance_text = (
-                            f"Distance mean: {flow_distance_mean:.3f} {unit} | "
-                            f"max: {flow_distance_max:.3f} {unit}"
-                        )
-                        cv2.putText(
-                            display_bgr,
-                            distance_text,
-                            (12, 50),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.60,
-                            (250, 245, 85),
-                            2,
-                        )
+                            if np.any(valid_mask):
+                                # Remove global camera jitter so remaining magnitude better reflects deformation.
+                                global_dx = float(np.median(dense_dx[valid_mask]))
+                                global_dy = float(np.median(dense_dy[valid_mask]))
+                                dense_dx = dense_dx - global_dx
+                                dense_dy = dense_dy - global_dy
+
+                            dense_mag = cv2.magnitude(dense_dx, dense_dy)
+                            dense_mag = np.where(valid_mask, dense_mag, 0.0)
+
+                            valid_mag = dense_mag[valid_mask] if np.any(valid_mask) else dense_mag.reshape(-1)
+                            if valid_mag.size > 0:
+                                clip_hi = float(np.percentile(valid_mag, 98.0))
+                                if clip_hi > 0:
+                                    dense_mag = np.clip(dense_mag, 0.0, clip_hi)
+
+                            dense_mag = cv2.GaussianBlur(dense_mag, (0, 0), sigmaX=1.4, sigmaY=1.4)
+
+                            if flow_mag_ema is None or flow_mag_ema.shape != dense_mag.shape:
+                                flow_mag_ema = dense_mag
+                            else:
+                                flow_mag_ema = cv2.addWeighted(flow_mag_ema, 0.80, dense_mag, 0.20, 0.0)
+
+                            display_bgr = self._build_flow_3d_plot(dense_gray, flow_mag_ema, cv2, roi_mask=dense_roi_mask)
+
+                            scale = float(params.get("distance_scale", 1.0))
+                            unit = str(params.get("distance_unit", "px"))
+                            ema_valid_mag = flow_mag_ema[valid_mask] if np.any(valid_mask) else flow_mag_ema.reshape(-1)
+                            if ema_valid_mag.size > 0:
+                                flow_distance_mean = float(np.mean(ema_valid_mag)) * scale
+                                flow_distance_max = float(np.max(ema_valid_mag)) * scale
+                            else:
+                                flow_distance_mean = 0.0
+                                flow_distance_max = 0.0
+                            distance_text = (
+                                f"Distance mean: {flow_distance_mean:.3f} {unit} | "
+                                f"max: {flow_distance_max:.3f} {unit}"
+                            )
+                            cv2.putText(
+                                display_bgr,
+                                distance_text,
+                                (12, 50),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.60,
+                                (250, 245, 85),
+                                2,
+                            )
+                            flow_3d_display_cache = display_bgr
+                            flow_3d_distance_text_cache = distance_text
+                            flow_3d_mean_cache = flow_distance_mean
+                            flow_3d_max_cache = flow_distance_max
+
+                        display_bgr = flow_3d_display_cache
+                        distance_text = flow_3d_distance_text_cache
+                        flow_distance_mean = flow_3d_mean_cache
+                        flow_distance_max = flow_3d_max_cache
+                        if display_bgr is None:
+                            display_bgr = cv2.cvtColor(flow_gray, cv2.COLOR_GRAY2BGR)
 
                     flow_prev_gray = flow_gray
                 elif display_mode == "mosaic":
