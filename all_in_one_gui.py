@@ -2026,14 +2026,6 @@ class AllInOneTesterGUI:
             )
             return
 
-        if self._is_flow_running():
-            self.log("Camera preview blocked while optical flow is still shutting down.")
-            messagebox.showwarning(
-                "Camera Busy",
-                "Optical flow is still releasing camera resources.",
-            )
-            return
-
         if self.camera_running:
             self.log("Camera preview is already running.")
             return
