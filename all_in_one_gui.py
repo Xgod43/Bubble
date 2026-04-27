@@ -2499,6 +2499,8 @@ class AllInOneTesterGUI:
             pipe.MIN_BLOB_AREA = int(params["min_area"])
             pipe.MAX_BLOB_AREA = int(params["max_area"])
             pipe.MIN_CIRCULARITY = float(params["min_circularity"])
+            if hasattr(pipe, "get_detection_backend_name"):
+                self.log(f"Blob detector backend: {pipe.get_detection_backend_name()}")
 
             stream = pipe.open_camera_stream(
                 camera_index=params["camera_index"],
@@ -2576,6 +2578,7 @@ class AllInOneTesterGUI:
                     binary,
                     min_area=params["min_area"],
                     max_area=params["max_area"],
+                    min_circularity=params["min_circularity"],
                 )
                 if not centroids:
                     keypoints = pipe.detect_blobs(binary)
@@ -3052,7 +3055,27 @@ class AllInOneTesterGUI:
         self.root.destroy()
 
 
-def main():
+def main(use_legacy=False):
+    if not use_legacy:
+        try:
+            sys.modules.setdefault("all_in_one_gui", sys.modules[__name__])
+            from python_mission_control_gui import main as modern_main
+
+            modern_main()
+            return
+        except Exception as exc:
+            try:
+                import traceback
+
+                log_path = Path(__file__).resolve().parent / "launch_errors.log"
+                with log_path.open("a", encoding="utf-8") as handle:
+                    handle.write("\n[all_in_one_gui_modern_redirect]\n")
+                    handle.write(
+                        "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+                    )
+            except Exception:
+                pass
+
     root = tk.Tk()
     app = AllInOneTesterGUI(root)
     root.mainloop()

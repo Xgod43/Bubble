@@ -2,12 +2,22 @@ import argparse
 import csv
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+try:
+    from backend.vision_native import NativeBlobDetector
+except Exception:
+    NativeBlobDetector = None
 
 try:
     from picamera2 import Picamera2
@@ -24,6 +34,17 @@ MAX_BLOB_AREA = 8000
 MIN_CIRCULARITY = 0.35
 MEDIAN_BLUR_KSIZE = 5
 MORPH_ITERATIONS = 1
+
+_NATIVE_DETECTOR = NativeBlobDetector() if NativeBlobDetector is not None else None
+_NATIVE_DETECTOR_ERROR = None
+
+
+def native_detector_available() -> bool:
+    return bool(_NATIVE_DETECTOR is not None and _NATIVE_DETECTOR.available)
+
+
+def get_detection_backend_name() -> str:
+    return "native-c" if native_detector_available() else "opencv-python"
 
 
 def preprocess(image: np.ndarray) -> np.ndarray:
@@ -107,7 +128,25 @@ def extract_centroids(keypoints):
     return [(int(k.pt[0]), int(k.pt[1])) for k in keypoints]
 
 
-def detect_centroids_from_binary(binary: np.ndarray, min_area=MIN_BLOB_AREA, max_area=MAX_BLOB_AREA):
+def detect_centroids_from_binary(
+    binary: np.ndarray,
+    min_area=MIN_BLOB_AREA,
+    max_area=MAX_BLOB_AREA,
+    min_circularity: float = MIN_CIRCULARITY,
+):
+    global _NATIVE_DETECTOR_ERROR
+    if native_detector_available():
+        try:
+            blobs = _NATIVE_DETECTOR.detect(
+                binary,
+                min_area=int(min_area),
+                max_area=int(max_area),
+                min_circularity=float(min_circularity),
+            )
+            return [(blob.x, blob.y) for blob in blobs]
+        except Exception as exc:
+            _NATIVE_DETECTOR_ERROR = str(exc)
+
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     centroids = []
     for cnt in contours:
@@ -118,7 +157,7 @@ def detect_centroids_from_binary(binary: np.ndarray, min_area=MIN_BLOB_AREA, max
         if perimeter <= 0:
             continue
         circularity = 4 * np.pi * (area / (perimeter * perimeter))
-        if circularity < MIN_CIRCULARITY:
+        if circularity < min_circularity:
             continue
         m = cv2.moments(cnt)
         if m["m00"] == 0:
