@@ -29,8 +29,12 @@ class MissionControlGUI(AllInOneTesterGUI):
     def __init__(self, root):
         super().__init__(root)
         self.root.title("Soft Gripper Bubble Console")
-        self.root.geometry("1520x960")
-        self.root.minsize(1280, 820)
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        initial_w = max(1024, min(1520, screen_w - 60))
+        initial_h = max(680, min(960, screen_h - 90))
+        self.root.geometry(f"{initial_w}x{initial_h}")
+        self.root.minsize(1024, 680)
         self.log("Mission control console loaded.")
 
     def _configure_styles(self):
@@ -199,7 +203,7 @@ class MissionControlGUI(AllInOneTesterGUI):
         main.pack(fill="both", expand=True)
         main.columnconfigure(0, weight=1)
         main.rowconfigure(2, weight=1)
-        main.rowconfigure(3, weight=1)
+        main.rowconfigure(3, weight=0)
 
         self._build_header(main)
         self._build_action_row(main)
@@ -384,7 +388,7 @@ class MissionControlGUI(AllInOneTesterGUI):
         card = ttk.LabelFrame(parent, text="Live Detection", padding=12)
         card.grid(row=0, column=0, sticky="nsew")
         card.columnconfigure(0, weight=1)
-        card.rowconfigure(1, weight=1)
+        card.rowconfigure(1, weight=1, minsize=240)
 
         ttk.Label(
             card,
@@ -668,7 +672,7 @@ class MissionControlGUI(AllInOneTesterGUI):
 
     def _build_flow_tab(self, tab):
         tab.columnconfigure(0, weight=1)
-        tab.rowconfigure(1, weight=1)
+        tab.rowconfigure(1, weight=1, minsize=220)
 
         top = ttk.Frame(tab, style="Surface.TFrame")
         top.grid(row=0, column=0, sticky="ew")
@@ -698,14 +702,14 @@ class MissionControlGUI(AllInOneTesterGUI):
 
         metrics = ttk.Frame(tab, style="App.TFrame")
         metrics.grid(row=2, column=0, sticky="ew", pady=(10, 0))
-        for col in range(4):
+        for col in range(5):
             metrics.columnconfigure(col, weight=1)
 
         self._metric_cell(metrics, 0, 0, "State", self.flow_state_var)
         self._metric_cell(metrics, 0, 1, "Points", self.flow_points_var)
         self._metric_cell(metrics, 0, 2, "Mean disp", self.flow_mean_disp_var)
         self._metric_cell(metrics, 0, 3, "Max disp", self.flow_max_disp_var)
-        self._metric_cell(metrics, 1, 0, "FPS", self.flow_fps_var)
+        self._metric_cell(metrics, 0, 4, "FPS", self.flow_fps_var)
 
         ttk.Label(
             tab,
@@ -738,7 +742,7 @@ class MissionControlGUI(AllInOneTesterGUI):
 
         from tkinter.scrolledtext import ScrolledText
 
-        self.log_text = ScrolledText(panel, height=10, state="disabled", wrap="word")
+        self.log_text = ScrolledText(panel, height=7, state="disabled", wrap="word")
         self.log_text.configure(
             font=("Consolas", 10),
             bg="#0a131b",

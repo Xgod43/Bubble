@@ -1268,6 +1268,18 @@ class AllInOneTesterGUI:
 
         self.root.after(60, self._drain_flow_frame_queue)
 
+    @staticmethod
+    def _fit_preview_size(src_width, src_height, max_width, max_height):
+        src_width = max(1, int(src_width))
+        src_height = max(1, int(src_height))
+        max_width = max(1, int(max_width))
+        max_height = max(1, int(max_height))
+
+        scale = min(max_width / float(src_width), max_height / float(src_height))
+        target_w = max(1, int(src_width * scale))
+        target_h = max(1, int(src_height * scale))
+        return target_w, target_h
+
     def _render_blob_frame(self, payload):
         if Image is None or ImageTk is None:
             return
@@ -1281,9 +1293,16 @@ class AllInOneTesterGUI:
             resample_mode = Image.Resampling.LANCZOS
 
         pil_image = Image.fromarray(frame_rgb)
-        max_width = min(BLOB_PREVIEW_MAX_WIDTH, max(320, self.blob_preview_label.winfo_width()))
-        max_height = min(BLOB_PREVIEW_MAX_HEIGHT, max(240, self.blob_preview_label.winfo_height()))
-        pil_image.thumbnail((max_width, max_height), resample_mode)
+        container_width = max(320, int(self.blob_preview_label.winfo_width()))
+        container_height = max(240, int(self.blob_preview_label.winfo_height()))
+        target_size = self._fit_preview_size(
+            pil_image.width,
+            pil_image.height,
+            container_width,
+            container_height,
+        )
+        if target_size != pil_image.size:
+            pil_image = pil_image.resize(target_size, resample_mode)
 
         self.blob_photo = ImageTk.PhotoImage(image=pil_image)
         self.blob_preview_label.configure(image=self.blob_photo, text="")
@@ -1388,9 +1407,16 @@ class AllInOneTesterGUI:
             resample_mode = Image.Resampling.LANCZOS
 
         pil_image = Image.fromarray(frame_rgb)
-        max_width = min(BLOB_PREVIEW_MAX_WIDTH, max(320, self.flow_preview_label.winfo_width()))
-        max_height = min(BLOB_PREVIEW_MAX_HEIGHT, max(240, self.flow_preview_label.winfo_height()))
-        pil_image.thumbnail((max_width, max_height), resample_mode)
+        container_width = max(320, int(self.flow_preview_label.winfo_width()))
+        container_height = max(240, int(self.flow_preview_label.winfo_height()))
+        target_size = self._fit_preview_size(
+            pil_image.width,
+            pil_image.height,
+            container_width,
+            container_height,
+        )
+        if target_size != pil_image.size:
+            pil_image = pil_image.resize(target_size, resample_mode)
 
         self.flow_photo = ImageTk.PhotoImage(image=pil_image)
         self.flow_preview_label.configure(image=self.flow_photo, text="")
