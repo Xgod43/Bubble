@@ -210,14 +210,16 @@ class MissionControlGUI(AllInOneTesterGUI):
         self._build_header(main)
         self._build_action_row(main)
 
-        workspace = ttk.Panedwindow(main, orient="vertical", style="Split.TPanedwindow")
+        workspace = ttk.Frame(main, style="App.TFrame")
         workspace.grid(row=2, column=0, sticky="nsew")
-        self.workspace_pane = workspace
+        workspace.columnconfigure(0, weight=1)
+        workspace.rowconfigure(0, weight=1)
+        self.workspace = workspace
 
         body_shell = ttk.Frame(workspace, style="App.TFrame")
+        body_shell.grid(row=0, column=0, sticky="nsew")
         body_shell.columnconfigure(0, weight=1)
         body_shell.rowconfigure(0, weight=1)
-        workspace.add(body_shell, weight=6)
 
         self._build_body(body_shell)
         self._build_log_panel_modern(workspace)
@@ -326,15 +328,12 @@ class MissionControlGUI(AllInOneTesterGUI):
             return
 
         body_width = self.body_pane.winfo_width() if hasattr(self, "body_pane") else 0
-        workspace_height = self.workspace_pane.winfo_height() if hasattr(self, "workspace_pane") else 0
-        if body_width < 320 or workspace_height < 320:
+        if body_width < 320:
             self.root.after(120, self._apply_initial_split_positions)
             return
 
         try:
             self.body_pane.sashpos(0, int(body_width * 0.64))
-            if self.log_panel_visible:
-                self.workspace_pane.sashpos(0, int(workspace_height * 0.72))
             self._layout_sashes_initialized = True
         except tk.TclError:
             self.root.after(120, self._apply_initial_split_positions)
@@ -355,7 +354,7 @@ class MissionControlGUI(AllInOneTesterGUI):
         self.blob_camera_backend_var = tk.StringVar(value="auto")
         self.blob_camera_index_var = tk.StringVar(value="0")
         self.blob_cam_width_var = tk.StringVar(value="1280")
-        self.blob_cam_height_var = tk.StringVar(value="720")
+        self.blob_cam_height_var = tk.StringVar(value="960")
         self.blob_autofocus_var = tk.StringVar(value="continuous")
         self.blob_lens_position_var = tk.StringVar(value="1.0")
         self.blob_exposure_ev_var = tk.StringVar(value="0.8")
@@ -392,6 +391,7 @@ class MissionControlGUI(AllInOneTesterGUI):
         self.loadcell_known_weight_var = tk.StringVar(value="500")
         self.loadcell_weight_var = tk.StringVar(value="-")
         self.loadcell_state_var = tk.StringVar(value="Stopped")
+        self._init_force_calibration_state()
 
     def _init_flow_defaults(self):
         self.flow_state_var = tk.StringVar(value="Stopped")
@@ -404,10 +404,10 @@ class MissionControlGUI(AllInOneTesterGUI):
         self.flow_camera_backend_var = tk.StringVar(value="auto")
         self.flow_camera_index_var = tk.StringVar(value="0")
         self.flow_cam_width_var = tk.StringVar(value="1280")
-        self.flow_cam_height_var = tk.StringVar(value="720")
+        self.flow_cam_height_var = tk.StringVar(value="960")
         self.flow_proc_scale_var = tk.StringVar(value="1.0")
         self.flow_roi_scale_var = tk.StringVar(value="0.96")
-        self.flow_3d_roi_scale_var = tk.StringVar(value="0.40")
+        self.flow_3d_roi_scale_var = tk.StringVar(value="1.0")
         self.flow_max_points_var = tk.StringVar(value="260")
         self.flow_quality_var = tk.StringVar(value="0.02")
         self.flow_min_distance_var = tk.StringVar(value="7")
@@ -417,10 +417,40 @@ class MissionControlGUI(AllInOneTesterGUI):
     def _build_detection_workspace(self, parent):
         self._init_blob_defaults()
 
-        card = ttk.LabelFrame(parent, text="Live Detection", padding=12)
+        scroll_shell = ttk.Frame(parent, style="App.TFrame")
+        scroll_shell.grid(row=0, column=0, sticky="nsew")
+        scroll_shell.columnconfigure(0, weight=1)
+        scroll_shell.rowconfigure(0, weight=1)
+
+        canvas = tk.Canvas(
+            scroll_shell,
+            background=COLOR_BG_DARK,
+            highlightthickness=0,
+            bd=0,
+            relief="flat",
+        )
+        scrollbar = ttk.Scrollbar(scroll_shell, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+
+        content = ttk.Frame(canvas, style="App.TFrame")
+        content.columnconfigure(0, weight=1)
+        window_id = canvas.create_window((0, 0), window=content, anchor="nw")
+
+        def _sync_scroll_region(_event):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _sync_width(event):
+            canvas.itemconfigure(window_id, width=event.width)
+
+        content.bind("<Configure>", _sync_scroll_region)
+        canvas.bind("<Configure>", _sync_width)
+
+        card = ttk.LabelFrame(content, text="Live Detection", padding=12)
         card.grid(row=0, column=0, sticky="nsew")
         card.columnconfigure(0, weight=1)
-        card.rowconfigure(1, weight=1, minsize=240)
+        card.rowconfigure(2, weight=1, minsize=180)
 
         ttk.Label(
             card,
@@ -428,8 +458,44 @@ class MissionControlGUI(AllInOneTesterGUI):
             style="SectionHint.TLabel",
         ).grid(row=0, column=0, sticky="w", pady=(0, 10))
 
+        command_bar = ttk.Frame(card, style="Surface.TFrame")
+        command_bar.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        for col in range(6):
+            command_bar.columnconfigure(col, weight=1)
+
+        ttk.Button(command_bar, text="Apply Preset", command=self._apply_blob_preset).grid(
+            row=0, column=0, sticky="ew", padx=(0, 8)
+        )
+        self.blob_start_btn = ttk.Button(
+            command_bar,
+            text="Start Detection",
+            style="Accent.TButton",
+            command=self.start_blob_test,
+        )
+        self.blob_start_btn.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        self.blob_stop_btn = ttk.Button(command_bar, text="Stop", command=self.stop_blob_test)
+        self.blob_stop_btn.grid(row=0, column=2, sticky="ew", padx=(0, 8))
+        self.blob_snapshot_btn = ttk.Button(
+            command_bar,
+            text="Snapshot",
+            command=self.request_blob_snapshot,
+        )
+        self.blob_snapshot_btn.grid(row=0, column=3, sticky="ew", padx=(0, 8))
+        self.blob_reset_ref_btn = ttk.Button(
+            command_bar,
+            text="Reset Ref",
+            command=self.request_blob_reference_reset,
+        )
+        self.blob_reset_ref_btn.grid(row=0, column=4, sticky="ew", padx=(0, 8))
+        self.blob_settings_btn = ttk.Button(
+            command_bar,
+            text="Settings",
+            command=self.open_blob_settings_dialog,
+        )
+        self.blob_settings_btn.grid(row=0, column=5, sticky="ew")
+
         preview_shell = ttk.Frame(card, style="Surface.TFrame")
-        preview_shell.grid(row=1, column=0, sticky="nsew")
+        preview_shell.grid(row=2, column=0, sticky="nsew")
         preview_shell.columnconfigure(0, weight=1)
         preview_shell.rowconfigure(0, weight=1)
 
@@ -444,7 +510,7 @@ class MissionControlGUI(AllInOneTesterGUI):
         self.blob_preview_label.grid(row=0, column=0, sticky="nsew")
 
         metrics = ttk.Frame(card, style="App.TFrame")
-        metrics.grid(row=2, column=0, sticky="ew", pady=(12, 10))
+        metrics.grid(row=3, column=0, sticky="ew", pady=(12, 10))
         for col in range(4):
             metrics.columnconfigure(col, weight=1)
 
@@ -458,7 +524,7 @@ class MissionControlGUI(AllInOneTesterGUI):
         self._metric_cell(metrics, 1, 3, "Missing", self.blob_missing_ratio_var, pad_right=0)
 
         control_card = ttk.LabelFrame(card, text="Detection Command Deck", padding=12)
-        control_card.grid(row=3, column=0, sticky="ew")
+        control_card.grid(row=4, column=0, sticky="ew")
         for col in range(4):
             control_card.columnconfigure(col, weight=1)
 
@@ -525,30 +591,6 @@ class MissionControlGUI(AllInOneTesterGUI):
             variable=self.blob_use_illum_norm_var,
         ).grid(row=0, column=3, sticky="w", padx=(12, 0))
 
-        actions = ttk.Frame(control_card, style="Surface.TFrame")
-        actions.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(12, 0))
-        for col in range(5):
-            actions.columnconfigure(col, weight=1)
-
-        ttk.Button(actions, text="Apply Preset", command=self._apply_blob_preset).grid(
-            row=0, column=0, sticky="ew", padx=(0, 8)
-        )
-        self.blob_start_btn = ttk.Button(actions, text="Start Detection", style="Accent.TButton", command=self.start_blob_test)
-        self.blob_start_btn.grid(row=0, column=1, sticky="ew", padx=(0, 8))
-        self.blob_stop_btn = ttk.Button(actions, text="Stop", command=self.stop_blob_test)
-        self.blob_stop_btn.grid(row=0, column=2, sticky="ew", padx=(0, 8))
-        self.blob_snapshot_btn = ttk.Button(actions, text="Snapshot", command=self.request_blob_snapshot)
-        self.blob_snapshot_btn.grid(row=0, column=3, sticky="ew", padx=(0, 8))
-        self.blob_reset_ref_btn = ttk.Button(actions, text="Reset Ref", command=self.request_blob_reference_reset)
-        self.blob_reset_ref_btn.grid(row=0, column=4, sticky="ew")
-
-        self.blob_settings_btn = ttk.Button(
-            control_card,
-            text="Advanced Detection Settings",
-            command=self.open_blob_settings_dialog,
-        )
-        self.blob_settings_btn.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(10, 0))
-
         blob_message_label = ttk.Label(
             card,
             textvariable=self.blob_message_var,
@@ -556,7 +598,7 @@ class MissionControlGUI(AllInOneTesterGUI):
             wraplength=920,
             justify="left",
         )
-        blob_message_label.grid(row=4, column=0, sticky="w", pady=(10, 0))
+        blob_message_label.grid(row=5, column=0, sticky="w", pady=(10, 0))
         self._bind_dynamic_wrap(blob_message_label, margin=18, min_wrap=320)
 
         self._set_blob_controls(False)
@@ -650,6 +692,7 @@ class MissionControlGUI(AllInOneTesterGUI):
         self._status_line(summary, 1, "Picked output", self.blob_pick_mode_var)
         self._status_line(summary, 2, "Frame time", self.blob_latency_var)
         self._status_line(summary, 3, "Track health", self.blob_missing_ratio_var)
+        self._status_line(summary, 4, "Estimated force", self.force_estimate_var)
 
         notes = ttk.LabelFrame(tab, text="Run Notes", padding=12)
         notes.grid(row=1, column=0, sticky="ew", pady=(10, 0))
@@ -739,6 +782,10 @@ class MissionControlGUI(AllInOneTesterGUI):
         self._status_line(load, 1, "State", self.loadcell_state_var)
         self._status_line(load, 2, "Weight", self.loadcell_weight_var)
 
+        force = ttk.LabelFrame(tab, text="Force Calibration", padding=12)
+        force.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self._build_force_calibration_panel(force)
+
         self._set_camera_controls(False)
         self._set_limit_controls(False)
         self._set_stepper_controls(False)
@@ -750,6 +797,7 @@ class MissionControlGUI(AllInOneTesterGUI):
         self.hw_stepper_card = stepper
         self.hw_pressure_card = pressure
         self.hw_load_card = load
+        self.hw_force_card = force
 
         tab.bind("<Configure>", self._on_hardware_tab_resize)
         self.root.after_idle(self._arrange_hardware_tab_cards)
@@ -772,7 +820,8 @@ class MissionControlGUI(AllInOneTesterGUI):
             self.hw_limits_card.grid_configure(row=1, column=0, columnspan=1, padx=(0, 0), pady=(0, 8), sticky="ew")
             self.hw_stepper_card.grid_configure(row=2, column=0, columnspan=1, padx=(0, 0), pady=(0, 8), sticky="ew")
             self.hw_pressure_card.grid_configure(row=3, column=0, columnspan=1, padx=(0, 0), pady=(0, 8), sticky="ew")
-            self.hw_load_card.grid_configure(row=4, column=0, columnspan=1, padx=(0, 0), pady=(0, 0), sticky="ew")
+            self.hw_load_card.grid_configure(row=4, column=0, columnspan=1, padx=(0, 0), pady=(0, 8), sticky="ew")
+            self.hw_force_card.grid_configure(row=5, column=0, columnspan=1, padx=(0, 0), pady=(0, 0), sticky="ew")
         else:
             self.hardware_tab.columnconfigure(0, weight=1)
             self.hardware_tab.columnconfigure(1, weight=1)
@@ -780,7 +829,8 @@ class MissionControlGUI(AllInOneTesterGUI):
             self.hw_limits_card.grid_configure(row=0, column=1, columnspan=1, padx=(0, 0), pady=(0, 8), sticky="nsew")
             self.hw_stepper_card.grid_configure(row=1, column=0, columnspan=1, padx=(0, 8), pady=(0, 8), sticky="nsew")
             self.hw_pressure_card.grid_configure(row=1, column=1, columnspan=1, padx=(0, 0), pady=(0, 8), sticky="nsew")
-            self.hw_load_card.grid_configure(row=2, column=0, columnspan=2, padx=(0, 0), pady=(0, 0), sticky="nsew")
+            self.hw_load_card.grid_configure(row=2, column=0, columnspan=2, padx=(0, 0), pady=(0, 8), sticky="nsew")
+            self.hw_force_card.grid_configure(row=3, column=0, columnspan=2, padx=(0, 0), pady=(0, 0), sticky="ew")
 
     def _build_flow_tab(self, tab):
         tab.columnconfigure(0, weight=1)
@@ -840,7 +890,7 @@ class MissionControlGUI(AllInOneTesterGUI):
         panel.columnconfigure(0, weight=1)
         panel.rowconfigure(1, weight=1)
         self.log_panel = panel
-        parent.add(panel, weight=2)
+        panel.grid(row=1, column=0, sticky="ew", pady=(12, 0))
 
         toolbar = ttk.Frame(panel, style="Surface.TFrame")
         toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
@@ -856,7 +906,7 @@ class MissionControlGUI(AllInOneTesterGUI):
 
         from tkinter.scrolledtext import ScrolledText
 
-        self.log_text = ScrolledText(panel, height=7, state="disabled", wrap="word")
+        self.log_text = ScrolledText(panel, height=5, state="disabled", wrap="word")
         self.log_text.configure(
             font=("Consolas", 10),
             bg="#0a131b",
@@ -868,13 +918,13 @@ class MissionControlGUI(AllInOneTesterGUI):
 
     def toggle_log_panel(self):
         if self.log_panel_visible:
-            self.workspace_pane.forget(self.log_panel)
+            self.log_panel.grid_remove()
             self.log_toggle_btn.configure(text="Show Log")
             self.log_panel_visible = False
             self.log("Session log hidden.")
             return
 
-        self.workspace_pane.add(self.log_panel, weight=2)
+        self.log_panel.grid()
         self._layout_sashes_initialized = False
         self.root.after(80, self._apply_initial_split_positions)
         self.log_toggle_btn.configure(text="Hide Log")

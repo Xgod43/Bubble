@@ -564,7 +564,16 @@ def open_camera_stream(
                     controls_payload["AfMode"] = libcamera_controls.AfModeEnum.Manual
 
                 controls_payload["ExposureValue"] = float(exposure_ev)
-                picam.set_controls(controls_payload)
+                scaler_crop = picam.camera_properties.get("ScalerCropMaximum")
+                if scaler_crop:
+                    controls_payload["ScalerCrop"] = tuple(scaler_crop)
+                try:
+                    picam.set_controls(controls_payload)
+                except Exception:
+                    if "ScalerCrop" not in controls_payload:
+                        raise
+                    controls_payload.pop("ScalerCrop", None)
+                    picam.set_controls(controls_payload)
                 time.sleep(0.2)
                 return {"backend": "picamera2", "device": picam}
             except Exception as exc:

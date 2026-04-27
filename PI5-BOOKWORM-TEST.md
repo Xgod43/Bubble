@@ -1,0 +1,86 @@
+# Raspberry Pi 5 Bookworm Test Checklist
+
+Status after the GUI layout fix: the Python/Tk console is ready for first Pi-side smoke testing, but the hardware path still depends on Pi packages and real wiring checks.
+
+## Recommended OS Setup
+
+Use Raspberry Pi OS Bookworm 64-bit with desktop. In Raspberry Pi Configuration or `raspi-config`, enable:
+
+- Camera
+- I2C
+
+Install system packages:
+
+```bash
+sudo apt update
+sudo apt install -y \
+  python3-venv python3-tk python3-pil python3-pil.imagetk \
+  python3-numpy python3-opencv python3-picamera2 \
+  python3-rpi-lgpio python3-libgpiod libgpiod-dev \
+  i2c-tools gcc pkg-config npm
+```
+
+On Raspberry Pi 5, do not rely on the old direct `RPi.GPIO` package for GPIO. This repo imports the `RPi.GPIO` API, so install `python3-rpi-lgpio`, which provides a compatible module backed by the newer GPIO stack.
+If apt reports a conflict with `python3-rpi.gpio`, remove the old package first and then install `python3-rpi-lgpio`.
+
+## Python Environment
+
+Create a venv that can see the apt-installed camera/OpenCV/GPIO packages:
+
+```bash
+cd ~/Bubble
+python3 -m venv --system-site-packages .venv
+source .venv/bin/activate
+python -m pip install -U pip
+python -m pip install -r requirements-pi-bookworm.txt
+```
+
+## Smoke Check
+
+Run this before touching hardware:
+
+```bash
+python tools/pi5_bookworm_check.py
+python main.py
+```
+
+The GUI should open with no overlapping panels. `main.py` currently launches the Python/Tk mission-control GUI first.
+
+## Optional Builds
+
+Native detector acceleration:
+Native stepper timing is built by the same script when `libgpiod-dev` is installed.
+
+```bash
+cd native
+chmod +x build_pi.sh
+./build_pi.sh
+cd ..
+```
+
+Static web UI export, only needed for the pywebview desktop shell path:
+
+```bash
+cd nextjs-gui
+npm install
+npm run build
+cd ..
+```
+
+## Hardware Test Order
+
+1. Open GUI only.
+2. Start camera/detection with backend `picamera2`.
+3. Test limit switches on GPIO17 and GPIO27.
+4. Test stepper with motor power disabled first, then enabled.
+5. Test pressure sensor after confirming I2C with `i2cdetect -y 1`.
+6. Test load cell on GPIO5/GPIO6 after confirming HX711 wiring.
+7. With pressure and load-cell readings both running, open Force Calibration, capture at least two stable pressure/load pairs at different loads, then fit the calibration. The model is `F = aP + b`, where `F` is force in newtons and `P` is pressure in hPa. The fitted model is saved to `force_calibration.json` and loaded on the next launch.
+
+## Current Known Risks
+
+- Stepper pulses are generated from Python timing. It is acceptable for a first functional test, but jitter should be measured before production use.
+- If `native/build/stepper_runner` exists, stepper pulse generation uses the native C runner through libgpiod. Without it, the GUI falls back to Python timing.
+- Pressure sensor support needs `adafruit-blinka` and `adafruit-circuitpython-mprls` from the pip requirements file.
+- The desktop/Next.js stack uses `backend` dataclasses that need Python 3.10 or newer; Bookworm's Python 3.11 is fine.
+- Re-calibrate if the gripper, tubing, sensor mounting, or load-cell setup changes.

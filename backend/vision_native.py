@@ -12,7 +12,7 @@ except Exception:  # pragma: no cover - optional runtime dependency
     np = None
 
 
-@dataclass(slots=True)
+@dataclass
 class BlobResult:
     x: int
     y: int
