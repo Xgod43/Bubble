@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List
 
 
-@dataclass(slots=True)
+@dataclass
 class MetricTile:
     label: str
     value: str
@@ -12,13 +12,13 @@ class MetricTile:
     tone: str = "normal"
 
 
-@dataclass(slots=True)
+@dataclass
 class TelemetryPair:
     label: str
     value: str
 
 
-@dataclass(slots=True)
+@dataclass
 class SubsystemCard:
     id: str
     name: str
@@ -28,7 +28,7 @@ class SubsystemCard:
     telemetry: List[TelemetryPair] = field(default_factory=list)
 
 
-@dataclass(slots=True)
+@dataclass
 class TimelineEvent:
     time: str
     title: str
@@ -36,7 +36,7 @@ class TimelineEvent:
     tone: str = "normal"
 
 
-@dataclass(slots=True)
+@dataclass
 class ActionCommand:
     id: str
     label: str
@@ -45,7 +45,7 @@ class ActionCommand:
     detail: str
 
 
-@dataclass(slots=True)
+@dataclass
 class PreviewPoint:
     x: float
     y: float
@@ -53,7 +53,7 @@ class PreviewPoint:
     tracked: bool
 
 
-@dataclass(slots=True)
+@dataclass
 class DetectionSnapshot:
     pipeline: str
     mode: str
@@ -68,7 +68,7 @@ class DetectionSnapshot:
     notes: List[str] = field(default_factory=list)
 
 
-@dataclass(slots=True)
+@dataclass
 class DashboardSnapshot:
     generatedAt: str
     missionName: str

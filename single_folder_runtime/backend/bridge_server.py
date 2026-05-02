@@ -13,6 +13,9 @@ except ImportError:  # pragma: no cover - allows python backend/bridge_server.py
     from mission_control import MissionControlState  # type: ignore
 
 
+MAX_COMMAND_BODY_BYTES = 64 * 1024
+
+
 class MissionControlHandler(BaseHTTPRequestHandler):
     state = MissionControlState()
     server_version = "PiBubbleBridge/0.1"
@@ -41,12 +44,23 @@ class MissionControlHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": f"Unknown route: {path}"}, status=404)
             return
 
-        content_length = int(self.headers.get("Content-Length", "0") or 0)
+        try:
+            content_length = int(self.headers.get("Content-Length", "0") or 0)
+        except ValueError:
+            self._send_json({"ok": False, "error": "Invalid Content-Length."}, status=400)
+            return
+        if content_length > MAX_COMMAND_BODY_BYTES:
+            self._send_json({"ok": False, "error": "Request body is too large."}, status=413)
+            return
+
         raw = self.rfile.read(content_length) if content_length > 0 else b"{}"
         try:
             payload = json.loads(raw.decode("utf-8"))
         except json.JSONDecodeError:
             self._send_json({"ok": False, "error": "Request body must be valid JSON."}, status=400)
+            return
+        if not isinstance(payload, dict):
+            self._send_json({"ok": False, "error": "Request body must be a JSON object."}, status=400)
             return
 
         self._send_json(self.state.dispatch_command(payload), status=202)
