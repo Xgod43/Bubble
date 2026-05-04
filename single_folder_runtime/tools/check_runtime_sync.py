@@ -7,11 +7,14 @@ ROOT = Path(__file__).resolve().parents[1]
 
 SYNC_PAIRS = [
     ("all_in_one_gui.py", "single_folder_runtime/all_in_one_gui.py"),
+    ("hx711v0_5_1.py", "single_folder_runtime/library/hx711py/hx711v0_5_1.py"),
+    ("requirements-pi-bookworm.txt", "single_folder_runtime/requirements-pi-bookworm.txt"),
     ("python_mission_control_gui.py", "single_folder_runtime/python_mission_control_gui.py"),
     ("launch_bubble_app.py", "single_folder_runtime/launch_bubble_app.py"),
     ("main.py", "single_folder_runtime/main.py"),
     ("JNR/dot_pipeline.py", "single_folder_runtime/JNR/dot_pipeline.py"),
     ("JNR/synthetic_generator.py", "single_folder_runtime/JNR/synthetic_generator.py"),
+    ("tools/setup_pi_venv.sh", "single_folder_runtime/tools/setup_pi_venv.sh"),
     ("backend/contracts.py", "single_folder_runtime/backend/contracts.py"),
     ("backend/mission_control.py", "single_folder_runtime/backend/mission_control.py"),
     ("backend/vision_runtime.py", "single_folder_runtime/backend/vision_runtime.py"),

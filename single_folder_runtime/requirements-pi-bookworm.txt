@@ -1,6 +1,9 @@
 # Install inside a venv created with --system-site-packages on Raspberry Pi OS Bookworm.
-# Keep camera/OpenCV/GPIO packages on apt where possible; see README-RUN.txt.
+# Keep camera/OpenCV/GPIO packages on apt where possible; see project hardware notes.
 pywebview>=5.0
 adafruit-blinka>=8.0
 adafruit-extended-bus>=1.0
-adafruit-circuitpython-mprls>=2.0
+adafruit-circuitpython-mprls>=1.2.0
+smbus2>=0.4
+lgpio>=0.2
+rpi-lgpio>=0.6

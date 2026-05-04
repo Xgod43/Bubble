@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 
 try:
@@ -9,6 +10,79 @@ except Exception as exc:  # pragma: no cover - only available on Raspberry Pi
     _GPIO_IMPORT_ERROR = exc
 else:
     _GPIO_IMPORT_ERROR = None
+
+try:
+    import lgpio
+except Exception as exc:  # pragma: no cover - only available on Raspberry Pi
+    lgpio = None
+    _LGPIO_IMPORT_ERROR = exc
+else:
+    _LGPIO_IMPORT_ERROR = None
+
+
+class _RPiGPIOBackend:
+    name = "RPi.GPIO"
+
+    def __init__(self, dout_pin, pd_sck_pin):
+        if GPIO is None:
+            raise RuntimeError(f"RPi.GPIO-compatible module is required: {_GPIO_IMPORT_ERROR}")
+        self.GPIO = GPIO
+        self.dout_pin = int(dout_pin)
+        self.pd_sck_pin = int(pd_sck_pin)
+        GPIO.setwarnings(False)
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setup(self.pd_sck_pin, GPIO.OUT, initial=GPIO.LOW)
+        try:
+            GPIO.setup(self.dout_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        except (AttributeError, TypeError):
+            GPIO.setup(self.dout_pin, GPIO.IN)
+
+    def output(self, pin, level):
+        self.GPIO.output(int(pin), self.GPIO.HIGH if level else self.GPIO.LOW)
+
+    def input(self, pin):
+        return int(self.GPIO.input(int(pin)))
+
+    def close(self):
+        return
+
+
+class _LGPIOBackend:
+    name = "lgpio"
+
+    def __init__(self, dout_pin, pd_sck_pin):
+        if lgpio is None:
+            raise RuntimeError(f"lgpio is required: {_LGPIO_IMPORT_ERROR}")
+        self.dout_pin = int(dout_pin)
+        self.pd_sck_pin = int(pd_sck_pin)
+        chip_text = os.environ.get("PI_BUBBLE_GPIO_CHIP", "gpiochip0")
+        chip_number = int(chip_text.replace("/dev/", "").replace("gpiochip", ""))
+        self._handle = lgpio.gpiochip_open(chip_number)
+        self._closed = False
+
+        try:
+            lgpio.gpio_claim_output(self._handle, self.pd_sck_pin, 0)
+        except TypeError:
+            lgpio.gpio_claim_output(self._handle, 0, self.pd_sck_pin, 0)
+        try:
+            lgpio.gpio_claim_input(self._handle, self.dout_pin)
+        except TypeError:
+            lgpio.gpio_claim_input(self._handle, 0, self.dout_pin)
+
+    def output(self, pin, level):
+        lgpio.gpio_write(self._handle, int(pin), 1 if level else 0)
+
+    def input(self, pin):
+        return int(lgpio.gpio_read(self._handle, int(pin)))
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            lgpio.gpiochip_close(self._handle)
+        except Exception:
+            pass
 
 
 class HX711:
@@ -21,9 +95,6 @@ class HX711:
     }
 
     def __init__(self, dout_pin, pd_sck_pin, gain=128):
-        if GPIO is None:
-            raise RuntimeError(f"RPi.GPIO-compatible module is required: {_GPIO_IMPORT_ERROR}")
-
         self.dout_pin = int(dout_pin)
         self.pd_sck_pin = int(pd_sck_pin)
         self.gain = int(gain)
@@ -32,12 +103,19 @@ class HX711:
         self.offset = {"A": 0.0, "B": 0.0}
         self.reference_unit = {"A": 1.0, "B": 1.0}
         self.readyCallbackEnabled = False
-
-        GPIO.setwarnings(False)
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setup(self.pd_sck_pin, GPIO.OUT, initial=GPIO.LOW)
-        GPIO.setup(self.dout_pin, GPIO.IN)
+        self._gpio = self._open_gpio_backend()
         self._configure_gain(self.gain)
+
+    def _open_gpio_backend(self):
+        errors = []
+        for backend_cls in (_RPiGPIOBackend, _LGPIOBackend):
+            try:
+                backend = backend_cls(self.dout_pin, self.pd_sck_pin)
+                self.backend_name = backend.name
+                return backend
+            except Exception as exc:
+                errors.append(f"{backend_cls.name}: {exc}")
+        raise RuntimeError("No usable GPIO backend for HX711. " + " | ".join(errors))
 
     def setReadingFormat(self, byte_format="MSB", bit_format="MSB"):
         self.byte_format = str(byte_format).upper()
@@ -65,35 +143,38 @@ class HX711:
         self.reference_unit[self._normalize_channel(channel)] = reference_unit
 
     def reset(self):
-        GPIO.output(self.pd_sck_pin, GPIO.LOW)
+        self._gpio.output(self.pd_sck_pin, 0)
         time.sleep(0.001)
         self.powerDown()
         self.powerUp()
 
     def powerDown(self):
-        GPIO.output(self.pd_sck_pin, GPIO.LOW)
-        GPIO.output(self.pd_sck_pin, GPIO.HIGH)
+        self._gpio.output(self.pd_sck_pin, 0)
+        self._gpio.output(self.pd_sck_pin, 1)
         time.sleep(0.00008)
 
     def powerUp(self):
-        GPIO.output(self.pd_sck_pin, GPIO.LOW)
+        self._gpio.output(self.pd_sck_pin, 0)
         time.sleep(0.001)
 
     def isReady(self):
-        return GPIO.input(self.dout_pin) == GPIO.LOW
+        return self._gpio.input(self.dout_pin) == 0
 
-    def getLong(self, channel="A"):
+    def getLong(self, channel="A", timeout=1.5):
         channel = self._normalize_channel(channel)
         pulses = self._pulses_for_channel(channel)
-        return self._read_raw(pulses)
+        return self._read_raw(pulses, timeout=timeout)
 
-    def getWeight(self, channel="A"):
+    def getWeight(self, channel="A", timeout=1.5):
         channel = self._normalize_channel(channel)
-        value = self.getLong(channel)
+        value = self.getLong(channel, timeout=timeout)
         return (float(value) - self.offset[channel]) / self.reference_unit[channel]
 
     def disableReadyCallback(self):
         self.readyCallbackEnabled = False
+
+    def close(self):
+        self._gpio.close()
 
     def _normalize_channel(self, channel):
         channel = str(channel).upper()
@@ -108,23 +189,23 @@ class HX711:
 
     def _wait_ready(self, timeout=1.0):
         deadline = time.monotonic() + timeout
-        while GPIO.input(self.dout_pin) != GPIO.LOW:
+        while self._gpio.input(self.dout_pin) != 0:
             if time.monotonic() >= deadline:
                 raise TimeoutError("HX711 is not ready.")
             time.sleep(0.001)
 
-    def _read_raw(self, gain_pulses):
-        self._wait_ready()
+    def _read_raw(self, gain_pulses, timeout=1.5):
+        self._wait_ready(timeout=timeout)
         value = 0
 
         for _ in range(24):
-            GPIO.output(self.pd_sck_pin, GPIO.HIGH)
-            value = (value << 1) | int(GPIO.input(self.dout_pin))
-            GPIO.output(self.pd_sck_pin, GPIO.LOW)
+            self._gpio.output(self.pd_sck_pin, 1)
+            value = (value << 1) | int(self._gpio.input(self.dout_pin))
+            self._gpio.output(self.pd_sck_pin, 0)
 
         for _ in range(gain_pulses):
-            GPIO.output(self.pd_sck_pin, GPIO.HIGH)
-            GPIO.output(self.pd_sck_pin, GPIO.LOW)
+            self._gpio.output(self.pd_sck_pin, 1)
+            self._gpio.output(self.pd_sck_pin, 0)
 
         if value & 0x800000:
             value -= 0x1000000

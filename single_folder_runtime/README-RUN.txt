@@ -6,12 +6,10 @@ How to run
    sudo apt update
    sudo apt install -y python3-venv python3-tk python3-pil python3-pil.imagetk python3-numpy python3-opencv python3-picamera2 python3-rpi-lgpio python3-libgpiod libgpiod-dev i2c-tools gcc pkg-config npm
 3) Create a venv that can see apt packages:
-   python3 -m venv --system-site-packages .venv
-   . .venv/bin/activate
-   python -m pip install -r requirements-pi-bookworm.txt
+   ./tools/setup_pi_venv.sh
 4) Check dependencies:
-   python tools/pi5_bookworm_check.py
-5) Run: python main.py
+   .venv/bin/python tools/pi5_bookworm_check.py
+5) Run: ./launch_bubble_app.sh
    or on Windows: launch_bubble_app.bat
 
 Notes

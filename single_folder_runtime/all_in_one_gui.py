@@ -37,8 +37,15 @@ STEPPER_PULSE_DELAY = 1.0 / (2.0 * STEPPER_FREQUENCY_HZ)
 
 LOADCELL_DT_PIN = 5
 LOADCELL_SCK_PIN = 6
+LOADCELL_CALIBRATION_DELAY_S = 8.0
+LOADCELL_CALIBRATION_FILENAME = "loadcell_calibration.json"
 FORCE_GRAVITY_MPS2 = 9.80665
 FORCE_CALIBRATION_FILENAME = "force_calibration.json"
+MPRLS_I2C_BUS = 1
+MPRLS_I2C_ADDR = 0x18
+MPRLS_PSI_MIN = 0.0
+MPRLS_PSI_MAX = 25.0
+MPRLS_PSI_TO_HPA = 68.947572932
 
 if GPIO is None:
     GPIO_HIGH = 1
@@ -69,6 +76,77 @@ COLOR_WARN = "#c97a00"
 BUBBLE_WIDTH_MM = 120.0
 BUBBLE_HEIGHT_MM = 80.0
 BUBBLE_MAX_HEIGHT_MM = 25.0
+CAMERA_TO_ACRYLIC_MM = 62.4
+# Positive means camera-to-surface = acrylic gap + outward bubble height.
+BUBBLE_CAMERA_DISTANCE_SIGN = 1.0
+SURFACE_CONTACT_DEADBAND_MM = 0.35
+SURFACE_CONTACT_NOISE_CAP_MM = 0.95
+SURFACE_BASELINE_ALPHA = 0.025
+SURFACE_CONTACT_HOLD_MM = 0.75
+
+
+class LinuxMPRLSSensor:
+    """Minimal Linux I2C fallback for Honeywell/Adafruit MPRLS sensors."""
+
+    _STATUS_BUSY = 0x20
+    _STATUS_MEMORY_ERROR = 0x04
+    _STATUS_MATH_SAT = 0x02
+    _COMMAND = [0xAA, 0x00, 0x00]
+    _OUTPUT_MIN = 0.10 * 16777216.0
+    _OUTPUT_MAX = 0.90 * 16777216.0
+
+    def __init__(self, bus_number=MPRLS_I2C_BUS, addr=MPRLS_I2C_ADDR):
+        try:
+            from smbus2 import SMBus, i2c_msg
+        except Exception as exc:
+            raise RuntimeError("smbus2 is required for direct MPRLS fallback.") from exc
+
+        bus_path = Path(f"/dev/i2c-{int(bus_number)}")
+        if not bus_path.exists():
+            raise RuntimeError(f"{bus_path} is missing. Enable I2C in raspi-config.")
+
+        self.bus_number = int(bus_number)
+        self.addr = int(addr)
+        self._SMBus = SMBus
+        self._i2c_msg = i2c_msg
+        self._bus = SMBus(self.bus_number)
+
+    def close(self):
+        try:
+            self._bus.close()
+        except Exception:
+            pass
+
+    @property
+    def pressure(self):
+        write = self._i2c_msg.write(self.addr, self._COMMAND)
+        self._bus.i2c_rdwr(write)
+
+        deadline = time.monotonic() + 0.12
+        last_status = 0
+        data = None
+        while time.monotonic() < deadline:
+            read = self._i2c_msg.read(self.addr, 4)
+            self._bus.i2c_rdwr(read)
+            data = list(read)
+            last_status = int(data[0])
+            if not (last_status & self._STATUS_BUSY):
+                break
+            time.sleep(0.005)
+
+        if data is None or (last_status & self._STATUS_BUSY):
+            raise TimeoutError("MPRLS conversion timed out.")
+        if last_status & self._STATUS_MEMORY_ERROR:
+            raise RuntimeError("MPRLS status reported memory error.")
+        if last_status & self._STATUS_MATH_SAT:
+            raise RuntimeError("MPRLS status reported math saturation.")
+
+        raw_counts = (int(data[1]) << 16) | (int(data[2]) << 8) | int(data[3])
+        pressure_psi = (
+            ((raw_counts - self._OUTPUT_MIN) * (MPRLS_PSI_MAX - MPRLS_PSI_MIN))
+            / (self._OUTPUT_MAX - self._OUTPUT_MIN)
+        ) + MPRLS_PSI_MIN
+        return pressure_psi * MPRLS_PSI_TO_HPA
 
 
 class AllInOneTesterGUI:
@@ -163,6 +241,8 @@ class AllInOneTesterGUI:
         )
         self.surface_scale_ema = None
         self.surface_height_ema = None
+        self.surface_reference_height_map = None
+        self.surface_contact_ema = None
 
         self._init_force_calibration_state()
         self._build_ui()
@@ -646,7 +726,7 @@ class AllInOneTesterGUI:
             tab,
             text=(
                 "Calibrates with a known weight (grams), then shows measured load in kg. "
-                "(Pins: DT=GPIO5, SCK=GPIO6)"
+                "(Pins: DT=GPIO5, SCK=GPIO6; calibration wait=8s)"
             ),
         ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
 
@@ -1092,6 +1172,8 @@ class AllInOneTesterGUI:
     def reset_surface_baseline(self):
         self.surface_scale_ema = None
         self.surface_height_ema = None
+        self.surface_reference_height_map = None
+        self.surface_contact_ema = None
         if not self._is_blob_running():
             self._set_var(
                 self.surface_status_var,
@@ -1120,10 +1202,28 @@ class AllInOneTesterGUI:
         points_arr = np.array(points, dtype=np.float32)
         vectors_arr = np.array(vectors, dtype=np.float32)
 
-        # Remove rigid camera/bubble drift. The residual field is what should
-        # become local membrane deformation.
-        global_shift = np.median(vectors_arr, axis=0)
-        residual_vectors = vectors_arr - global_shift
+        # Remove whole-frame marker motion before estimating local membrane
+        # deformation. Translation-only compensation is too sensitive to small
+        # camera/focus changes, so fit a partial affine field first.
+        current_arr = points_arr + vectors_arr
+        try:
+            affine, _inliers = cv2.estimateAffinePartial2D(
+                points_arr,
+                current_arr,
+                method=cv2.RANSAC,
+                ransacReprojThreshold=3.0,
+                maxIters=120,
+                confidence=0.96,
+            )
+        except Exception:
+            affine = None
+
+        if affine is not None:
+            predicted_arr = cv2.transform(points_arr.reshape(-1, 1, 2), affine).reshape(-1, 2)
+            residual_vectors = current_arr - predicted_arr
+        else:
+            global_shift = np.median(vectors_arr, axis=0)
+            residual_vectors = vectors_arr - global_shift
         values_arr = np.linalg.norm(residual_vectors, axis=1).astype(np.float32)
 
         height_px, width_px = frame_shape[:2]
@@ -1235,6 +1335,124 @@ class AllInOneTesterGUI:
         return height_full, ellipse_mask, scale
 
     @staticmethod
+    def _measure_camera_to_surface_mm(height_map, ellipse_mask=None):
+        if height_map is None or height_map.size == 0:
+            return None
+
+        height_norm = np.clip(height_map.astype(np.float32), 0.0, 1.0)
+        valid_mask = np.isfinite(height_norm)
+        if ellipse_mask is not None:
+            valid_mask &= ellipse_mask.astype(bool)
+        else:
+            valid_mask &= height_norm > 0.0
+
+        if not np.any(valid_mask):
+            return None
+
+        height_mm = height_norm * BUBBLE_MAX_HEIGHT_MM
+        distance_mm = CAMERA_TO_ACRYLIC_MM + (BUBBLE_CAMERA_DISTANCE_SIGN * height_mm)
+        valid_distance = distance_mm[valid_mask]
+        valid_height = height_mm[valid_mask]
+
+        ys, xs = np.nonzero(valid_mask)
+        center_y = int(np.clip(round(float(np.mean(ys))), 0, distance_mm.shape[0] - 1))
+        center_x = int(np.clip(round(float(np.mean(xs))), 0, distance_mm.shape[1] - 1))
+
+        return {
+            "min": float(np.min(valid_distance)),
+            "mean": float(np.mean(valid_distance)),
+            "max": float(np.max(valid_distance)),
+            "center": float(distance_mm[center_y, center_x]),
+            "height_peak": float(np.max(valid_height)),
+        }
+
+    def _measure_contact_deformation_mm(self, height_map, ellipse_mask=None, cv2=None):
+        if height_map is None or height_map.size == 0:
+            return None
+
+        height_norm = np.clip(height_map.astype(np.float32), 0.0, 1.0)
+        valid_mask = np.isfinite(height_norm)
+        if ellipse_mask is not None:
+            valid_mask &= ellipse_mask.astype(bool)
+        else:
+            valid_mask &= height_norm > 0.0
+
+        if not np.any(valid_mask):
+            return None
+
+        if (
+            self.surface_reference_height_map is None
+            or self.surface_reference_height_map.shape != height_norm.shape
+        ):
+            self.surface_reference_height_map = height_norm.copy()
+            self.surface_contact_ema = np.zeros_like(height_norm, dtype=np.float32)
+            return {
+                "ready": False,
+                "mean": 0.0,
+                "top_mean": 0.0,
+                "peak": 0.0,
+                "area_ratio": 0.0,
+                "noise_floor": SURFACE_CONTACT_DEADBAND_MM,
+            }
+
+        baseline = self.surface_reference_height_map.astype(np.float32)
+        raw_delta_mm = np.abs(baseline - height_norm) * BUBBLE_MAX_HEIGHT_MM
+        valid_delta = raw_delta_mm[valid_mask]
+        median_delta = float(np.median(valid_delta))
+        mad_delta = float(np.median(np.abs(valid_delta - median_delta)))
+        adaptive_floor = median_delta + (2.2 * 1.4826 * mad_delta)
+        noise_floor = max(
+            SURFACE_CONTACT_DEADBAND_MM,
+            min(adaptive_floor, SURFACE_CONTACT_NOISE_CAP_MM),
+        )
+
+        contact_map = np.maximum(raw_delta_mm - noise_floor, 0.0)
+        contact_map = np.where(valid_mask, contact_map, 0.0).astype(np.float32)
+        if cv2 is not None:
+            contact_map = cv2.GaussianBlur(contact_map, (0, 0), sigmaX=1.1, sigmaY=1.1)
+            contact_map = np.where(valid_mask, contact_map, 0.0).astype(np.float32)
+
+        if self.surface_contact_ema is None or self.surface_contact_ema.shape != contact_map.shape:
+            self.surface_contact_ema = contact_map
+        else:
+            self.surface_contact_ema = (
+                (0.70 * self.surface_contact_ema.astype(np.float32)) + (0.30 * contact_map)
+            )
+        contact_filtered = np.where(valid_mask, self.surface_contact_ema, 0.0)
+        valid_contact = contact_filtered[valid_mask]
+
+        peak = float(np.percentile(valid_contact, 98.0)) if valid_contact.size else 0.0
+        active = valid_contact[valid_contact > 0.05]
+        mean = float(np.mean(active)) if active.size else 0.0
+        top_count = max(1, int(valid_contact.size * 0.05))
+        top_mean = float(np.mean(np.partition(valid_contact, -top_count)[-top_count:]))
+        area_ratio = float((np.count_nonzero(valid_contact > 0.10) / valid_contact.size) * 100.0)
+
+        if peak < SURFACE_CONTACT_HOLD_MM:
+            if cv2 is not None:
+                self.surface_reference_height_map = cv2.addWeighted(
+                    baseline,
+                    1.0 - SURFACE_BASELINE_ALPHA,
+                    height_norm,
+                    SURFACE_BASELINE_ALPHA,
+                    0.0,
+                )
+            else:
+                self.surface_reference_height_map = (
+                    ((1.0 - SURFACE_BASELINE_ALPHA) * baseline)
+                    + (SURFACE_BASELINE_ALPHA * height_norm)
+                )
+
+        return {
+            "ready": True,
+            "mean": mean,
+            "top_mean": top_mean,
+            "peak": peak,
+            "area_ratio": area_ratio,
+            "noise_floor": noise_floor,
+        }
+
+    @staticmethod
     def _build_flow_3d_plot(gray_frame, height_map, cv2, roi_mask=None, camera_gray_frame=None):
         camera_source = camera_gray_frame if camera_gray_frame is not None else gray_frame
         out_h, out_w = camera_source.shape[:2]
@@ -1305,14 +1523,14 @@ class AllInOneTesterGUI:
         step = max(4, min(10, out_w // 120))
         x_scale = 0.95
         y_scale = 0.62
-        z_scale = max(20.0, plot_h * 0.34)
+        z_scale = max(28.0, plot_h * 0.48)
         z_x_shift = max(10.0, min(28.0, out_w * 0.028))
-        horizon = int(plot_h * 0.48)
+        horizon = int(plot_h * 0.68)
         center_x = out_w * 0.5
 
         def project(gx, gy, z):
             px = (gx - center_x) * x_scale + center_x + z * z_x_shift
-            py = (gy - plot_h * 0.5) * y_scale + horizon + z * z_scale
+            py = (gy - plot_h * 0.5) * y_scale + horizon - z * z_scale
             return (int(np.clip(px, 0, out_w - 1)), int(np.clip(py, 0, plot_h - 1)))
 
         cells = []
@@ -1355,10 +1573,7 @@ class AllInOneTesterGUI:
                 lineType=cv2.LINE_AA,
             )
 
-        if plot_roi_binary is not None:
-            roi_uint8 = plot_roi_binary.astype(np.uint8) * 255
-            contours, _ = cv2.findContours(roi_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            cv2.drawContours(plot_canvas, contours, -1, (40, 180, 220), 1)
+        plot_canvas = cv2.rotate(plot_canvas, cv2.ROTATE_180)
 
         cv2.putText(
             plot_canvas,
@@ -1470,7 +1685,7 @@ class AllInOneTesterGUI:
         self.log("GPIO test requested, but RPi.GPIO is unavailable.")
         messagebox.showerror(
             "GPIO Unavailable",
-            "RPi.GPIO is not available in this environment.",
+            "RPi.GPIO is not available. On Raspberry Pi OS Bookworm/Pi 5, install rpi-lgpio.",
         )
         return False
 
@@ -2358,6 +2573,33 @@ class AllInOneTesterGUI:
                 if not stopped:
                     self.log("Optical flow still active after forced camera release.")
 
+    def _configure_cv2_multicore(self, cv2):
+        cpu_count = os.cpu_count() or 1
+        thread_text = os.environ.get("PI_BUBBLE_VISION_THREADS", "").strip()
+        if thread_text:
+            try:
+                thread_count = int(thread_text)
+            except ValueError:
+                thread_count = cpu_count
+        else:
+            thread_count = cpu_count
+        thread_count = max(1, min(thread_count, cpu_count))
+
+        try:
+            cv2.setUseOptimized(True)
+        except Exception:
+            pass
+
+        actual_threads = thread_count
+        try:
+            cv2.setNumThreads(thread_count)
+            actual_threads = int(cv2.getNumThreads())
+        except Exception:
+            actual_threads = thread_count
+
+        self.log(f"OpenCV optimized mode enabled; vision threads={actual_threads}/{cpu_count}.")
+        return actual_threads
+
     def _load_blob_backend(self):
         if self.blob_module is not None and self.blob_cv2 is not None:
             return
@@ -2369,6 +2611,7 @@ class AllInOneTesterGUI:
             import cv2
         except Exception as exc:
             raise RuntimeError(f"OpenCV import failed: {exc}") from exc
+        self._configure_cv2_multicore(cv2)
 
         try:
             from JNR import dot_pipeline as dot_pipeline_module
@@ -2854,48 +3097,95 @@ class AllInOneTesterGUI:
 
     @staticmethod
     def _open_pressure_i2c():
-        import board
-
-        if hasattr(board, "I2C"):
-            return board.I2C(), "board.I2C"
-
-        try:
-            import busio
-
-            scl = getattr(board, "SCL", None)
-            sda = getattr(board, "SDA", None)
-            if scl is not None and sda is not None:
-                return busio.I2C(scl, sda), "busio.I2C(board.SCL, board.SDA)"
-        except Exception:
-            pass
+        errors = []
 
         try:
             from adafruit_extended_bus import ExtendedI2C
 
-            return ExtendedI2C(1), "ExtendedI2C(1)"
+            return ExtendedI2C(MPRLS_I2C_BUS), f"ExtendedI2C({MPRLS_I2C_BUS})"
         except Exception as exc:
-            raise RuntimeError(
-                "Could not open I2C bus. Install/enable Blinka I2C support, or install "
-                "adafruit-extended-bus and enable i2c with raspi-config."
-            ) from exc
+            errors.append(f"ExtendedI2C: {exc}")
 
-    def _pressure_worker(self):
+        try:
+            import board
+
+            if hasattr(board, "I2C"):
+                return board.I2C(), "board.I2C"
+            errors.append("board.I2C missing")
+
+            try:
+                import busio
+
+                scl = getattr(board, "SCL", None)
+                sda = getattr(board, "SDA", None)
+                if scl is not None and sda is not None:
+                    return busio.I2C(scl, sda), "busio.I2C(board.SCL, board.SDA)"
+                errors.append("board.SCL/SDA missing")
+            except Exception as exc:
+                errors.append(f"busio.I2C: {exc}")
+        except Exception as exc:
+            errors.append(f"board import: {exc}")
+
+        detail = "; ".join(errors) if errors else "no backend attempted"
+        raise RuntimeError(
+            "Could not open CircuitPython I2C bus. Enable I2C, install Blinka support, "
+            f"or use direct smbus2 fallback. Details: {detail}"
+        )
+
+    def _open_pressure_sensor(self):
+        errors = []
         try:
             import adafruit_mprls
 
             i2c, i2c_backend = self._open_pressure_i2c()
-            sensor = adafruit_mprls.MPRLS(i2c, psi_min=0, psi_max=25)
-            self.log(f"MPRLS pressure sensor initialized via {i2c_backend}.")
+            sensor = adafruit_mprls.MPRLS(
+                i2c,
+                addr=MPRLS_I2C_ADDR,
+                psi_min=MPRLS_PSI_MIN,
+                psi_max=MPRLS_PSI_MAX,
+            )
+            return sensor, f"adafruit_mprls via {i2c_backend}", None
+        except Exception as exc:
+            errors.append(f"adafruit_mprls: {exc}")
 
+        try:
+            sensor = LinuxMPRLSSensor(MPRLS_I2C_BUS, MPRLS_I2C_ADDR)
+            return sensor, f"smbus2 /dev/i2c-{MPRLS_I2C_BUS} addr 0x{MPRLS_I2C_ADDR:02X}", sensor.close
+        except Exception as exc:
+            errors.append(f"smbus2 direct: {exc}")
+
+        raise RuntimeError("Pressure sensor unavailable. " + " | ".join(errors))
+
+    def _pressure_worker(self):
+        pressure_close = None
+        try:
+            sensor, pressure_backend, pressure_close = self._open_pressure_sensor()
+            self.log(f"MPRLS pressure sensor initialized via {pressure_backend}.")
+
+            read_failures = 0
             while not self.pressure_stop_event.is_set():
-                pressure_hpa = float(sensor.pressure)
-                self._record_pressure_reading(pressure_hpa)
-                self._set_var(self.pressure_value_var, f"{pressure_hpa:.2f} hPa")
+                try:
+                    pressure_hpa = float(sensor.pressure)
+                    read_failures = 0
+                    self._record_pressure_reading(pressure_hpa)
+                    self._set_var(self.pressure_value_var, f"{pressure_hpa:.2f} hPa")
+                except Exception as read_exc:
+                    read_failures += 1
+                    if read_failures == 1 or read_failures % 5 == 0:
+                        self.log(f"Pressure read retry {read_failures}: {read_exc}")
+                    if read_failures >= 12:
+                        raise
+                    self._set_var(self.pressure_value_var, "Retrying...")
                 time.sleep(0.5)
         except Exception as exc:
             self.log(f"Pressure sensor error: {exc}")
             self._set_var(self.pressure_value_var, "Error")
         finally:
+            if pressure_close is not None:
+                try:
+                    pressure_close()
+                except Exception:
+                    pass
             self._set_var(self.pressure_state_var, "Stopped")
             self._set_pressure_controls(False)
             self._refresh_system_status()
@@ -3156,23 +3446,60 @@ class AllInOneTesterGUI:
 
         return HX711
 
+    def _loadcell_calibration_path(self):
+        return Path(__file__).resolve().parent / LOADCELL_CALIBRATION_FILENAME
+
+    def _load_loadcell_calibration(self):
+        path = self._loadcell_calibration_path()
+        if not path.exists():
+            return None
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            return float(payload["counts_per_gram"])
+        except Exception as exc:
+            self.log(f"Could not load load-cell calibration: {exc}")
+            return None
+
+    def _save_loadcell_calibration(self, counts_per_gram, known_weight_grams):
+        payload = {
+            "counts_per_gram": float(counts_per_gram),
+            "known_weight_grams": float(known_weight_grams),
+            "dt_pin": int(LOADCELL_DT_PIN),
+            "sck_pin": int(LOADCELL_SCK_PIN),
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        try:
+            with self._loadcell_calibration_path().open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2)
+        except Exception as exc:
+            self.log(f"Could not save load-cell calibration: {exc}")
+
     @staticmethod
-    def _read_average_raw(hx, samples=20, delay=0.05, channel="A"):
+    def _read_average_raw(hx, samples=12, delay=0.025, channel="A", timeout=1.5):
         readings = []
-        for _ in range(samples):
-            value = hx.getLong(channel)
+        attempts = max(samples, samples * 3)
+        for _ in range(attempts):
+            try:
+                value = hx.getLong(channel, timeout=timeout)
+            except TimeoutError:
+                value = None
             if value is not None:
                 readings.append(float(value))
+                if len(readings) >= samples:
+                    break
             time.sleep(delay)
 
         if not readings:
             raise RuntimeError("No valid load cell readings were captured.")
 
-        return sum(readings) / len(readings)
+        return float(np.median(np.array(readings, dtype=np.float64)))
+
+    def _read_weight_grams(self, hx, samples=5):
+        raw = self._read_average_raw(hx, samples=samples, delay=0.015, channel="A", timeout=1.2)
+        return (raw - hx.offset["A"]) / hx.reference_unit["A"]
 
     def start_loadcell_read(self):
-        if not self._require_gpio():
-            return
         if self.loadcell_thread is not None and self.loadcell_thread.is_alive():
             self.log("Load cell read is already running.")
             return
@@ -3205,6 +3532,7 @@ class AllInOneTesterGUI:
             HX711 = self._load_hx711_class()
             hx = HX711(LOADCELL_DT_PIN, LOADCELL_SCK_PIN)
             self.loadcell_hx = hx
+            self.log(f"Load cell HX711 GPIO backend: {getattr(hx, 'backend_name', 'unknown')}.")
 
             hx.setReadingFormat("MSB", "MSB")
             hx.reset()
@@ -3217,25 +3545,47 @@ class AllInOneTesterGUI:
             hx.setOffset(offset, "A")
             self.log(f"Load cell tare offset: {offset:.2f}")
 
-            self.log(f"Load cell: place {known_weight_grams:.2f} g for calibration.")
-            if not self._wait_with_cancel(3.0, self.loadcell_stop_event):
+            saved_counts_per_gram = self._load_loadcell_calibration()
+            self.log(
+                f"Load cell: place {known_weight_grams:.2f} g now; "
+                f"calibrating in {LOADCELL_CALIBRATION_DELAY_S:.0f}s."
+            )
+            if not self._wait_with_cancel(LOADCELL_CALIBRATION_DELAY_S, self.loadcell_stop_event):
                 return
 
-            loaded_raw = self._read_average_raw(hx, channel="A")
-            delta = loaded_raw - offset
-            if abs(delta) < 1e-9:
-                raise RuntimeError("Calibration failed: raw delta is too small.")
-
-            counts_per_gram = delta / known_weight_grams
+            try:
+                loaded_raw = self._read_average_raw(hx, channel="A")
+                delta = loaded_raw - offset
+                if abs(delta) < 50.0:
+                    raise RuntimeError(f"raw delta is too small ({delta:.2f} counts)")
+                counts_per_gram = delta / known_weight_grams
+                self._save_loadcell_calibration(counts_per_gram, known_weight_grams)
+                self.log(f"Load cell calibrated. counts_per_gram={counts_per_gram:.6f}")
+            except Exception as calibration_exc:
+                if saved_counts_per_gram is None:
+                    raise RuntimeError(f"Calibration failed: {calibration_exc}") from calibration_exc
+                counts_per_gram = saved_counts_per_gram
+                self.log(
+                    "Load cell calibration failed; using saved calibration "
+                    f"counts_per_gram={counts_per_gram:.6f}. Reason: {calibration_exc}"
+                )
             hx.setReferenceUnit(counts_per_gram, "A")
-            self.log(f"Load cell calibrated. counts_per_gram={counts_per_gram:.6f}")
 
+            read_failures = 0
             while not self.loadcell_stop_event.is_set():
-                weight_grams = hx.getWeight("A")
-                if weight_grams is not None:
+                try:
+                    weight_grams = self._read_weight_grams(hx, samples=5)
+                    read_failures = 0
                     weight_kg = float(weight_grams) / 1000.0
                     self._record_loadcell_reading(weight_kg)
                     self._set_var(self.loadcell_weight_var, f"{weight_kg:.4f} kg")
+                except Exception as read_exc:
+                    read_failures += 1
+                    if read_failures == 1 or read_failures % 5 == 0:
+                        self.log(f"Load cell read retry {read_failures}: {read_exc}")
+                    if read_failures >= 12:
+                        raise
+                    self._set_var(self.loadcell_weight_var, "Retrying...")
                 time.sleep(0.2)
         except Exception as exc:
             self.log(f"Load cell error: {exc}")
@@ -3245,6 +3595,11 @@ class AllInOneTesterGUI:
                 try:
                     hx.disableReadyCallback()
                 except RuntimeError:
+                    pass
+            if hx is not None and hasattr(hx, "close"):
+                try:
+                    hx.close()
+                except Exception:
                     pass
 
             self.loadcell_hx = None
@@ -3312,6 +3667,8 @@ class AllInOneTesterGUI:
         self.blob_reset_reference_event.clear()
         self.surface_scale_ema = None
         self.surface_height_ema = None
+        self.surface_reference_height_map = None
+        self.surface_contact_ema = None
         self.surface_status_var.set("Surface idle. Auto baseline on first frame.")
 
         self.blob_thread = threading.Thread(target=self._blob_worker, daemon=True)
@@ -3441,6 +3798,8 @@ class AllInOneTesterGUI:
                     reference_centroids = list(centroids)
                     self.surface_scale_ema = None
                     self.surface_height_ema = None
+                    self.surface_reference_height_map = None
+                    self.surface_contact_ema = None
                     self._set_var(self.surface_status_var, "Baseline auto-set.")
 
                 if reference_centroids is None:
@@ -3453,6 +3812,8 @@ class AllInOneTesterGUI:
                     next_id = 0
                     self.surface_scale_ema = None
                     self.surface_height_ema = None
+                    self.surface_reference_height_map = None
+                    self.surface_contact_ema = None
                     self._set_var(self.surface_status_var, "Baseline reset.")
                     self.log("Dot pipeline reference reset to current centroids.")
 
@@ -3630,6 +3991,11 @@ class AllInOneTesterGUI:
                             )
 
                             if height_map is not None:
+                                contact_stats = self._measure_contact_deformation_mm(
+                                    height_map,
+                                    ellipse_mask,
+                                    cv2,
+                                )
                                 self._set_var(self.surface_status_var, "Surface running.")
                                 display_bgr = self._build_flow_3d_plot(
                                     flow_gray,
@@ -3641,19 +4007,41 @@ class AllInOneTesterGUI:
 
                                 flow_distance_mean = mean_disp
                                 flow_distance_max = max_disp
-                                distance_text = (
-                                    f"Disp mean: {mean_disp:.3f} px | "
-                                    f"scale: {scale:.3f}"
-                                )
-                                cv2.putText(
-                                    display_bgr,
-                                    distance_text,
-                                    (12, 50),
-                                    cv2.FONT_HERSHEY_SIMPLEX,
-                                    0.60,
-                                    (250, 245, 85),
-                                    2,
-                                )
+                                if contact_stats is not None and contact_stats["ready"]:
+                                    flow_distance_mean = contact_stats["top_mean"]
+                                    flow_distance_max = contact_stats["peak"]
+                                    distance_text = (
+                                        f"Contact deform peak: {contact_stats['peak']:.2f} mm | "
+                                        f"top mean: {contact_stats['top_mean']:.2f} mm | "
+                                        f"area: {contact_stats['area_ratio']:.1f}%"
+                                    )
+                                    overlay_lines = [
+                                        (
+                                            f"Contact deform peak {contact_stats['peak']:.2f} mm | "
+                                            f"top {contact_stats['top_mean']:.2f} mm"
+                                        ),
+                                        (
+                                            f"Area {contact_stats['area_ratio']:.1f}% | "
+                                            f"noise gate {contact_stats['noise_floor']:.2f} mm"
+                                        ),
+                                    ]
+                                    overlay_lines.append(f"Disp mean {mean_disp:.3f} px | scale {scale:.3f}")
+                                else:
+                                    distance_text = "Contact baseline readying..."
+                                    overlay_lines = [
+                                        "Contact baseline readying...",
+                                        f"Disp mean {mean_disp:.3f} px | scale {scale:.3f}",
+                                    ]
+                                for line_index, overlay_line in enumerate(overlay_lines):
+                                    cv2.putText(
+                                        display_bgr,
+                                        overlay_line,
+                                        (12, 50 + (line_index * 20)),
+                                        cv2.FONT_HERSHEY_SIMPLEX,
+                                        0.54,
+                                        (250, 245, 85),
+                                        2,
+                                    )
                                 surface_display_cache = display_bgr
                                 surface_distance_text_cache = distance_text
                                 surface_mean_cache = flow_distance_mean

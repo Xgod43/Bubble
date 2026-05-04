@@ -1,0 +1,14 @@
+
+[modern_python_gui]
+Traceback (most recent call last):
+  File "/home/bubble/Desktop/VespaBattleCatFC/Bubble/launch_bubble_app.py", line 56, in main
+    launch_modern_python_gui()
+  File "/home/bubble/Desktop/VespaBattleCatFC/Bubble/launch_bubble_app.py", line 35, in launch_modern_python_gui
+    modern_main()
+  File "/home/bubble/Desktop/VespaBattleCatFC/Bubble/python_mission_control_gui.py", line 1036, in main
+    root = tk.Tk()
+           ^^^^^^^
+  File "/usr/lib/python3.11/tkinter/__init__.py", line 2326, in __init__
+    self.tk = _tkinter.create(screenName, baseName, className, interactive, wantobjects, useTk, sync, use)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_tkinter.TclError: no display name and no $DISPLAY environment variable

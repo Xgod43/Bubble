@@ -29,19 +29,20 @@ Create a venv that can see the apt-installed camera/OpenCV/GPIO packages:
 
 ```bash
 cd ~/Bubble
-python3 -m venv --system-site-packages .venv
-source .venv/bin/activate
-python -m pip install -U pip
-python -m pip install -r requirements-pi-bookworm.txt
+./tools/setup_pi_venv.sh
 ```
+
+The setup script avoids Bookworm's externally-managed Python restriction (PEP 668)
+by installing pip packages into `.venv`, while `--system-site-packages` keeps
+apt-installed camera/OpenCV/GPIO packages visible.
 
 ## Smoke Check
 
 Run this before touching hardware:
 
 ```bash
-python tools/pi5_bookworm_check.py
-python main.py
+.venv/bin/python tools/pi5_bookworm_check.py
+./launch_bubble_app.sh
 ```
 
 The GUI should open with no overlapping panels. `main.py` currently launches the Python/Tk mission-control GUI first.
