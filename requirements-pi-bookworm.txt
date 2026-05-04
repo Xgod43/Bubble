@@ -2,4 +2,5 @@
 # Keep camera/OpenCV/GPIO packages on apt where possible; see PI5-BOOKWORM-TEST.md.
 pywebview>=5.0
 adafruit-blinka>=8.0
+adafruit-extended-bus>=1.0
 adafruit-circuitpython-mprls>=2.0

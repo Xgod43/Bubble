@@ -394,12 +394,12 @@ class MissionControlGUI(AllInOneTesterGUI):
         self._init_force_calibration_state()
 
     def _init_flow_defaults(self):
-        self.flow_state_var = tk.StringVar(value="Stopped")
+        self.flow_state_var = tk.StringVar(value="Merged into Live Detection")
         self.flow_points_var = tk.StringVar(value="-")
         self.flow_mean_disp_var = tk.StringVar(value="-")
         self.flow_max_disp_var = tk.StringVar(value="-")
         self.flow_fps_var = tk.StringVar(value="-")
-        self.flow_message_var = tk.StringVar(value="Start optical flow to inspect live motion.")
+        self.flow_message_var = tk.StringVar(value="Use Live Detection output type: optical_flow_2d.")
 
         self.flow_camera_backend_var = tk.StringVar(value="auto")
         self.flow_camera_index_var = tk.StringVar(value="0")
@@ -548,7 +548,7 @@ class MissionControlGUI(AllInOneTesterGUI):
         ttk.Combobox(
             control_card,
             textvariable=self.blob_view_type_var,
-            values=("overlay", "auto", "mosaic", "vector", "heatmap", "binary", "blob", "optical_flow_2d", "optical_flow_3d"),
+            values=("overlay", "auto", "mosaic", "vector", "heatmap", "binary", "blob", "optical_flow_2d", "surface_3d"),
             state="readonly",
         ).grid(row=1, column=2, sticky="ew", padx=(0, 8))
 
@@ -663,15 +663,15 @@ class MissionControlGUI(AllInOneTesterGUI):
 
         ops_tab = ttk.Frame(notebook, padding=12)
         hardware_tab_shell, hardware_tab = self._build_scrollable_tab(notebook, padding=12)
-        flow_tab = ttk.Frame(notebook, padding=12)
+        system_tab_shell, system_tab = self._build_scrollable_tab(notebook, padding=12)
 
         notebook.add(ops_tab, text="Operations")
         notebook.add(hardware_tab_shell, text="Hardware")
-        notebook.add(flow_tab, text="Optical Flow")
+        notebook.add(system_tab_shell, text="System Tests")
 
         self._build_operations_tab(ops_tab)
         self._build_hardware_tab(hardware_tab)
-        self._build_flow_tab(flow_tab)
+        self._build_system_tests_tab(system_tab)
 
     def _build_status_card(self, parent, row, column, title, variable, detail):
         card = ttk.Frame(parent, padding=10, style="Panel.TFrame")
@@ -831,6 +831,101 @@ class MissionControlGUI(AllInOneTesterGUI):
             self.hw_pressure_card.grid_configure(row=1, column=1, columnspan=1, padx=(0, 0), pady=(0, 8), sticky="nsew")
             self.hw_load_card.grid_configure(row=2, column=0, columnspan=2, padx=(0, 0), pady=(0, 8), sticky="nsew")
             self.hw_force_card.grid_configure(row=3, column=0, columnspan=2, padx=(0, 0), pady=(0, 0), sticky="ew")
+
+    def _build_system_tests_tab(self, tab):
+        tab.columnconfigure(0, weight=1)
+
+        vision = ttk.LabelFrame(tab, text="Vision Tests", padding=12)
+        vision.grid(row=0, column=0, sticky="ew")
+        vision.columnconfigure(1, weight=1)
+        vision.columnconfigure(2, weight=1)
+
+        self._test_row(
+            vision,
+            0,
+            "Camera",
+            self.camera_status_var,
+            (("Open", self.start_camera), ("Stop", self.stop_camera)),
+        )
+        self._test_row(
+            vision,
+            1,
+            "Dot pipeline",
+            self.blob_state_var,
+            (("Start", self.start_blob_test), ("Stop", self.stop_blob_test)),
+        )
+        hardware = ttk.LabelFrame(tab, text="Hardware Tests", padding=12)
+        hardware.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        hardware.columnconfigure(1, weight=1)
+        hardware.columnconfigure(2, weight=1)
+
+        self._test_row(
+            hardware,
+            0,
+            "Limit switches",
+            self.limit_monitor_state_var,
+            (("Start", self.start_limit_monitor), ("Stop", self.stop_limit_monitor)),
+        )
+        self._test_row(
+            hardware,
+            1,
+            "Stepper",
+            self.stepper_state_var,
+            (("Move", self.start_stepper_move), ("Stop", self.stop_stepper_move)),
+        )
+        self._test_row(
+            hardware,
+            2,
+            "Pressure",
+            self.pressure_state_var,
+            (("Start", self.start_pressure_read), ("Stop", self.stop_pressure_read)),
+        )
+        self._test_row(
+            hardware,
+            3,
+            "Load cell",
+            self.loadcell_state_var,
+            (("Start", self.start_loadcell_read), ("Stop", self.stop_loadcell_read)),
+        )
+
+        readout = ttk.LabelFrame(tab, text="Live Readouts", padding=12)
+        readout.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        for col in range(2):
+            readout.columnconfigure(col, weight=1)
+        self._status_line(readout, 0, "Pressure", self.pressure_value_var)
+        self._status_line(readout, 1, "Estimated force", self.force_estimate_var)
+        self._status_line(readout, 2, "Load cell", self.loadcell_weight_var)
+        self._status_line(readout, 3, f"Limit GPIO{LIMIT_1_PIN}", self.limit1_status_var)
+        self._status_line(readout, 4, f"Limit GPIO{LIMIT_2_PIN}", self.limit2_status_var)
+
+        ttk.Button(
+            tab,
+            text="Stop All",
+            style="Danger.TButton",
+            command=self.stop_all_tests,
+        ).grid(row=3, column=0, sticky="ew", pady=(10, 0))
+
+    def _test_row(self, parent, row, label, status_var, actions):
+        ttk.Label(parent, text=label, style="MetricLabel.TLabel").grid(
+            row=row,
+            column=0,
+            sticky="w",
+            pady=(0 if row == 0 else 8, 0),
+        )
+        ttk.Label(parent, textvariable=status_var).grid(
+            row=row,
+            column=1,
+            sticky="w",
+            pady=(0 if row == 0 else 8, 0),
+        )
+        buttons = ttk.Frame(parent, style="Surface.TFrame")
+        buttons.grid(row=row, column=2, sticky="e", pady=(0 if row == 0 else 8, 0))
+        for idx, (text, command) in enumerate(actions):
+            ttk.Button(buttons, text=text, command=command).grid(
+                row=0,
+                column=idx,
+                padx=(0 if idx == 0 else 6, 0),
+            )
 
     def _build_flow_tab(self, tab):
         tab.columnconfigure(0, weight=1)

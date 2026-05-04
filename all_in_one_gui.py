@@ -66,6 +66,10 @@ COLOR_BORDER = "#d7e0e2"
 COLOR_OK = "#1f8f63"
 COLOR_WARN = "#c97a00"
 
+BUBBLE_WIDTH_MM = 120.0
+BUBBLE_HEIGHT_MM = 80.0
+BUBBLE_MAX_HEIGHT_MM = 25.0
+
 
 class AllInOneTesterGUI:
     def __init__(self, root):
@@ -120,6 +124,7 @@ class AllInOneTesterGUI:
         self.blob_stop_btn = None
         self.blob_snapshot_btn = None
         self.blob_reset_ref_btn = None
+        self.surface_reset_btn = None
         self.blob_reset_reference_event = threading.Event()
 
         self.flow_thread = None
@@ -131,13 +136,39 @@ class AllInOneTesterGUI:
         self.flow_start_btn = None
         self.flow_stop_btn = None
         self.flow_settings_btn = None
+        self.flow_state_var = tk.StringVar(value="Merged into Live Detection")
+        self.flow_points_var = tk.StringVar(value="-")
+        self.flow_mean_disp_var = tk.StringVar(value="-")
+        self.flow_max_disp_var = tk.StringVar(value="-")
+        self.flow_fps_var = tk.StringVar(value="-")
+        self.flow_message_var = tk.StringVar(value="Use Live Detection output type: optical_flow_2d.")
+        self.flow_camera_backend_var = tk.StringVar(value="auto")
+        self.flow_camera_index_var = tk.StringVar(value="0")
+        self.flow_cam_width_var = tk.StringVar(value="1280")
+        self.flow_cam_height_var = tk.StringVar(value="960")
+        self.flow_proc_scale_var = tk.StringVar(value="1.0")
+        self.flow_roi_scale_var = tk.StringVar(value="0.96")
+        self.flow_3d_roi_scale_var = tk.StringVar(value="1.0")
+        self.flow_max_points_var = tk.StringVar(value="260")
+        self.flow_quality_var = tk.StringVar(value="0.02")
+        self.flow_min_distance_var = tk.StringVar(value="7")
+        self.flow_reseed_var = tk.StringVar(value="90")
+        self.flow_show_vectors_var = tk.BooleanVar(value=True)
+
+        self.surface_gain_var = tk.StringVar(value="1.0")
+        self.surface_smooth_var = tk.StringVar(value="1.4")
+        self.surface_grid_var = tk.StringVar(value="52")
+        self.surface_status_var = tk.StringVar(
+            value="Surface idle. Auto baseline on first frame."
+        )
+        self.surface_scale_ema = None
+        self.surface_height_ema = None
 
         self._init_force_calibration_state()
         self._build_ui()
         self._setup_gpio_once()
         self.root.after(100, self._drain_log_queue)
         self.root.after(60, self._drain_blob_frame_queue)
-        self.root.after(60, self._drain_flow_frame_queue)
         self.root.after(500, self._update_clock)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -280,13 +311,13 @@ class AllInOneTesterGUI:
         notebook.grid(row=0, column=0, sticky="nsew")
 
         self._build_blob_tab(notebook)
-        self._build_optical_flow_tab(notebook)
         self._build_camera_tab(notebook)
         self._build_limit_tab(notebook)
         self._build_stepper_tab(notebook)
         self._build_pressure_tab(notebook)
         self._build_loadcell_tab(notebook)
         self._build_force_calibration_tab(notebook)
+        self._build_system_tests_tab(notebook)
         self._build_session_log_panel(content_pane)
 
     def _build_session_log_panel(self, parent):
@@ -331,6 +362,117 @@ class AllInOneTesterGUI:
         self.log_toggle_btn.configure(text="Hide Log")
         self.log_panel_visible = True
         self.log("Session Log shown.")
+
+    def _build_system_tests_tab(self, notebook):
+        tab = ttk.Frame(notebook, padding=12)
+        try:
+            notebook.insert(1, tab, text="2) System Tests")
+        except tk.TclError:
+            notebook.add(tab, text="2) System Tests")
+
+        tab.columnconfigure(0, weight=1)
+        tab.columnconfigure(1, weight=1)
+
+        ttk.Label(
+            tab,
+            text="One-page checkout for camera, vision modes, motion, pressure, and load sensors.",
+            style="SectionHint.TLabel",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        vision = ttk.LabelFrame(tab, text="Vision", padding=10)
+        vision.grid(row=1, column=0, sticky="nsew", padx=(0, 6))
+        vision.columnconfigure(1, weight=1)
+
+        hardware = ttk.LabelFrame(tab, text="Hardware", padding=10)
+        hardware.grid(row=1, column=1, sticky="nsew", padx=(6, 0))
+        hardware.columnconfigure(1, weight=1)
+
+        def add_row(parent, row, name, status_var, actions, detail_var=None):
+            ttk.Label(parent, text=name + ":").grid(row=row, column=0, sticky="w", pady=(5, 0))
+            ttk.Label(parent, textvariable=status_var).grid(row=row, column=1, sticky="w", pady=(5, 0))
+            action_frame = ttk.Frame(parent)
+            action_frame.grid(row=row, column=2, sticky="e", pady=(5, 0), padx=(8, 0))
+            for idx, (label, command) in enumerate(actions):
+                ttk.Button(action_frame, text=label, command=command).grid(
+                    row=0,
+                    column=idx,
+                    sticky="ew",
+                    padx=(0 if idx == 0 else 6, 0),
+                )
+            if detail_var is not None:
+                ttk.Label(parent, textvariable=detail_var, style="SectionHint.TLabel").grid(
+                    row=row + 1,
+                    column=1,
+                    columnspan=2,
+                    sticky="w",
+                )
+
+        add_row(
+            vision,
+            0,
+            "Camera",
+            self.camera_status_var,
+            (("Open", self.start_camera), ("Stop", self.stop_camera)),
+        )
+        add_row(
+            vision,
+            2,
+            "Dot pipeline",
+            self.blob_state_var,
+            (("Start", self.start_blob_test), ("Stop", self.stop_blob_test)),
+            detail_var=self.blob_message_var,
+        )
+        add_row(
+            hardware,
+            0,
+            "Limit switches",
+            self.limit_monitor_state_var,
+            (("Start", self.start_limit_monitor), ("Stop", self.stop_limit_monitor)),
+            detail_var=self.limit1_status_var,
+        )
+        ttk.Label(hardware, textvariable=self.limit2_status_var, style="SectionHint.TLabel").grid(
+            row=2,
+            column=1,
+            columnspan=2,
+            sticky="w",
+        )
+        add_row(
+            hardware,
+            3,
+            "Stepper",
+            self.stepper_state_var,
+            (("Move", self.start_stepper_move), ("Stop", self.stop_stepper_move)),
+        )
+        add_row(
+            hardware,
+            5,
+            "Pressure",
+            self.pressure_state_var,
+            (("Start", self.start_pressure_read), ("Stop", self.stop_pressure_read)),
+            detail_var=self.pressure_value_var,
+        )
+        add_row(
+            hardware,
+            7,
+            "Load cell",
+            self.loadcell_state_var,
+            (("Start", self.start_loadcell_read), ("Stop", self.stop_loadcell_read)),
+            detail_var=self.loadcell_weight_var,
+        )
+
+        footer = ttk.Frame(tab)
+        footer.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        footer.columnconfigure(0, weight=1)
+        ttk.Label(footer, textvariable=self.system_status_var, style="SectionHint.TLabel").grid(
+            row=0,
+            column=0,
+            sticky="w",
+        )
+        ttk.Button(footer, text="Stop All", style="Danger.TButton", command=self.stop_all_tests).grid(
+            row=0,
+            column=1,
+            sticky="e",
+        )
 
     def _build_camera_tab(self, notebook):
         tab = ttk.Frame(notebook, padding=12)
@@ -609,7 +751,7 @@ class AllInOneTesterGUI:
 
         right_panel = ttk.Frame(main_pane)
         right_panel.columnconfigure(0, weight=1)
-        right_panel.rowconfigure(1, weight=1)
+        right_panel.rowconfigure(2, weight=1)
 
         main_pane.add(left_panel, weight=4)
         main_pane.add(right_panel, weight=3)
@@ -687,7 +829,18 @@ class AllInOneTesterGUI:
         ttk.Combobox(
             controls,
             textvariable=self.blob_view_type_var,
-            values=("auto", "mosaic", "overlay", "vector", "heatmap", "pointcloud", "binary", "blob", "optical_flow_2d", "optical_flow_3d"),
+            values=(
+                "auto",
+                "mosaic",
+                "overlay",
+                "vector",
+                "heatmap",
+                "pointcloud",
+                "binary",
+                "blob",
+                "optical_flow_2d",
+                "surface_3d",
+            ),
             state="readonly",
         ).grid(row=4, column=1, sticky="ew", pady=(6, 0))
 
@@ -770,8 +923,43 @@ class AllInOneTesterGUI:
         )
         self.blob_settings_btn.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(8, 0))
 
+        surface = ttk.LabelFrame(right_panel, text="3D Surface", padding=8)
+        surface.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        surface.columnconfigure(1, weight=1)
+        surface.columnconfigure(3, weight=1)
+
+        ttk.Label(
+            surface,
+            textvariable=self.surface_status_var,
+            wraplength=280,
+            justify="left",
+        ).grid(row=0, column=0, columnspan=4, sticky="w")
+
+        self.surface_reset_btn = ttk.Button(
+            surface,
+            text="Reset Baseline",
+            command=self.reset_surface_baseline,
+        )
+        self.surface_reset_btn.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+
+        ttk.Label(surface, text="Gain:").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(surface, textvariable=self.surface_gain_var, width=10).grid(
+            row=2, column=1, sticky="ew", pady=(6, 0)
+        )
+        ttk.Label(surface, text="Smooth:").grid(
+            row=2, column=2, sticky="w", padx=(12, 0), pady=(6, 0)
+        )
+        ttk.Entry(surface, textvariable=self.surface_smooth_var, width=10).grid(
+            row=2, column=3, sticky="ew", pady=(6, 0)
+        )
+
+        ttk.Label(surface, text="Grid:").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(surface, textvariable=self.surface_grid_var, width=10).grid(
+            row=3, column=1, sticky="ew", pady=(6, 0)
+        )
+
         metrics = ttk.LabelFrame(right_panel, text="Live Metrics", padding=8)
-        metrics.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+        metrics.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
         metrics.columnconfigure(1, weight=1)
         metrics.columnconfigure(3, weight=1)
 
@@ -877,7 +1065,177 @@ class AllInOneTesterGUI:
         return cv2.cvtColor(norm_gray, cv2.COLOR_GRAY2BGR)
 
     @staticmethod
-    def _build_flow_3d_plot(gray_frame, mag_map, cv2, roi_mask=None, camera_gray_frame=None):
+    def _build_surface_ellipse_mask(shape, cx, cy, rx, ry):
+        height_px, width_px = shape[:2]
+        if rx <= 1 or ry <= 1:
+            return np.zeros((height_px, width_px), dtype=bool)
+
+        yy, xx = np.ogrid[:height_px, :width_px]
+        nx = (xx - cx) / rx
+        ny = (yy - cy) / ry
+        return (nx * nx + ny * ny) <= 1.0
+
+    def _parse_surface_float(self, variable, default, min_value, max_value):
+        try:
+            value = float(variable.get())
+        except (TypeError, ValueError):
+            value = default
+        return float(np.clip(value, min_value, max_value))
+
+    def _parse_surface_int(self, variable, default, min_value, max_value):
+        try:
+            value = int(float(variable.get()))
+        except (TypeError, ValueError):
+            value = default
+        return int(np.clip(value, min_value, max_value))
+
+    def reset_surface_baseline(self):
+        self.surface_scale_ema = None
+        self.surface_height_ema = None
+        if not self._is_blob_running():
+            self._set_var(
+                self.surface_status_var,
+                "Surface idle. Auto baseline on first frame.",
+            )
+            return
+
+        self._set_var(self.surface_status_var, "Baseline reset requested.")
+        self.request_blob_reference_reset()
+
+    def _build_surface_height_map(self, centroids, reference_centroids, displacements, frame_shape, params, cv2):
+        if not reference_centroids or not displacements:
+            return None, None, None
+
+        points = []
+        vectors = []
+        for ref, disp in zip(reference_centroids, displacements):
+            if ref is None or disp is None:
+                continue
+            points.append(ref)
+            vectors.append(disp)
+
+        if len(points) < 6:
+            return None, None, None
+
+        points_arr = np.array(points, dtype=np.float32)
+        vectors_arr = np.array(vectors, dtype=np.float32)
+
+        # Remove rigid camera/bubble drift. The residual field is what should
+        # become local membrane deformation.
+        global_shift = np.median(vectors_arr, axis=0)
+        residual_vectors = vectors_arr - global_shift
+        values_arr = np.linalg.norm(residual_vectors, axis=1).astype(np.float32)
+
+        height_px, width_px = frame_shape[:2]
+        ratio = BUBBLE_WIDTH_MM / BUBBLE_HEIGHT_MM if BUBBLE_HEIGHT_MM > 0 else 1.0
+        roi_scale = float(params.get("roi_scale", 1.0)) if params.get("use_roi", False) else 1.0
+
+        if params.get("use_roi", False):
+            cx = width_px * 0.5
+            cy = height_px * 0.5
+            max_rx = max(10.0, width_px * roi_scale * 0.5)
+            max_ry = max(10.0, height_px * roi_scale * 0.5)
+        else:
+            lo = np.percentile(points_arr, 3.0, axis=0)
+            hi = np.percentile(points_arr, 97.0, axis=0)
+            cx = float((lo[0] + hi[0]) * 0.5)
+            cy = float((lo[1] + hi[1]) * 0.5)
+            max_rx = max(10.0, float((hi[0] - lo[0]) * 0.64))
+            max_ry = max(10.0, float((hi[1] - lo[1]) * 0.64))
+
+        if max_rx / max_ry > ratio:
+            ry = max_ry
+            rx = ry * ratio
+        else:
+            rx = max_rx
+            ry = rx / ratio
+
+        rx = min(rx, max(10.0, width_px * 0.49))
+        ry = min(ry, max(10.0, height_px * 0.49))
+        cx = float(np.clip(cx, rx, max(rx, width_px - 1 - rx)))
+        cy = float(np.clip(cy, ry, max(ry, height_px - 1 - ry)))
+
+        grid_w = self._parse_surface_int(self.surface_grid_var, 52, 24, 140)
+        grid_h = max(18, min(int(grid_w / ratio), 120))
+
+        grid_x = np.linspace(cx - rx, cx + rx, grid_w)
+        grid_y = np.linspace(cy - ry, cy + ry, grid_h)
+        gx, gy = np.meshgrid(grid_x, grid_y)
+
+        nx = (gx - cx) / rx
+        ny = (gy - cy) / ry
+        r2 = nx * nx + ny * ny
+        grid_mask = r2 <= 1.0
+
+        base = np.zeros_like(r2, dtype=np.float32)
+        base[grid_mask] = np.sqrt(np.clip(1.0 - r2[grid_mask], 0.0, 1.0))
+
+        dx = gx[..., None] - points_arr[:, 0]
+        dy = gy[..., None] - points_arr[:, 1]
+        dist2 = dx * dx + dy * dy
+
+        sigma = max(8.0, min(rx, ry) * 0.28)
+        weights = np.exp(-dist2 / (2.0 * sigma * sigma)).astype(np.float32)
+        weight_sum = np.sum(weights, axis=-1)
+        disp_map = np.sum(weights * values_arr, axis=-1)
+        disp_map = np.divide(
+            disp_map,
+            weight_sum,
+            out=np.zeros_like(disp_map),
+            where=weight_sum > 1e-6,
+        )
+
+        confidence = np.clip(weight_sum / (np.percentile(weight_sum[grid_mask], 75.0) + 1e-6), 0.0, 1.0)
+        disp_map = np.where(grid_mask, disp_map * confidence, 0.0)
+        disp_map = cv2.GaussianBlur(disp_map, (0, 0), sigmaX=1.1, sigmaY=1.0)
+
+        pctl = float(np.percentile(values_arr, 92.0)) if values_arr.size > 0 else 0.0
+        pctl = max(pctl, 0.05)
+        if self.surface_scale_ema is None:
+            self.surface_scale_ema = pctl
+        else:
+            self.surface_scale_ema = (0.9 * self.surface_scale_ema) + (0.1 * pctl)
+
+        scale = max(self.surface_scale_ema, 0.05)
+        gain = self._parse_surface_float(self.surface_gain_var, 1.0, 0.2, 3.0)
+        smooth = self._parse_surface_float(self.surface_smooth_var, 1.4, 0.0, 4.0)
+
+        disp_norm = np.clip(disp_map / scale, 0.0, 1.35)
+        base_mm = base * BUBBLE_MAX_HEIGHT_MM
+        edge_lock = np.power(np.clip(base, 0.0, 1.0), 0.72)
+        depression_mm = gain * disp_norm * (BUBBLE_MAX_HEIGHT_MM * 0.62) * edge_lock
+        height_low_mm = np.clip(base_mm - depression_mm, 0.0, BUBBLE_MAX_HEIGHT_MM)
+        height_low = height_low_mm / BUBBLE_MAX_HEIGHT_MM
+
+        if smooth > 0.01:
+            low_sigma = max(0.3, smooth * 0.65)
+            height_low = cv2.GaussianBlur(height_low, (0, 0), sigmaX=low_sigma, sigmaY=low_sigma)
+        height_low = np.where(grid_mask, height_low, 0.0)
+
+        height_full = cv2.resize(height_low, (width_px, height_px), interpolation=cv2.INTER_CUBIC)
+        ellipse_mask = self._build_surface_ellipse_mask((height_px, width_px), cx, cy, rx, ry)
+        height_full = np.where(ellipse_mask, np.clip(height_full, 0.0, 1.0), 0.0)
+
+        if smooth > 0.01:
+            height_full = cv2.GaussianBlur(height_full, (0, 0), sigmaX=smooth, sigmaY=smooth)
+            height_full = np.where(ellipse_mask, np.clip(height_full, 0.0, 1.0), 0.0)
+
+        if self.surface_height_ema is None or self.surface_height_ema.shape != height_full.shape:
+            self.surface_height_ema = height_full.astype(np.float32)
+        else:
+            self.surface_height_ema = cv2.addWeighted(
+                self.surface_height_ema.astype(np.float32),
+                0.78,
+                height_full.astype(np.float32),
+                0.22,
+                0.0,
+            )
+        height_full = np.where(ellipse_mask, self.surface_height_ema, 0.0)
+
+        return height_full, ellipse_mask, scale
+
+    @staticmethod
+    def _build_flow_3d_plot(gray_frame, height_map, cv2, roi_mask=None, camera_gray_frame=None):
         camera_source = camera_gray_frame if camera_gray_frame is not None else gray_frame
         out_h, out_w = camera_source.shape[:2]
         camera_h = max(96, int(out_h * 0.58))
@@ -898,33 +1256,22 @@ class AllInOneTesterGUI:
         plot_canvas[:, :, :] = (9, 22, 32)
         cv2.line(output, (0, camera_h - 1), (out_w - 1, camera_h - 1), (45, 73, 96), 1)
 
-        if mag_map is None or mag_map.size == 0:
+        if height_map is None or height_map.size == 0:
             output[camera_h:, :, :] = plot_canvas
             return output
 
-        mag_work = mag_map.astype(np.float32)
+        height_work = height_map.astype(np.float32)
+        max_val = float(np.max(height_work))
+        if max_val > 1.0:
+            height_work = height_work / max_val
+
         if roi_mask is not None:
-            roi_binary = (roi_mask > 0)
-            if np.any(roi_binary):
-                mag_vals = mag_work[roi_binary]
-            else:
-                mag_vals = mag_work.reshape(-1)
+            roi_binary = roi_mask.astype(bool)
+            height_work = np.where(roi_binary, height_work, 0.0)
         else:
             roi_binary = None
-            mag_vals = mag_work.reshape(-1)
 
-        if mag_vals.size == 0:
-            output[camera_h:, :, :] = plot_canvas
-            return output
-
-        robust_scale = float(np.percentile(mag_vals, 95.0))
-        robust_scale = max(robust_scale, 0.08)
-        mag_norm = np.clip(mag_work / robust_scale, 0.0, 1.0)
-
-        if roi_binary is not None:
-            mag_norm = mag_norm * roi_binary.astype(np.float32)
-
-        mag_plot = cv2.resize(mag_norm, (out_w, plot_h), interpolation=cv2.INTER_AREA)
+        height_plot = cv2.resize(height_work, (out_w, plot_h), interpolation=cv2.INTER_AREA)
         plot_roi_binary = None
         if roi_binary is not None:
             plot_roi_binary = cv2.resize(
@@ -933,46 +1280,95 @@ class AllInOneTesterGUI:
                 interpolation=cv2.INTER_NEAREST,
             ).astype(bool)
 
-        step = max(8, min(16, out_w // 80))
+        # Smooth and shade the height map to render a filled surface.
+        height = height_plot.astype(np.float32)
+        height = cv2.GaussianBlur(height, (0, 0), sigmaX=1.6, sigmaY=1.4)
+        if plot_roi_binary is not None:
+            mask_float = plot_roi_binary.astype(np.float32)
+            soft_mask = cv2.GaussianBlur(mask_float, (0, 0), sigmaX=2.0, sigmaY=2.0)
+            soft_mask = np.clip(soft_mask, 0.0, 1.0)
+            height = height * soft_mask
+        height = np.clip(height, 0.0, 1.0)
+
+        color_map = cv2.applyColorMap((height * 255.0).astype(np.uint8), cv2.COLORMAP_TURBO)
+        dx = cv2.Sobel(height, cv2.CV_32F, 1, 0, ksize=3)
+        dy = cv2.Sobel(height, cv2.CV_32F, 0, 1, ksize=3)
+        nx = -dx * 1.5
+        ny = -dy * 1.5
+        nz = 1.0
+        norm = np.sqrt(nx * nx + ny * ny + nz * nz)
+        norm = np.where(norm < 1e-6, 1.0, norm)
+        shade = (nx * 0.25 + ny * -0.35 + nz * 1.0) / norm
+        shade = np.clip(shade, 0.0, 1.0)
+        shade = 0.35 + 0.65 * shade
+
+        step = max(4, min(10, out_w // 120))
         x_scale = 0.95
         y_scale = 0.62
-        z_scale = max(28.0, plot_h * 0.48)
+        z_scale = max(20.0, plot_h * 0.34)
         z_x_shift = max(10.0, min(28.0, out_w * 0.028))
-        horizon = int(plot_h * 0.82)
+        horizon = int(plot_h * 0.48)
         center_x = out_w * 0.5
 
-        # Draw wireframe rows (Y lines)
-        for gy in range(0, plot_h, step):
-            prev = None
-            for gx in range(0, out_w, step):
-                z = float(mag_plot[gy, gx])
-                px = int((gx - center_x) * x_scale + center_x + z * z_x_shift)
-                py = int((gy - plot_h * 0.5) * y_scale + horizon - z * z_scale)
-                cur = (int(np.clip(px, 0, out_w - 1)), int(np.clip(py, 0, plot_h - 1)))
-                if prev is not None:
-                    color = (70, int(120 + z * 110), int(180 + z * 70))
-                    cv2.line(plot_canvas, prev, cur, color, 1)
-                prev = cur
+        def project(gx, gy, z):
+            px = (gx - center_x) * x_scale + center_x + z * z_x_shift
+            py = (gy - plot_h * 0.5) * y_scale + horizon + z * z_scale
+            return (int(np.clip(px, 0, out_w - 1)), int(np.clip(py, 0, plot_h - 1)))
 
-        # Draw wireframe columns (X lines)
-        for gx in range(0, out_w, step):
-            prev = None
-            for gy in range(0, plot_h, step):
-                z = float(mag_plot[gy, gx])
-                px = int((gx - center_x) * x_scale + center_x + z * z_x_shift)
-                py = int((gy - plot_h * 0.5) * y_scale + horizon - z * z_scale)
-                cur = (int(np.clip(px, 0, out_w - 1)), int(np.clip(py, 0, plot_h - 1)))
-                if prev is not None:
-                    color = (55, int(110 + z * 120), int(170 + z * 85))
-                    cv2.line(plot_canvas, prev, cur, color, 1)
-                prev = cur
+        cells = []
+        for gy in range(0, plot_h - step, step):
+            cy = min(plot_h - 1, gy + step // 2)
+            for gx in range(0, out_w - step, step):
+                cx = min(out_w - 1, gx + step // 2)
+                if plot_roi_binary is not None and not plot_roi_binary[cy, cx]:
+                    continue
+
+                z00 = float(height[gy, gx])
+                z10 = float(height[gy, gx + step])
+                z11 = float(height[gy + step, gx + step])
+                z01 = float(height[gy + step, gx])
+
+                p0 = project(gx, gy, z00)
+                p1 = project(gx + step, gy, z10)
+                p2 = project(gx + step, gy + step, z11)
+                p3 = project(gx, gy + step, z01)
+
+                shade_val = float(shade[cy, cx])
+                base = color_map[cy, cx].astype(np.float32)
+                color = np.clip(base * shade_val, 0, 255).astype(np.uint8)
+                avg_y = (p0[1] + p1[1] + p2[1] + p3[1]) * 0.25
+                avg_z = (z00 + z10 + z11 + z01) * 0.25
+                cells.append(
+                    (
+                        avg_y,
+                        -avg_z,
+                        np.array([p0, p1, p2, p3], dtype=np.int32),
+                        (int(color[0]), int(color[1]), int(color[2])),
+                    )
+                )
+
+        for _avg_y, _avg_z, polygon, color in sorted(cells, key=lambda item: (item[0], item[1])):
+            cv2.fillConvexPoly(
+                plot_canvas,
+                polygon,
+                color,
+                lineType=cv2.LINE_AA,
+            )
 
         if plot_roi_binary is not None:
             roi_uint8 = plot_roi_binary.astype(np.uint8) * 255
             contours, _ = cv2.findContours(roi_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             cv2.drawContours(plot_canvas, contours, -1, (40, 180, 220), 1)
 
-        cv2.putText(plot_canvas, "3D deformation plot", (12, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 230, 80), 1)
+        cv2.putText(
+            plot_canvas,
+            "bubble surface",
+            (12, 22),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            (255, 230, 80),
+            1,
+        )
         output[camera_h:, :, :] = plot_canvas
         return output
 
@@ -1164,6 +1560,7 @@ class AllInOneTesterGUI:
         self._set_button_enabled(self.blob_snapshot_btn, running)
         self._set_button_enabled(self.blob_reset_ref_btn, running)
         self._set_button_enabled(self.blob_settings_btn, not running)
+        self._set_button_enabled(self.surface_reset_btn, running)
 
     def _set_flow_controls(self, running):
         self._set_start_stop_controls(self.flow_start_btn, self.flow_stop_btn, running)
@@ -1621,7 +2018,18 @@ class AllInOneTesterGUI:
         ttk.Combobox(
             viz_tab,
             textvariable=self.blob_view_type_var,
-            values=("auto", "mosaic", "overlay", "vector", "heatmap", "pointcloud", "binary", "blob", "optical_flow_2d", "optical_flow_3d"),
+            values=(
+                "auto",
+                "mosaic",
+                "overlay",
+                "vector",
+                "heatmap",
+                "pointcloud",
+                "binary",
+                "blob",
+                "optical_flow_2d",
+                "surface_3d",
+            ),
             state="readonly",
         ).grid(row=1, column=1, sticky="ew", pady=(8, 0))
         ttk.Checkbutton(viz_tab, text="Enable mosaic view", variable=self.blob_use_mosaic_var).grid(
@@ -2009,10 +2417,24 @@ class AllInOneTesterGUI:
         view_type = self.blob_view_type_var.get().strip().lower()
         if view_type == "optical_flow":
             view_type = "optical_flow_2d"
-        valid_view_types = {"auto", "mosaic", "overlay", "vector", "heatmap", "pointcloud", "binary", "blob", "optical_flow_2d", "optical_flow_3d"}
+        if view_type == "optical_flow_3d":
+            view_type = "surface_3d"
+        valid_view_types = {
+            "auto",
+            "mosaic",
+            "overlay",
+            "vector",
+            "heatmap",
+            "pointcloud",
+            "binary",
+            "blob",
+            "optical_flow_2d",
+            "surface_3d",
+            "optical_flow_3d",
+        }
         if view_type not in valid_view_types:
             raise ValueError(
-                "Output type must be one of: auto, mosaic, overlay, vector, heatmap, pointcloud, binary, blob, optical_flow_2d, optical_flow_3d."
+                "Output type must be one of: auto, mosaic, overlay, vector, heatmap, pointcloud, binary, blob, optical_flow_2d, surface_3d, optical_flow_3d."
             )
 
         illum_method = self.blob_illum_method_var.get().strip().lower()
@@ -2430,14 +2852,40 @@ class AllInOneTesterGUI:
         self._refresh_system_status()
         self.log("Pressure read started.")
 
+    @staticmethod
+    def _open_pressure_i2c():
+        import board
+
+        if hasattr(board, "I2C"):
+            return board.I2C(), "board.I2C"
+
+        try:
+            import busio
+
+            scl = getattr(board, "SCL", None)
+            sda = getattr(board, "SDA", None)
+            if scl is not None and sda is not None:
+                return busio.I2C(scl, sda), "busio.I2C(board.SCL, board.SDA)"
+        except Exception:
+            pass
+
+        try:
+            from adafruit_extended_bus import ExtendedI2C
+
+            return ExtendedI2C(1), "ExtendedI2C(1)"
+        except Exception as exc:
+            raise RuntimeError(
+                "Could not open I2C bus. Install/enable Blinka I2C support, or install "
+                "adafruit-extended-bus and enable i2c with raspi-config."
+            ) from exc
+
     def _pressure_worker(self):
         try:
-            import board
             import adafruit_mprls
 
-            i2c = board.I2C()
+            i2c, i2c_backend = self._open_pressure_i2c()
             sensor = adafruit_mprls.MPRLS(i2c, psi_min=0, psi_max=25)
-            self.log("MPRLS pressure sensor initialized.")
+            self.log(f"MPRLS pressure sensor initialized via {i2c_backend}.")
 
             while not self.pressure_stop_event.is_set():
                 pressure_hpa = float(sensor.pressure)
@@ -2862,6 +3310,9 @@ class AllInOneTesterGUI:
         self.blob_photo = None
         self.blob_preview_label.configure(image="", text="Starting preview...")
         self.blob_reset_reference_event.clear()
+        self.surface_scale_ema = None
+        self.surface_height_ema = None
+        self.surface_status_var.set("Surface idle. Auto baseline on first frame.")
 
         self.blob_thread = threading.Thread(target=self._blob_worker, daemon=True)
         self.blob_thread.start()
@@ -2887,12 +3338,11 @@ class AllInOneTesterGUI:
         flow_prev_gray = None
         flow_prev_pts = None
         flow_reseed_counter = 0
-        flow_mag_ema = None
-        flow_3d_refresh_counter = 0
-        flow_3d_display_cache = None
-        flow_3d_distance_text_cache = ""
-        flow_3d_mean_cache = None
-        flow_3d_max_cache = None
+        surface_refresh_counter = 0
+        surface_display_cache = None
+        surface_distance_text_cache = ""
+        surface_mean_cache = None
+        surface_max_cache = None
 
         try:
             pipe = self.blob_module
@@ -2989,6 +3439,9 @@ class AllInOneTesterGUI:
 
                 if (reference_centroids is None or len(reference_centroids) == 0) and centroids:
                     reference_centroids = list(centroids)
+                    self.surface_scale_ema = None
+                    self.surface_height_ema = None
+                    self._set_var(self.surface_status_var, "Baseline auto-set.")
 
                 if reference_centroids is None:
                     reference_centroids = []
@@ -2998,6 +3451,9 @@ class AllInOneTesterGUI:
                     reference_centroids = list(centroids)
                     tracks = {}
                     next_id = 0
+                    self.surface_scale_ema = None
+                    self.surface_height_ema = None
+                    self._set_var(self.surface_status_var, "Baseline reset.")
                     self.log("Dot pipeline reference reset to current centroids.")
 
                 displacements, _unmatched_ref = pipe.compute_displacements(
@@ -3065,59 +3521,60 @@ class AllInOneTesterGUI:
                     display_bgr = heatmap_vis
                 elif display_mode == "pointcloud":
                     display_bgr = pointcloud_vis
-                elif display_mode in {"optical_flow_2d", "optical_flow_3d"}:
+                elif display_mode in {"optical_flow_2d", "surface_3d"}:
                     flow_gray = cv2.cvtColor(frame_for_detection, cv2.COLOR_BGR2GRAY)
                     display_bgr = frame_bgr.copy()
-                    flow_reseed_counter += 1
-                    flow_roi_mask = None
 
-                    if params["use_roi"]:
-                        fh, fw = flow_gray.shape[:2]
-                        flow_roi_mask = np.zeros((fh, fw), dtype=np.uint8)
-                        fcx, fcy = fw // 2, fh // 2
-                        frx = max(10, int((fw * params["roi_scale"]) * 0.5))
-                        fry = max(10, int((fh * params["roi_scale"]) * 0.5))
-                        cv2.ellipse(flow_roi_mask, (fcx, fcy), (frx, fry), 0, 0, 360, 255, -1)
+                    if display_mode == "optical_flow_2d":
+                        flow_reseed_counter += 1
+                        flow_roi_mask = None
 
-                    need_reseed = (
-                        flow_prev_gray is None
-                        or flow_prev_pts is None
-                        or len(flow_prev_pts) < 10
-                        or flow_reseed_counter >= 12
-                    )
+                        if params["use_roi"]:
+                            fh, fw = flow_gray.shape[:2]
+                            flow_roi_mask = np.zeros((fh, fw), dtype=np.uint8)
+                            fcx, fcy = fw // 2, fh // 2
+                            frx = max(10, int((fw * params["roi_scale"]) * 0.5))
+                            fry = max(10, int((fh * params["roi_scale"]) * 0.5))
+                            cv2.ellipse(flow_roi_mask, (fcx, fcy), (frx, fry), 0, 0, 360, 255, -1)
 
-                    if need_reseed:
-                        flow_prev_pts = cv2.goodFeaturesToTrack(
-                            flow_prev_gray if flow_prev_gray is not None else flow_gray,
-                            maxCorners=220,
-                            qualityLevel=0.02,
-                            minDistance=7,
-                            mask=flow_roi_mask,
+                        need_reseed = (
+                            flow_prev_gray is None
+                            or flow_prev_pts is None
+                            or len(flow_prev_pts) < 10
+                            or flow_reseed_counter >= 12
                         )
-                        flow_reseed_counter = 0
 
-                    if flow_prev_gray is not None and flow_prev_pts is not None:
-                        next_pts, status, _err = cv2.calcOpticalFlowPyrLK(
-                            flow_prev_gray,
-                            flow_gray,
-                            flow_prev_pts,
-                            None,
-                        )
-                        if next_pts is not None and status is not None:
-                            good_old = flow_prev_pts[status.flatten() == 1]
-                            good_new = next_pts[status.flatten() == 1]
+                        if need_reseed:
+                            flow_prev_pts = cv2.goodFeaturesToTrack(
+                                flow_prev_gray if flow_prev_gray is not None else flow_gray,
+                                maxCorners=220,
+                                qualityLevel=0.02,
+                                minDistance=7,
+                                mask=flow_roi_mask,
+                            )
+                            flow_reseed_counter = 0
 
-                            flow_mags = []
+                        if flow_prev_gray is not None and flow_prev_pts is not None:
+                            next_pts, status, _err = cv2.calcOpticalFlowPyrLK(
+                                flow_prev_gray,
+                                flow_gray,
+                                flow_prev_pts,
+                                None,
+                            )
+                            if next_pts is not None and status is not None:
+                                good_old = flow_prev_pts[status.flatten() == 1]
+                                good_new = next_pts[status.flatten() == 1]
 
-                            for old_pt, new_pt in zip(good_old, good_new):
-                                ox, oy = old_pt.ravel()
-                                nx, ny = new_pt.ravel()
-                                dx = float(nx - ox)
-                                dy = float(ny - oy)
-                                mag = float(np.hypot(dx, dy))
-                                flow_mags.append(mag)
+                                flow_mags = []
 
-                                if view_type == "optical_flow_2d":
+                                for old_pt, new_pt in zip(good_old, good_new):
+                                    ox, oy = old_pt.ravel()
+                                    nx, ny = new_pt.ravel()
+                                    dx = float(nx - ox)
+                                    dy = float(ny - oy)
+                                    mag = float(np.hypot(dx, dy))
+                                    flow_mags.append(mag)
+
                                     cv2.arrowedLine(
                                         display_bgr,
                                         (int(ox), int(oy)),
@@ -3128,16 +3585,15 @@ class AllInOneTesterGUI:
                                     )
                                     cv2.circle(display_bgr, (int(nx), int(ny)), 2, (0, 220, 0), -1)
 
-                            if flow_mags:
-                                scale = float(params.get("distance_scale", 1.0))
-                                unit = str(params.get("distance_unit", "px"))
-                                flow_distance_mean = float(np.mean(flow_mags)) * scale
-                                flow_distance_max = float(np.max(flow_mags)) * scale
-                                distance_text = (
-                                    f"Distance mean: {flow_distance_mean:.3f} {unit} | "
-                                    f"max: {flow_distance_max:.3f} {unit}"
-                                )
-                                if view_type == "optical_flow_2d":
+                                if flow_mags:
+                                    scale = float(params.get("distance_scale", 1.0))
+                                    unit = str(params.get("distance_unit", "px"))
+                                    flow_distance_mean = float(np.mean(flow_mags)) * scale
+                                    flow_distance_max = float(np.max(flow_mags)) * scale
+                                    distance_text = (
+                                        f"Distance mean: {flow_distance_mean:.3f} {unit} | "
+                                        f"max: {flow_distance_max:.3f} {unit}"
+                                    )
                                     cv2.putText(
                                         display_bgr,
                                         distance_text,
@@ -3147,156 +3603,68 @@ class AllInOneTesterGUI:
                                         (255, 245, 80),
                                         2,
                                     )
-                            else:
-                                distance_text = "Distance mean: - | max: -"
+                                else:
+                                    distance_text = "Distance mean: - | max: -"
 
-                            flow_prev_pts = good_new.reshape(-1, 1, 2).astype(np.float32) if len(good_new) > 0 else None
-                        else:
-                            flow_prev_pts = None
-
-                    if view_type == "optical_flow_3d" and flow_prev_gray is not None:
-                        flow_3d_refresh_counter += 1
-                        refresh_3d = flow_3d_display_cache is None or flow_3d_refresh_counter >= 3
-
-                        if refresh_3d:
-                            flow_3d_refresh_counter = 0
-
-                            dense_prev_gray = flow_prev_gray
-                            dense_gray = flow_gray
-                            dense_roi_mask = flow_roi_mask
-
-                            if dense_gray.shape[0] >= 360 or dense_gray.shape[1] >= 640:
-                                dense_prev_gray = cv2.resize(
-                                    flow_prev_gray,
-                                    None,
-                                    fx=0.5,
-                                    fy=0.5,
-                                    interpolation=cv2.INTER_AREA,
+                                flow_prev_pts = (
+                                    good_new.reshape(-1, 1, 2).astype(np.float32)
+                                    if len(good_new) > 0
+                                    else None
                                 )
-                                dense_gray = cv2.resize(
-                                    flow_gray,
-                                    None,
-                                    fx=0.5,
-                                    fy=0.5,
-                                    interpolation=cv2.INTER_AREA,
-                                )
-                                if flow_roi_mask is not None:
-                                    dense_roi_mask = cv2.resize(
-                                        flow_roi_mask,
-                                        (dense_gray.shape[1], dense_gray.shape[0]),
-                                        interpolation=cv2.INTER_NEAREST,
-                                    )
-
-                            dense_roi_scale = float(params.get("roi_3d_scale", 1.0))
-                            dense_h, dense_w = dense_gray.shape[:2]
-                            dense_cx = dense_w // 2
-                            dense_cy = dense_h // 2
-                            dense_rx = max(8, int((dense_w * dense_roi_scale) * 0.5))
-                            dense_ry = max(8, int((dense_h * dense_roi_scale) * 0.5))
-                            dense_x0 = max(0, dense_cx - dense_rx)
-                            dense_x1 = min(dense_w, dense_cx + dense_rx)
-                            dense_y0 = max(0, dense_cy - dense_ry)
-                            dense_y1 = min(dense_h, dense_cy + dense_ry)
-
-                            dense_prev_gray = dense_prev_gray[dense_y0:dense_y1, dense_x0:dense_x1]
-                            dense_gray = dense_gray[dense_y0:dense_y1, dense_x0:dense_x1]
-                            if dense_roi_mask is not None:
-                                dense_roi_mask = dense_roi_mask[dense_y0:dense_y1, dense_x0:dense_x1]
-
-                            dense_flow = cv2.calcOpticalFlowFarneback(
-                                dense_prev_gray,
-                                dense_gray,
-                                None,
-                                0.5,
-                                2,
-                                15,
-                                2,
-                                5,
-                                1.1,
-                                cv2.OPTFLOW_FARNEBACK_GAUSSIAN,
-                            )
-
-                            dense_dx = dense_flow[..., 0].astype(np.float32)
-                            dense_dy = dense_flow[..., 1].astype(np.float32)
-                            valid_mask = np.ones(dense_gray.shape, dtype=bool)
-
-                            if dense_roi_mask is not None:
-                                roi_valid = dense_roi_mask > 0
-                                valid_mask &= roi_valid
-                                dense_dx = np.where(roi_valid, dense_dx, 0.0)
-                                dense_dy = np.where(roi_valid, dense_dy, 0.0)
-
-                            # Suppress low-texture regions where dense optical flow is unstable.
-                            gx = cv2.Sobel(dense_gray, cv2.CV_32F, 1, 0, ksize=3)
-                            gy = cv2.Sobel(dense_gray, cv2.CV_32F, 0, 1, ksize=3)
-                            grad_mag = cv2.magnitude(gx, gy)
-                            grad_pool = grad_mag[valid_mask] if np.any(valid_mask) else grad_mag.reshape(-1)
-                            grad_thresh = float(np.percentile(grad_pool, 45.0)) if grad_pool.size > 0 else 0.0
-                            texture_mask = grad_mag >= grad_thresh
-                            valid_mask &= texture_mask
-
-                            if np.any(valid_mask):
-                                # Remove global camera jitter so remaining magnitude better reflects deformation.
-                                global_dx = float(np.median(dense_dx[valid_mask]))
-                                global_dy = float(np.median(dense_dy[valid_mask]))
-                                dense_dx = dense_dx - global_dx
-                                dense_dy = dense_dy - global_dy
-
-                            dense_mag = cv2.magnitude(dense_dx, dense_dy)
-                            dense_mag = np.where(valid_mask, dense_mag, 0.0)
-
-                            valid_mag = dense_mag[valid_mask] if np.any(valid_mask) else dense_mag.reshape(-1)
-                            if valid_mag.size > 0:
-                                clip_hi = float(np.percentile(valid_mag, 98.0))
-                                if clip_hi > 0:
-                                    dense_mag = np.clip(dense_mag, 0.0, clip_hi)
-
-                            dense_mag = cv2.GaussianBlur(dense_mag, (0, 0), sigmaX=1.4, sigmaY=1.4)
-
-                            if flow_mag_ema is None or flow_mag_ema.shape != dense_mag.shape:
-                                flow_mag_ema = dense_mag
                             else:
-                                flow_mag_ema = cv2.addWeighted(flow_mag_ema, 0.80, dense_mag, 0.20, 0.0)
+                                flow_prev_pts = None
+                    else:
+                        surface_refresh_counter += 1
+                        refresh_surface = surface_display_cache is None or surface_refresh_counter >= 2
 
-                            display_bgr = self._build_flow_3d_plot(
-                                dense_gray,
-                                flow_mag_ema,
+                        if refresh_surface:
+                            surface_refresh_counter = 0
+
+                            height_map, ellipse_mask, scale = self._build_surface_height_map(
+                                centroids,
+                                reference_centroids,
+                                displacements,
+                                frame_bgr.shape,
+                                params,
                                 cv2,
-                                roi_mask=dense_roi_mask,
-                                camera_gray_frame=flow_gray,
                             )
 
-                            scale = float(params.get("distance_scale", 1.0))
-                            unit = str(params.get("distance_unit", "px"))
-                            ema_valid_mag = flow_mag_ema[valid_mask] if np.any(valid_mask) else flow_mag_ema.reshape(-1)
-                            if ema_valid_mag.size > 0:
-                                flow_distance_mean = float(np.mean(ema_valid_mag)) * scale
-                                flow_distance_max = float(np.max(ema_valid_mag)) * scale
+                            if height_map is not None:
+                                self._set_var(self.surface_status_var, "Surface running.")
+                                display_bgr = self._build_flow_3d_plot(
+                                    flow_gray,
+                                    height_map,
+                                    cv2,
+                                    roi_mask=ellipse_mask,
+                                    camera_gray_frame=flow_gray,
+                                )
+
+                                flow_distance_mean = mean_disp
+                                flow_distance_max = max_disp
+                                distance_text = (
+                                    f"Disp mean: {mean_disp:.3f} px | "
+                                    f"scale: {scale:.3f}"
+                                )
+                                cv2.putText(
+                                    display_bgr,
+                                    distance_text,
+                                    (12, 50),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.60,
+                                    (250, 245, 85),
+                                    2,
+                                )
+                                surface_display_cache = display_bgr
+                                surface_distance_text_cache = distance_text
+                                surface_mean_cache = flow_distance_mean
+                                surface_max_cache = flow_distance_max
                             else:
-                                flow_distance_mean = 0.0
-                                flow_distance_max = 0.0
-                            distance_text = (
-                                f"Distance mean: {flow_distance_mean:.3f} {unit} | "
-                                f"max: {flow_distance_max:.3f} {unit}"
-                            )
-                            cv2.putText(
-                                display_bgr,
-                                distance_text,
-                                (12, 50),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.60,
-                                (250, 245, 85),
-                                2,
-                            )
-                            flow_3d_display_cache = display_bgr
-                            flow_3d_distance_text_cache = distance_text
-                            flow_3d_mean_cache = flow_distance_mean
-                            flow_3d_max_cache = flow_distance_max
+                                self._set_var(self.surface_status_var, "Surface waiting for dots.")
 
-                        display_bgr = flow_3d_display_cache
-                        distance_text = flow_3d_distance_text_cache
-                        flow_distance_mean = flow_3d_mean_cache
-                        flow_distance_max = flow_3d_max_cache
+                        display_bgr = surface_display_cache
+                        distance_text = surface_distance_text_cache
+                        flow_distance_mean = surface_mean_cache
+                        flow_distance_max = surface_max_cache
                         if display_bgr is None:
                             display_bgr = cv2.cvtColor(flow_gray, cv2.COLOR_GRAY2BGR)
 
