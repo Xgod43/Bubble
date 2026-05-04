@@ -1453,12 +1453,126 @@ class AllInOneTesterGUI:
         }
 
     @staticmethod
-    def _build_flow_3d_plot(gray_frame, height_map, cv2, roi_mask=None, camera_gray_frame=None):
+    def _draw_surface_history_graph(width, height, history, cv2):
+        graph = np.zeros((height, width, 3), dtype=np.uint8)
+        graph[:, :, :] = (11, 22, 32)
+        if height <= 8 or width <= 8:
+            return graph
+
+        margin_l = 46
+        margin_r = 12
+        margin_t = 18
+        margin_b = 18
+        plot_w = max(1, width - margin_l - margin_r)
+        plot_h = max(1, height - margin_t - margin_b)
+        left = margin_l
+        right = width - margin_r
+        top = margin_t
+        bottom = height - margin_b
+
+        safe_history = list(history or [])
+        peak_values = np.array(
+            [np.nan if item[0] is None else float(item[0]) for item in safe_history],
+            dtype=np.float32,
+        )
+        top_values = np.array(
+            [np.nan if item[1] is None else float(item[1]) for item in safe_history],
+            dtype=np.float32,
+        )
+
+        combined = np.concatenate([peak_values, top_values]) if safe_history else np.array([], dtype=np.float32)
+        valid = combined[np.isfinite(combined)]
+        y_max = 1.0
+        if valid.size > 0:
+            y_max = max(1.0, float(np.max(valid)) * 1.15)
+
+        for idx in range(4):
+            y = int(round(top + (idx * plot_h / 3.0)))
+            value = y_max * (1.0 - (idx / 3.0))
+            cv2.line(graph, (left, y), (right, y), (36, 54, 68), 1)
+            cv2.putText(
+                graph,
+                f"{value:.1f}",
+                (6, min(height - 4, y + 4)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.34,
+                (150, 178, 196),
+                1,
+                cv2.LINE_AA,
+            )
+
+        cv2.rectangle(graph, (left, top), (right, bottom), (55, 82, 100), 1)
+
+        def draw_series(values, color):
+            if values.size < 2:
+                return
+            prev_pt = None
+            denom = max(1, values.size - 1)
+            for idx, value in enumerate(values):
+                if not np.isfinite(value):
+                    prev_pt = None
+                    continue
+                x = int(round(left + (idx / denom) * plot_w))
+                y = int(round(bottom - (np.clip(float(value), 0.0, y_max) / y_max) * plot_h))
+                point = (int(np.clip(x, left, right)), int(np.clip(y, top, bottom)))
+                if prev_pt is not None:
+                    cv2.line(graph, prev_pt, point, color, 2, cv2.LINE_AA)
+                prev_pt = point
+
+        draw_series(peak_values, (80, 205, 255))
+        draw_series(top_values, (255, 210, 80))
+
+        cv2.putText(
+            graph,
+            "deformation history (mm)",
+            (left, 13),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.40,
+            (130, 238, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            graph,
+            "peak",
+            (max(left + 170, width - 132), 13),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.34,
+            (80, 205, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            graph,
+            "top mean",
+            (max(left + 214, width - 82), 13),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.34,
+            (255, 210, 80),
+            1,
+            cv2.LINE_AA,
+        )
+        return graph
+
+    @staticmethod
+    def _build_flow_3d_plot(
+        gray_frame,
+        height_map,
+        cv2,
+        roi_mask=None,
+        camera_gray_frame=None,
+        surface_history=None,
+    ):
         camera_source = camera_gray_frame if camera_gray_frame is not None else gray_frame
         out_h, out_w = camera_source.shape[:2]
-        camera_h = max(96, int(out_h * 0.58))
-        camera_h = min(camera_h, max(1, out_h - 72)) if out_h > 168 else max(1, int(out_h * 0.58))
-        plot_h = max(1, out_h - camera_h)
+        show_graph = surface_history is not None
+        graph_h = max(72, min(128, int(out_h * 0.18))) if show_graph and out_h > 220 else 0
+        camera_h = max(96, int(out_h * (0.42 if show_graph else 0.58)))
+        min_plot_h = max(72, int(out_h * (0.26 if show_graph else 0.18)))
+        if camera_h + graph_h + min_plot_h > out_h:
+            camera_h = max(1, out_h - graph_h - min_plot_h)
+        camera_h = min(camera_h, max(1, out_h - graph_h - 1))
+        plot_h = max(1, out_h - camera_h - graph_h)
 
         if len(camera_source.shape) == 2:
             camera_canvas = cv2.cvtColor(camera_source, cv2.COLOR_GRAY2BGR)
@@ -1473,9 +1587,16 @@ class AllInOneTesterGUI:
         plot_canvas = np.zeros((plot_h, out_w, 3), dtype=np.uint8)
         plot_canvas[:, :, :] = (9, 22, 32)
         cv2.line(output, (0, camera_h - 1), (out_w - 1, camera_h - 1), (45, 73, 96), 1)
+        graph_canvas = (
+            AllInOneTesterGUI._draw_surface_history_graph(out_w, graph_h, surface_history, cv2)
+            if graph_h > 0
+            else None
+        )
 
         if height_map is None or height_map.size == 0:
-            output[camera_h:, :, :] = plot_canvas
+            output[camera_h:camera_h + plot_h, :, :] = plot_canvas
+            if graph_canvas is not None:
+                output[camera_h + plot_h:, :, :] = graph_canvas
             return output
 
         height_work = height_map.astype(np.float32)
@@ -1584,7 +1705,10 @@ class AllInOneTesterGUI:
             (255, 230, 80),
             1,
         )
-        output[camera_h:, :, :] = plot_canvas
+        output[camera_h:camera_h + plot_h, :, :] = plot_canvas
+        if graph_canvas is not None:
+            cv2.line(output, (0, camera_h + plot_h - 1), (out_w - 1, camera_h + plot_h - 1), (45, 73, 96), 1)
+            output[camera_h + plot_h:, :, :] = graph_canvas
         return output
 
     def _build_optical_flow_tab(self, notebook):
@@ -3700,6 +3824,7 @@ class AllInOneTesterGUI:
         surface_distance_text_cache = ""
         surface_mean_cache = None
         surface_max_cache = None
+        surface_graph_history = []
 
         try:
             pipe = self.blob_module
@@ -3800,6 +3925,7 @@ class AllInOneTesterGUI:
                     self.surface_height_ema = None
                     self.surface_reference_height_map = None
                     self.surface_contact_ema = None
+                    surface_graph_history.clear()
                     self._set_var(self.surface_status_var, "Baseline auto-set.")
 
                 if reference_centroids is None:
@@ -3814,6 +3940,7 @@ class AllInOneTesterGUI:
                     self.surface_height_ema = None
                     self.surface_reference_height_map = None
                     self.surface_contact_ema = None
+                    surface_graph_history.clear()
                     self._set_var(self.surface_status_var, "Baseline reset.")
                     self.log("Dot pipeline reference reset to current centroids.")
 
@@ -3996,6 +4123,17 @@ class AllInOneTesterGUI:
                                     ellipse_mask,
                                     cv2,
                                 )
+                                if contact_stats is not None and contact_stats["ready"]:
+                                    surface_graph_history.append(
+                                        (
+                                            float(contact_stats["peak"]),
+                                            float(contact_stats["top_mean"]),
+                                        )
+                                    )
+                                else:
+                                    surface_graph_history.append((None, None))
+                                if len(surface_graph_history) > 180:
+                                    del surface_graph_history[:-180]
                                 self._set_var(self.surface_status_var, "Surface running.")
                                 display_bgr = self._build_flow_3d_plot(
                                     flow_gray,
@@ -4003,6 +4141,7 @@ class AllInOneTesterGUI:
                                     cv2,
                                     roi_mask=ellipse_mask,
                                     camera_gray_frame=flow_gray,
+                                    surface_history=surface_graph_history,
                                 )
 
                                 flow_distance_mean = mean_disp
