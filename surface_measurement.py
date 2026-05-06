@@ -99,9 +99,40 @@ def measure_contact_deformation_mm(
 
     baseline = np.clip(reference_height_map.astype(np.float32), 0.0, 1.0)
     signed_delta_mm = (baseline - height_norm) * geometry.bubble_max_height_mm
-    valid_signed_delta = signed_delta_mm[valid_mask]
-    global_offset_mm = float(np.median(valid_signed_delta)) if valid_signed_delta.size else 0.0
-    raw_delta_mm = np.maximum(signed_delta_mm - global_offset_mm, 0.0)
+    ys, xs = np.nonzero(valid_mask)
+    if xs.size >= 12:
+        sample_step = max(1, xs.size // 5000)
+        sample_x = xs[::sample_step].astype(np.float32)
+        sample_y = ys[::sample_step].astype(np.float32)
+        sample_z = signed_delta_mm[ys[::sample_step], xs[::sample_step]].astype(np.float32)
+        x_center = float(np.mean(sample_x))
+        y_center = float(np.mean(sample_y))
+        xy_scale = float(max(height_norm.shape[0], height_norm.shape[1], 1))
+        design = np.column_stack(
+            [
+                np.ones_like(sample_z, dtype=np.float32),
+                (sample_x - x_center) / xy_scale,
+                (sample_y - y_center) / xy_scale,
+            ]
+        )
+        try:
+            coeffs, *_ = np.linalg.lstsq(design, sample_z, rcond=None)
+            grid_y, grid_x = np.indices(height_norm.shape, dtype=np.float32)
+            global_trend_mm = (
+                coeffs[0]
+                + coeffs[1] * ((grid_x - x_center) / xy_scale)
+                + coeffs[2] * ((grid_y - y_center) / xy_scale)
+            )
+            local_delta_mm = signed_delta_mm - global_trend_mm
+        except np.linalg.LinAlgError:
+            valid_signed_delta = signed_delta_mm[valid_mask]
+            global_offset_mm = float(np.median(valid_signed_delta)) if valid_signed_delta.size else 0.0
+            local_delta_mm = signed_delta_mm - global_offset_mm
+    else:
+        valid_signed_delta = signed_delta_mm[valid_mask]
+        global_offset_mm = float(np.median(valid_signed_delta)) if valid_signed_delta.size else 0.0
+        local_delta_mm = signed_delta_mm - global_offset_mm
+    raw_delta_mm = np.maximum(local_delta_mm, 0.0)
     valid_delta = raw_delta_mm[valid_mask]
     median_delta = float(np.median(valid_delta))
     mad_delta = float(np.median(np.abs(valid_delta - median_delta)))

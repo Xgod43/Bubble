@@ -90,6 +90,7 @@ SURFACE_CONTACT_DEADBAND_MM = 0.35
 SURFACE_CONTACT_NOISE_CAP_MM = 0.95
 SURFACE_BASELINE_ALPHA = 0.025
 SURFACE_CONTACT_HOLD_MM = 0.75
+CONTACT_ZERO_SAMPLE_COUNT = 8
 
 
 class LinuxMPRLSSensor:
@@ -4070,6 +4071,7 @@ class AllInOneTesterGUI:
         surface_graph_history = []
         contact_zero_pending = False
         contact_zero_ready = False
+        contact_zero_samples = []
 
         try:
             pipe = self.blob_module
@@ -4108,6 +4110,7 @@ class AllInOneTesterGUI:
             self._refresh_system_status()
             contact_zero_pending = False
             contact_zero_ready = False
+            contact_zero_samples = []
 
             while not self.blob_stop_event.is_set():
                 loop_start = time.perf_counter()
@@ -4185,6 +4188,7 @@ class AllInOneTesterGUI:
                     self.surface_zero_ready = False
                     contact_zero_pending = False
                     contact_zero_ready = False
+                    contact_zero_samples.clear()
                     surface_display_cache = None
                     surface_distance_text_cache = ""
                     surface_mean_cache = None
@@ -4207,6 +4211,7 @@ class AllInOneTesterGUI:
                     self.surface_zero_ready = False
                     contact_zero_pending = False
                     contact_zero_ready = False
+                    contact_zero_samples.clear()
                     surface_display_cache = None
                     surface_distance_text_cache = ""
                     surface_mean_cache = None
@@ -4223,6 +4228,7 @@ class AllInOneTesterGUI:
                         self.surface_zero_ready = False
                         contact_zero_pending = True
                         contact_zero_ready = False
+                        contact_zero_samples.clear()
                         surface_display_cache = None
                         surface_distance_text_cache = ""
                         surface_mean_cache = None
@@ -4410,11 +4416,18 @@ class AllInOneTesterGUI:
 
                             if height_map is not None:
                                 if contact_zero_active:
-                                    self.surface_reference_height_map = height_map.astype(np.float32).copy()
-                                    self.surface_contact_ema = np.zeros_like(height_map, dtype=np.float32)
-                                    contact_zero_pending = False
-                                    contact_zero_ready = True
-                                    self.surface_zero_ready = True
+                                    contact_zero_samples.append(height_map.astype(np.float32).copy())
+                                    if len(contact_zero_samples) >= CONTACT_ZERO_SAMPLE_COUNT:
+                                        self.surface_reference_height_map = np.median(
+                                            np.stack(contact_zero_samples[-CONTACT_ZERO_SAMPLE_COUNT:], axis=0),
+                                            axis=0,
+                                        ).astype(np.float32)
+                                        self.surface_contact_ema = np.zeros_like(height_map, dtype=np.float32)
+                                        contact_zero_samples.clear()
+                                        contact_zero_pending = False
+                                        contact_zero_ready = True
+                                        self.surface_zero_ready = True
+                                        self.log("Contact deform zero captured from averaged surface frames.")
                                     contact_stats = {
                                         "ready": True,
                                         "mean": 0.0,
@@ -4445,7 +4458,14 @@ class AllInOneTesterGUI:
                                 self._set_var(
                                     self.surface_status_var,
                                     (
-                                        "Contact deform zeroing..."
+                                        (
+                                            (
+                                                f"Contact deform zeroing {len(contact_zero_samples)}/"
+                                                f"{CONTACT_ZERO_SAMPLE_COUNT}..."
+                                            )
+                                            if contact_zero_pending
+                                            else "Contact deform zero set."
+                                        )
                                         if contact_zero_active
                                         else (
                                             "Surface running."
