@@ -72,11 +72,12 @@ cd ..
 
 1. Open GUI only.
 2. Start camera/detection with backend `picamera2`.
-3. Test limit switches on GPIO17 and GPIO27.
-4. Test stepper with motor power disabled first, then enabled.
-5. Test pressure sensor after confirming I2C with `i2cdetect -y 1`.
-6. Test load cell on GPIO5/GPIO6 after confirming HX711 wiring.
-7. With pressure and load-cell readings both running, open Force Calibration, capture at least two stable pressure/load pairs at different loads, then fit the calibration. The model is `F = aP + b`, where `F` is force in newtons and `P` is pressure in hPa. The fitted model is saved to `force_calibration.json` and loaded on the next launch.
+3. For repeatable surface/deformation measurements, choose preset `measurement`, start detection, wait for the image to settle, then press Reset Ref before applying load. This preset locks Pi Cam 3 focus/exposure/gain/AWB controls instead of letting autofocus and auto exposure drift during the run.
+4. Test limit switches on GPIO17 and GPIO27.
+5. Test stepper with motor power disabled first, then enabled.
+6. Test pressure sensor after confirming I2C with `i2cdetect -y 1`.
+7. Test load cell on GPIO5/GPIO6 after confirming HX711 wiring.
+8. With pressure and load-cell readings both running, open Force Calibration, capture at least two stable pressure/load pairs at different loads, then fit the calibration. The model is `F = aP + b`, where `F` is force in newtons and `P` is pressure in hPa. The fitted model is saved to `force_calibration.json` and loaded on the next launch.
 
 ## Current Known Risks
 

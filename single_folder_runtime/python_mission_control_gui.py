@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 import tkinter as tk
 from tkinter import ttk
@@ -8,6 +9,7 @@ from all_in_one_gui import (
     AllInOneTesterGUI,
     COLOR_ACCENT,
     COLOR_ACCENT_SOFT,
+    FORCE_GRAVITY_MPS2,
     COLOR_OK,
     COLOR_WARN,
     LIMIT_1_PIN,
@@ -23,6 +25,8 @@ COLOR_BORDER_DARK = "#22384d"
 COLOR_TEXT_BRIGHT = "#eef5fb"
 COLOR_TEXT_MUTED = "#93a9bc"
 COLOR_DANGER = "#c25b5b"
+FORCE_GRAPH_HISTORY_SECONDS = 120.0
+FORCE_GRAPH_MAX_POINTS = 600
 
 
 class MissionControlGUI(AllInOneTesterGUI):
@@ -36,6 +40,7 @@ class MissionControlGUI(AllInOneTesterGUI):
         self.root.geometry(f"{initial_w}x{initial_h}")
         self.root.minsize(940, 620)
         self.log("Mission control console loaded.")
+        self.log("Force tab layout active; bubble calibration force estimate enabled.")
 
     def _configure_styles(self):
         style = ttk.Style(self.root)
@@ -318,7 +323,7 @@ class MissionControlGUI(AllInOneTesterGUI):
         body.add(left, weight=4)
         body.add(right, weight=1)
 
-        self._build_detection_workspace(left)
+        self._build_primary_workspace(left)
         self._build_sidebar(right)
 
     def _apply_initial_split_positions(self):
@@ -337,6 +342,280 @@ class MissionControlGUI(AllInOneTesterGUI):
             self._layout_sashes_initialized = True
         except tk.TclError:
             self.root.after(120, self._apply_initial_split_positions)
+
+    def _build_primary_workspace(self, parent):
+        notebook = ttk.Notebook(parent)
+        notebook.grid(row=0, column=0, sticky="nsew")
+
+        live_tab = ttk.Frame(notebook, style="App.TFrame")
+        live_tab.columnconfigure(0, weight=1)
+        live_tab.rowconfigure(0, weight=1)
+
+        force_tab = ttk.Frame(notebook, style="App.TFrame", padding=8)
+        force_tab.columnconfigure(0, weight=1)
+        force_tab.rowconfigure(1, weight=1)
+
+        notebook.add(live_tab, text="Live Detection")
+        notebook.add(force_tab, text="Force")
+
+        self._build_detection_workspace(live_tab)
+        self._build_force_workspace(force_tab)
+
+    def _build_force_workspace(self, parent):
+        ttk.Label(
+            parent,
+            text="Pressure-derived force, load-cell comparison, and live error tracking.",
+            style="SectionHint.TLabel",
+        ).grid(row=0, column=0, sticky="w", pady=(0, 6))
+
+        pane = ttk.Panedwindow(parent, orient="horizontal", style="Split.TPanedwindow")
+        pane.grid(row=1, column=0, sticky="nsew")
+
+        graph_area = ttk.Frame(pane, style="App.TFrame", padding=(0, 0, 8, 0))
+        graph_area.columnconfigure(0, weight=1)
+        graph_area.rowconfigure(0, weight=1)
+        graph_area.rowconfigure(1, weight=1)
+
+        side_shell, side_content = self._build_scrollable_tab(pane, padding=8)
+
+        pane.add(graph_area, weight=4)
+        pane.add(side_shell, weight=2)
+
+        compare = ttk.LabelFrame(graph_area, text="Force comparison", padding=8)
+        compare.grid(row=0, column=0, sticky="nsew", pady=(0, 6))
+        compare.columnconfigure(0, weight=1)
+        compare.rowconfigure(0, weight=1)
+        self.force_compare_canvas = tk.Canvas(
+            compare,
+            height=240,
+            background="#0a131b",
+            highlightthickness=1,
+            highlightbackground=COLOR_BORDER_DARK,
+        )
+        self.force_compare_canvas.grid(row=0, column=0, sticky="nsew")
+        self.force_compare_canvas.bind("<Configure>", lambda _event: self._draw_force_graphs())
+
+        error = ttk.LabelFrame(graph_area, text="Force error", padding=8)
+        error.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
+        error.columnconfigure(0, weight=1)
+        error.rowconfigure(0, weight=1)
+        self.force_error_canvas = tk.Canvas(
+            error,
+            height=220,
+            background="#0a131b",
+            highlightthickness=1,
+            highlightbackground=COLOR_BORDER_DARK,
+        )
+        self.force_error_canvas.grid(row=0, column=0, sticky="nsew")
+        self.force_error_canvas.bind("<Configure>", lambda _event: self._draw_force_graphs())
+
+        self._build_force_measurement_tab(side_content)
+        self.root.after(120, self._draw_force_graphs)
+
+    def _record_pressure_reading(self, pressure_hpa):
+        pressure = float(pressure_hpa)
+        zero_captured = False
+        with self.sensor_data_lock:
+            self.latest_pressure_hpa = pressure
+            if self.force_pressure_zero_hpa is None:
+                self.force_pressure_zero_hpa = pressure
+                zero_captured = True
+        if zero_captured:
+            self._refresh_force_pressure_zero()
+            self._set_var(
+                self.force_calibration_status_var,
+                "Pressure zero captured. Press bubble into load cell.",
+            )
+            self.log(f"Force pressure zero auto-captured at {pressure:.2f} hPa.")
+        self._refresh_force_live_pair()
+        self._update_force_estimate()
+        self._append_force_graph_sample()
+
+    def _record_loadcell_reading(self, weight_kg):
+        with self.sensor_data_lock:
+            self.latest_loadcell_kg = float(weight_kg)
+            self.latest_loadcell_force_n = float(weight_kg) * FORCE_GRAVITY_MPS2
+        self._refresh_force_live_pair()
+        self._update_force_estimate()
+        self._append_force_graph_sample()
+
+    def _update_force_estimate(self):
+        if not hasattr(self, "force_estimate_var"):
+            return
+        with self.sensor_data_lock:
+            pressure = self.latest_pressure_hpa
+            zero = self.force_pressure_zero_hpa
+            coeffs = self.force_calibration_coeffs
+
+        pressure_delta = self._pressure_delta_from_zero(pressure, zero)
+
+        if pressure_delta is None or coeffs is None:
+            with self.sensor_data_lock:
+                self.latest_pressure_force_n = None
+            self._set_var(self.force_estimate_var, "-")
+            return
+
+        slope, intercept = coeffs
+        estimated_force = (slope * pressure_delta) + intercept
+        with self.sensor_data_lock:
+            self.latest_pressure_force_n = float(estimated_force)
+        estimated_load_kg = float(estimated_force) / FORCE_GRAVITY_MPS2
+        self._set_var(self.force_estimate_var, f"{estimated_load_kg:.4f} kg")
+
+    def _append_force_graph_sample(self):
+        now = time.monotonic()
+        with self.sensor_data_lock:
+            if not hasattr(self, "force_graph_history"):
+                self.force_graph_history = []
+            load_force = getattr(self, "latest_loadcell_force_n", None)
+            pressure_force = getattr(self, "latest_pressure_force_n", None)
+            pressure_hpa = self.latest_pressure_hpa
+            if load_force is None and pressure_force is None and pressure_hpa is None:
+                return
+            self.force_graph_history.append((now, load_force, pressure_force, pressure_hpa))
+            cutoff = now - FORCE_GRAPH_HISTORY_SECONDS
+            self.force_graph_history = [
+                point for point in self.force_graph_history if point[0] >= cutoff
+            ]
+            if len(self.force_graph_history) > FORCE_GRAPH_MAX_POINTS:
+                del self.force_graph_history[:-FORCE_GRAPH_MAX_POINTS]
+        self._request_force_graph_redraw()
+
+    def _request_force_graph_redraw(self):
+        if not self.root.winfo_exists():
+            return
+        if not hasattr(self, "force_compare_canvas") or not hasattr(self, "force_error_canvas"):
+            return
+        if getattr(self, "force_graph_redraw_pending", False):
+            return
+        self.force_graph_redraw_pending = True
+
+        def redraw():
+            self.force_graph_redraw_pending = False
+            self._draw_force_graphs()
+
+        self.root.after(80, redraw)
+
+    @staticmethod
+    def _finite_number(value):
+        return isinstance(value, (int, float)) and math.isfinite(float(value))
+
+    @staticmethod
+    def _graph_bounds(values):
+        finite_values = [float(value) for value in values if MissionControlGUI._finite_number(value)]
+        if not finite_values:
+            return -1.0, 1.0
+        low = min(0.0, min(finite_values))
+        high = max(0.0, max(finite_values))
+        pad = max(0.5, (high - low) * 0.12)
+        return low - pad, high + pad
+
+    def _draw_force_graphs(self):
+        if not hasattr(self, "force_compare_canvas") or not hasattr(self, "force_error_canvas"):
+            return
+        self._draw_force_compare_graph(self.force_compare_canvas)
+        self._draw_force_error_graph(self.force_error_canvas)
+
+    def _prepare_force_graph(self, canvas, title, y_label):
+        width = max(1, int(canvas.winfo_width()))
+        height = max(1, int(canvas.winfo_height()))
+        canvas.delete("all")
+        canvas.create_rectangle(0, 0, width, height, fill="#0a131b", outline="")
+        left, top = 48, 28
+        right, bottom = max(68, width - 12), max(48, height - 28)
+        canvas.create_text(10, 8, text=title, anchor="nw", fill=COLOR_TEXT_BRIGHT, font=("Segoe UI", 9, "bold"))
+        canvas.create_text(8, (top + bottom) / 2, text=y_label, anchor="w", fill=COLOR_TEXT_MUTED, font=("Segoe UI", 8))
+        canvas.create_text((left + right) / 2, height - 5, text=f"last {int(FORCE_GRAPH_HISTORY_SECONDS)} s", anchor="s", fill=COLOR_TEXT_MUTED, font=("Segoe UI", 8))
+        canvas.create_rectangle(left, top, right, bottom, outline=COLOR_BORDER_DARK)
+        return left, top, right, bottom
+
+    def _draw_empty_force_graph(self, canvas, title, message):
+        left, top, right, bottom = self._prepare_force_graph(canvas, title, "")
+        canvas.create_text((left + right) / 2, (top + bottom) / 2, text=message, fill=COLOR_TEXT_MUTED, font=("Segoe UI", 9))
+
+    def _draw_force_compare_graph(self, canvas):
+        with self.sensor_data_lock:
+            history = list(getattr(self, "force_graph_history", []))
+        if not history:
+            self._draw_empty_force_graph(canvas, "Load comparison", "Waiting for load cell / pressure data")
+            return
+        left, top, right, bottom = self._prepare_force_graph(canvas, "Load comparison", "kg")
+        now = max(point[0] for point in history)
+        x_min = now - FORCE_GRAPH_HISTORY_SECONDS
+        values = []
+        for _ts, load_force, pressure_force, _pressure in history:
+            if self._finite_number(load_force):
+                values.append(float(load_force) / FORCE_GRAVITY_MPS2)
+            if self._finite_number(pressure_force):
+                values.append(float(pressure_force) / FORCE_GRAVITY_MPS2)
+        if not values:
+            canvas.create_text((left + right) / 2, (top + bottom) / 2, text="Waiting for force calibration", fill=COLOR_TEXT_MUTED, font=("Segoe UI", 9))
+            return
+        y_min, y_max = self._graph_bounds(values)
+
+        def x_for(timestamp):
+            return left + ((float(timestamp) - x_min) / FORCE_GRAPH_HISTORY_SECONDS) * (right - left)
+
+        def y_for(value):
+            return bottom - ((float(value) - y_min) / max(1e-9, y_max - y_min)) * (bottom - top)
+
+        for idx in range(4):
+            y = top + (idx / 3.0) * (bottom - top)
+            canvas.create_line(left, y, right, y, fill="#1d3347")
+        for idx in range(3):
+            x = left + (idx / 2.0) * (right - left)
+            canvas.create_line(x, top, x, bottom, fill="#15283a")
+
+        def draw_series(value_index, color, dash=None):
+            coords = []
+            for point in history:
+                value = point[value_index]
+                if not self._finite_number(value):
+                    if len(coords) >= 4:
+                        canvas.create_line(*coords, fill=color, width=2, smooth=True, dash=dash)
+                    coords = []
+                    continue
+                value = float(value) / FORCE_GRAVITY_MPS2
+                coords.extend((x_for(point[0]), y_for(value)))
+            if len(coords) >= 4:
+                canvas.create_line(*coords, fill=color, width=2, smooth=True, dash=dash)
+
+        draw_series(1, COLOR_OK)
+        draw_series(2, COLOR_WARN, dash=(4, 2))
+        canvas.create_text(right - 8, top + 6, text="green load kg | orange pressure kg-eq", anchor="ne", fill=COLOR_TEXT_MUTED, font=("Segoe UI", 7))
+
+    def _draw_force_error_graph(self, canvas):
+        with self.sensor_data_lock:
+            history = list(getattr(self, "force_graph_history", []))
+        error_points = [
+            (ts, (float(pressure_force) - float(load_force)) / FORCE_GRAVITY_MPS2)
+            for ts, load_force, pressure_force, _pressure in history
+            if self._finite_number(load_force) and self._finite_number(pressure_force)
+        ]
+        if not error_points:
+            self._draw_empty_force_graph(canvas, "Force error", "Waiting for both force lines")
+            return
+        left, top, right, bottom = self._prepare_force_graph(canvas, "Load error (pressure kg-eq - load cell kg)", "kg")
+        now = max(point[0] for point in history)
+        x_min = now - FORCE_GRAPH_HISTORY_SECONDS
+        y_min, y_max = self._graph_bounds([point[1] for point in error_points])
+
+        def x_for(timestamp):
+            return left + ((float(timestamp) - x_min) / FORCE_GRAPH_HISTORY_SECONDS) * (right - left)
+
+        def y_for(value):
+            return bottom - ((float(value) - y_min) / max(1e-9, y_max - y_min)) * (bottom - top)
+
+        zero_y = y_for(0.0)
+        canvas.create_line(left, zero_y, right, zero_y, fill=COLOR_ACCENT, dash=(3, 2))
+        coords = []
+        latest_error = 0.0
+        for timestamp, error_n in error_points:
+            coords.extend((x_for(timestamp), y_for(error_n)))
+            latest_error = error_n
+        if len(coords) >= 4:
+            canvas.create_line(*coords, fill=COLOR_DANGER, width=2, smooth=True)
+        canvas.create_text(right - 8, top + 6, text=f"latest {latest_error:+.3f} kg | abs {abs(latest_error):.3f} kg", anchor="ne", fill=COLOR_TEXT_MUTED, font=("Segoe UI", 7))
 
     def _init_blob_defaults(self):
         self.blob_state_var = tk.StringVar(value="Stopped")
@@ -358,6 +637,10 @@ class MissionControlGUI(AllInOneTesterGUI):
         self.blob_autofocus_var = tk.StringVar(value="continuous")
         self.blob_lens_position_var = tk.StringVar(value="1.0")
         self.blob_exposure_ev_var = tk.StringVar(value="0.8")
+        self.blob_exposure_time_us_var = tk.StringVar(value="")
+        self.blob_analogue_gain_var = tk.StringVar(value="")
+        self.blob_awb_mode_var = tk.StringVar(value="auto")
+        self.blob_colour_gains_var = tk.StringVar(value="")
 
         self.blob_mode_var = tk.StringVar(value="dark")
         self.blob_min_area_var = tk.StringVar(value="260")
@@ -460,7 +743,7 @@ class MissionControlGUI(AllInOneTesterGUI):
 
         command_bar = ttk.Frame(card, style="Surface.TFrame")
         command_bar.grid(row=1, column=0, sticky="ew", pady=(0, 6))
-        for col in range(6):
+        for col in range(7):
             command_bar.columnconfigure(col, weight=1)
 
         ttk.Button(command_bar, text="Reset", command=self._apply_blob_preset).grid(
@@ -487,12 +770,18 @@ class MissionControlGUI(AllInOneTesterGUI):
             command=self.request_blob_reference_reset,
         )
         self.blob_reset_ref_btn.grid(row=0, column=4, sticky="ew", padx=(0, 6))
+        self.surface_reset_btn = ttk.Button(
+            command_bar,
+            text="Reset Zero",
+            command=self.reset_surface_baseline,
+        )
+        self.surface_reset_btn.grid(row=0, column=5, sticky="ew", padx=(0, 6))
         self.blob_settings_btn = ttk.Button(
             command_bar,
             text="Settings",
             command=self.open_blob_settings_dialog,
         )
-        self.blob_settings_btn.grid(row=0, column=5, sticky="ew")
+        self.blob_settings_btn.grid(row=0, column=6, sticky="ew")
 
         preview_shell = ttk.Frame(card, style="Surface.TFrame")
         preview_shell.grid(row=2, column=0, sticky="nsew")
@@ -532,7 +821,7 @@ class MissionControlGUI(AllInOneTesterGUI):
         ttk.Combobox(
             control_card,
             textvariable=self.blob_profile_var,
-            values=("fast", "balanced", "precision"),
+            values=("fast", "balanced", "precision", "measurement"),
             state="readonly",
         ).grid(row=1, column=0, sticky="ew", padx=(0, 6))
 
@@ -831,6 +1120,102 @@ class MissionControlGUI(AllInOneTesterGUI):
             self.hw_pressure_card.grid_configure(row=1, column=1, columnspan=1, padx=(0, 0), pady=(0, 6), sticky="nsew")
             self.hw_load_card.grid_configure(row=2, column=0, columnspan=2, padx=(0, 0), pady=(0, 6), sticky="nsew")
             self.hw_force_card.grid_configure(row=3, column=0, columnspan=2, padx=(0, 0), pady=(0, 0), sticky="ew")
+
+    def _build_force_measurement_tab(self, tab):
+        tab.columnconfigure(0, weight=1)
+
+        live = ttk.LabelFrame(tab, text="Force From Pressure", padding=8)
+        live.grid(row=0, column=0, sticky="ew")
+        live.columnconfigure(0, weight=1)
+        live.columnconfigure(1, weight=1)
+
+        self._force_metric_cell(live, 0, 0, "Estimated force", self.force_estimate_var)
+        self._force_metric_cell(live, 0, 1, "Pressure", self.pressure_value_var)
+        self._force_metric_cell(live, 1, 0, "Load cell", self.loadcell_weight_var)
+        self._force_metric_cell(live, 1, 1, "Model", self.force_calibration_model_var)
+
+        sensor = ttk.LabelFrame(tab, text="Sensor Run", padding=8)
+        sensor.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        sensor.columnconfigure(1, weight=1)
+        sensor.columnconfigure(3, weight=1)
+
+        ttk.Label(sensor, text="Pressure").grid(row=0, column=0, sticky="w")
+        ttk.Label(sensor, textvariable=self.pressure_state_var).grid(row=0, column=1, sticky="w")
+        self.force_pressure_start_btn = ttk.Button(sensor, text="Start", command=self.start_pressure_read)
+        self.force_pressure_start_btn.grid(row=1, column=0, sticky="ew", pady=(4, 0), padx=(0, 6))
+        self.force_pressure_stop_btn = ttk.Button(sensor, text="Stop", command=self.stop_pressure_read)
+        self.force_pressure_stop_btn.grid(row=1, column=1, sticky="ew", pady=(4, 0))
+
+        ttk.Label(sensor, text="Known weight (g)").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(sensor, textvariable=self.loadcell_known_weight_var).grid(
+            row=2,
+            column=1,
+            sticky="ew",
+            pady=(8, 0),
+        )
+        ttk.Label(sensor, text="Load cell").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(sensor, textvariable=self.loadcell_state_var).grid(row=3, column=1, sticky="w", pady=(8, 0))
+        self.force_loadcell_start_btn = ttk.Button(sensor, text="Start", command=self.start_loadcell_read)
+        self.force_loadcell_start_btn.grid(row=4, column=0, sticky="ew", pady=(4, 0), padx=(0, 6))
+        self.force_loadcell_stop_btn = ttk.Button(sensor, text="Stop", command=self.stop_loadcell_read)
+        self.force_loadcell_stop_btn.grid(row=4, column=1, sticky="ew", pady=(4, 0))
+
+        both = ttk.Frame(sensor, style="Surface.TFrame")
+        both.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        both.columnconfigure(0, weight=1)
+        both.columnconfigure(1, weight=1)
+        ttk.Button(both, text="Start Both", style="Accent.TButton", command=self.start_force_measurement).grid(
+            row=0,
+            column=0,
+            sticky="ew",
+            padx=(0, 6),
+        )
+        ttk.Button(both, text="Stop Both", command=self.stop_force_measurement).grid(
+            row=0,
+            column=1,
+            sticky="ew",
+        )
+
+        calibration = ttk.LabelFrame(tab, text="Pressure To Force Calibration", padding=8)
+        calibration.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        self._build_force_calibration_panel(calibration)
+
+        self._set_pressure_controls(self._is_thread_running(self.pressure_thread))
+        self._set_loadcell_controls(self._is_thread_running(self.loadcell_thread))
+
+    def _force_metric_cell(self, parent, row, column, label, variable):
+        panel = ttk.Frame(parent, padding=8, style="Panel.TFrame")
+        panel.grid(row=row, column=column, sticky="nsew", padx=(0 if column == 1 else 0, 6 if column == 0 else 0), pady=(0, 6))
+        ttk.Label(panel, text=label, style="MetricLabel.TLabel").pack(anchor="w")
+        ttk.Label(panel, textvariable=variable, style="MetricValue.TLabel").pack(anchor="w", pady=(3, 0))
+
+    def start_force_measurement(self):
+        if not self._is_thread_running(self.pressure_thread):
+            self.start_pressure_read()
+        if not self._is_thread_running(self.loadcell_thread):
+            self.start_loadcell_read()
+
+    def stop_force_measurement(self):
+        self.stop_loadcell_read()
+        self.stop_pressure_read()
+
+    def _set_pressure_controls(self, running):
+        super()._set_pressure_controls(running)
+        if hasattr(self, "force_pressure_start_btn"):
+            self._set_start_stop_controls(
+                self.force_pressure_start_btn,
+                self.force_pressure_stop_btn,
+                running,
+            )
+
+    def _set_loadcell_controls(self, running):
+        super()._set_loadcell_controls(running)
+        if hasattr(self, "force_loadcell_start_btn"):
+            self._set_start_stop_controls(
+                self.force_loadcell_start_btn,
+                self.force_loadcell_stop_btn,
+                running,
+            )
 
     def _build_system_tests_tab(self, tab):
         tab.columnconfigure(0, weight=1)

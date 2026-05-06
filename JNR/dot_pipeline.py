@@ -536,6 +536,10 @@ def open_camera_stream(
     autofocus: str,
     lens_position: float,
     exposure_ev: float,
+    exposure_time_us=None,
+    analogue_gain=None,
+    awb_mode: str = "auto",
+    colour_gains=None,
 ):
     backend = backend.lower()
     if backend == "picamera3":
@@ -563,10 +567,33 @@ def open_camera_stream(
                 elif autofocus == "off" and libcamera_controls is not None:
                     controls_payload["AfMode"] = libcamera_controls.AfModeEnum.Manual
 
-                controls_payload["ExposureValue"] = float(exposure_ev)
+                if exposure_time_us is not None or analogue_gain is not None:
+                    controls_payload["AeEnable"] = False
+                    if exposure_time_us is not None:
+                        controls_payload["ExposureTime"] = int(exposure_time_us)
+                    if analogue_gain is not None:
+                        controls_payload["AnalogueGain"] = float(analogue_gain)
+                else:
+                    controls_payload["ExposureValue"] = float(exposure_ev)
+
+                awb_mode = str(awb_mode or "auto").lower()
+                if awb_mode == "manual":
+                    controls_payload["AwbEnable"] = False
+                    if colour_gains is not None:
+                        controls_payload["ColourGains"] = tuple(float(value) for value in colour_gains)
+                elif awb_mode == "auto":
+                    controls_payload["AwbEnable"] = True
+
                 scaler_crop = picam.camera_properties.get("ScalerCropMaximum")
                 if scaler_crop:
                     controls_payload["ScalerCrop"] = tuple(scaler_crop)
+                available_controls = getattr(picam, "camera_controls", {}) or {}
+                if available_controls:
+                    controls_payload = {
+                        name: value
+                        for name, value in controls_payload.items()
+                        if name in available_controls
+                    }
                 try:
                     picam.set_controls(controls_payload)
                 except Exception:
@@ -574,8 +601,8 @@ def open_camera_stream(
                         raise
                     controls_payload.pop("ScalerCrop", None)
                     picam.set_controls(controls_payload)
-                time.sleep(0.2)
-                return {"backend": "picamera2", "device": picam}
+                time.sleep(0.35 if exposure_time_us is not None or awb_mode == "manual" else 0.2)
+                return {"backend": "picamera2", "device": picam, "controls": controls_payload}
             except Exception as exc:
                 last_error = str(exc)
                 if backend == "picamera2":

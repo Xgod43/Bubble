@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 SYNC_PAIRS = [
     ("all_in_one_gui.py", "single_folder_runtime/all_in_one_gui.py"),
+    ("surface_measurement.py", "single_folder_runtime/surface_measurement.py"),
     ("hx711v0_5_1.py", "single_folder_runtime/library/hx711py/hx711v0_5_1.py"),
     ("requirements-pi-bookworm.txt", "single_folder_runtime/requirements-pi-bookworm.txt"),
     ("python_mission_control_gui.py", "single_folder_runtime/python_mission_control_gui.py"),

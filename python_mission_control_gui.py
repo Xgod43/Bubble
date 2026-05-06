@@ -36,6 +36,7 @@ class MissionControlGUI(AllInOneTesterGUI):
         self.root.geometry(f"{initial_w}x{initial_h}")
         self.root.minsize(940, 620)
         self.log("Mission control console loaded.")
+        self.log("Force tab layout active; bubble calibration force estimate enabled.")
 
     def _configure_styles(self):
         style = ttk.Style(self.root)
@@ -318,7 +319,7 @@ class MissionControlGUI(AllInOneTesterGUI):
         body.add(left, weight=4)
         body.add(right, weight=1)
 
-        self._build_detection_workspace(left)
+        self._build_primary_workspace(left)
         self._build_sidebar(right)
 
     def _apply_initial_split_positions(self):
@@ -337,6 +338,75 @@ class MissionControlGUI(AllInOneTesterGUI):
             self._layout_sashes_initialized = True
         except tk.TclError:
             self.root.after(120, self._apply_initial_split_positions)
+
+    def _build_primary_workspace(self, parent):
+        notebook = ttk.Notebook(parent)
+        notebook.grid(row=0, column=0, sticky="nsew")
+
+        live_tab = ttk.Frame(notebook, style="App.TFrame")
+        live_tab.columnconfigure(0, weight=1)
+        live_tab.rowconfigure(0, weight=1)
+
+        force_tab = ttk.Frame(notebook, style="App.TFrame", padding=8)
+        force_tab.columnconfigure(0, weight=1)
+        force_tab.rowconfigure(1, weight=1)
+
+        notebook.add(live_tab, text="Live Detection")
+        notebook.add(force_tab, text="Force")
+
+        self._build_detection_workspace(live_tab)
+        self._build_force_workspace(force_tab)
+
+    def _build_force_workspace(self, parent):
+        ttk.Label(
+            parent,
+            text="Pressure-derived force, load-cell comparison, and live error tracking.",
+            style="SectionHint.TLabel",
+        ).grid(row=0, column=0, sticky="w", pady=(0, 6))
+
+        pane = ttk.Panedwindow(parent, orient="horizontal", style="Split.TPanedwindow")
+        pane.grid(row=1, column=0, sticky="nsew")
+
+        graph_area = ttk.Frame(pane, style="App.TFrame", padding=(0, 0, 8, 0))
+        graph_area.columnconfigure(0, weight=1)
+        graph_area.rowconfigure(0, weight=1)
+        graph_area.rowconfigure(1, weight=1)
+
+        side_shell, side_content = self._build_scrollable_tab(pane, padding=8)
+
+        pane.add(graph_area, weight=4)
+        pane.add(side_shell, weight=2)
+
+        compare = ttk.LabelFrame(graph_area, text="Force comparison", padding=8)
+        compare.grid(row=0, column=0, sticky="nsew", pady=(0, 6))
+        compare.columnconfigure(0, weight=1)
+        compare.rowconfigure(0, weight=1)
+        self.force_compare_canvas = tk.Canvas(
+            compare,
+            height=240,
+            background="#0a131b",
+            highlightthickness=1,
+            highlightbackground=COLOR_BORDER_DARK,
+        )
+        self.force_compare_canvas.grid(row=0, column=0, sticky="nsew")
+        self.force_compare_canvas.bind("<Configure>", lambda _event: self._draw_force_graphs())
+
+        error = ttk.LabelFrame(graph_area, text="Force error", padding=8)
+        error.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
+        error.columnconfigure(0, weight=1)
+        error.rowconfigure(0, weight=1)
+        self.force_error_canvas = tk.Canvas(
+            error,
+            height=220,
+            background="#0a131b",
+            highlightthickness=1,
+            highlightbackground=COLOR_BORDER_DARK,
+        )
+        self.force_error_canvas.grid(row=0, column=0, sticky="nsew")
+        self.force_error_canvas.bind("<Configure>", lambda _event: self._draw_force_graphs())
+
+        self._build_force_measurement_tab(side_content)
+        self.root.after(120, self._draw_force_graphs)
 
     def _init_blob_defaults(self):
         self.blob_state_var = tk.StringVar(value="Stopped")
@@ -358,6 +428,10 @@ class MissionControlGUI(AllInOneTesterGUI):
         self.blob_autofocus_var = tk.StringVar(value="continuous")
         self.blob_lens_position_var = tk.StringVar(value="1.0")
         self.blob_exposure_ev_var = tk.StringVar(value="0.8")
+        self.blob_exposure_time_us_var = tk.StringVar(value="")
+        self.blob_analogue_gain_var = tk.StringVar(value="")
+        self.blob_awb_mode_var = tk.StringVar(value="auto")
+        self.blob_colour_gains_var = tk.StringVar(value="")
 
         self.blob_mode_var = tk.StringVar(value="dark")
         self.blob_min_area_var = tk.StringVar(value="260")
@@ -460,7 +534,7 @@ class MissionControlGUI(AllInOneTesterGUI):
 
         command_bar = ttk.Frame(card, style="Surface.TFrame")
         command_bar.grid(row=1, column=0, sticky="ew", pady=(0, 6))
-        for col in range(6):
+        for col in range(7):
             command_bar.columnconfigure(col, weight=1)
 
         ttk.Button(command_bar, text="Reset", command=self._apply_blob_preset).grid(
@@ -487,12 +561,18 @@ class MissionControlGUI(AllInOneTesterGUI):
             command=self.request_blob_reference_reset,
         )
         self.blob_reset_ref_btn.grid(row=0, column=4, sticky="ew", padx=(0, 6))
+        self.surface_reset_btn = ttk.Button(
+            command_bar,
+            text="Reset Zero",
+            command=self.reset_surface_baseline,
+        )
+        self.surface_reset_btn.grid(row=0, column=5, sticky="ew", padx=(0, 6))
         self.blob_settings_btn = ttk.Button(
             command_bar,
             text="Settings",
             command=self.open_blob_settings_dialog,
         )
-        self.blob_settings_btn.grid(row=0, column=5, sticky="ew")
+        self.blob_settings_btn.grid(row=0, column=6, sticky="ew")
 
         preview_shell = ttk.Frame(card, style="Surface.TFrame")
         preview_shell.grid(row=2, column=0, sticky="nsew")
@@ -532,7 +612,7 @@ class MissionControlGUI(AllInOneTesterGUI):
         ttk.Combobox(
             control_card,
             textvariable=self.blob_profile_var,
-            values=("fast", "balanced", "precision"),
+            values=("fast", "balanced", "precision", "measurement"),
             state="readonly",
         ).grid(row=1, column=0, sticky="ew", padx=(0, 6))
 
@@ -831,6 +911,102 @@ class MissionControlGUI(AllInOneTesterGUI):
             self.hw_pressure_card.grid_configure(row=1, column=1, columnspan=1, padx=(0, 0), pady=(0, 6), sticky="nsew")
             self.hw_load_card.grid_configure(row=2, column=0, columnspan=2, padx=(0, 0), pady=(0, 6), sticky="nsew")
             self.hw_force_card.grid_configure(row=3, column=0, columnspan=2, padx=(0, 0), pady=(0, 0), sticky="ew")
+
+    def _build_force_measurement_tab(self, tab):
+        tab.columnconfigure(0, weight=1)
+
+        live = ttk.LabelFrame(tab, text="Force From Pressure", padding=8)
+        live.grid(row=0, column=0, sticky="ew")
+        live.columnconfigure(0, weight=1)
+        live.columnconfigure(1, weight=1)
+
+        self._force_metric_cell(live, 0, 0, "Estimated force", self.force_estimate_var)
+        self._force_metric_cell(live, 0, 1, "Pressure", self.pressure_value_var)
+        self._force_metric_cell(live, 1, 0, "Load cell", self.loadcell_weight_var)
+        self._force_metric_cell(live, 1, 1, "Model", self.force_calibration_model_var)
+
+        sensor = ttk.LabelFrame(tab, text="Sensor Run", padding=8)
+        sensor.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        sensor.columnconfigure(1, weight=1)
+        sensor.columnconfigure(3, weight=1)
+
+        ttk.Label(sensor, text="Pressure").grid(row=0, column=0, sticky="w")
+        ttk.Label(sensor, textvariable=self.pressure_state_var).grid(row=0, column=1, sticky="w")
+        self.force_pressure_start_btn = ttk.Button(sensor, text="Start", command=self.start_pressure_read)
+        self.force_pressure_start_btn.grid(row=1, column=0, sticky="ew", pady=(4, 0), padx=(0, 6))
+        self.force_pressure_stop_btn = ttk.Button(sensor, text="Stop", command=self.stop_pressure_read)
+        self.force_pressure_stop_btn.grid(row=1, column=1, sticky="ew", pady=(4, 0))
+
+        ttk.Label(sensor, text="Known weight (g)").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(sensor, textvariable=self.loadcell_known_weight_var).grid(
+            row=2,
+            column=1,
+            sticky="ew",
+            pady=(8, 0),
+        )
+        ttk.Label(sensor, text="Load cell").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(sensor, textvariable=self.loadcell_state_var).grid(row=3, column=1, sticky="w", pady=(8, 0))
+        self.force_loadcell_start_btn = ttk.Button(sensor, text="Start", command=self.start_loadcell_read)
+        self.force_loadcell_start_btn.grid(row=4, column=0, sticky="ew", pady=(4, 0), padx=(0, 6))
+        self.force_loadcell_stop_btn = ttk.Button(sensor, text="Stop", command=self.stop_loadcell_read)
+        self.force_loadcell_stop_btn.grid(row=4, column=1, sticky="ew", pady=(4, 0))
+
+        both = ttk.Frame(sensor, style="Surface.TFrame")
+        both.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        both.columnconfigure(0, weight=1)
+        both.columnconfigure(1, weight=1)
+        ttk.Button(both, text="Start Both", style="Accent.TButton", command=self.start_force_measurement).grid(
+            row=0,
+            column=0,
+            sticky="ew",
+            padx=(0, 6),
+        )
+        ttk.Button(both, text="Stop Both", command=self.stop_force_measurement).grid(
+            row=0,
+            column=1,
+            sticky="ew",
+        )
+
+        calibration = ttk.LabelFrame(tab, text="Pressure To Force Calibration", padding=8)
+        calibration.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        self._build_force_calibration_panel(calibration)
+
+        self._set_pressure_controls(self._is_thread_running(self.pressure_thread))
+        self._set_loadcell_controls(self._is_thread_running(self.loadcell_thread))
+
+    def _force_metric_cell(self, parent, row, column, label, variable):
+        panel = ttk.Frame(parent, padding=8, style="Panel.TFrame")
+        panel.grid(row=row, column=column, sticky="nsew", padx=(0 if column == 1 else 0, 6 if column == 0 else 0), pady=(0, 6))
+        ttk.Label(panel, text=label, style="MetricLabel.TLabel").pack(anchor="w")
+        ttk.Label(panel, textvariable=variable, style="MetricValue.TLabel").pack(anchor="w", pady=(3, 0))
+
+    def start_force_measurement(self):
+        if not self._is_thread_running(self.pressure_thread):
+            self.start_pressure_read()
+        if not self._is_thread_running(self.loadcell_thread):
+            self.start_loadcell_read()
+
+    def stop_force_measurement(self):
+        self.stop_loadcell_read()
+        self.stop_pressure_read()
+
+    def _set_pressure_controls(self, running):
+        super()._set_pressure_controls(running)
+        if hasattr(self, "force_pressure_start_btn"):
+            self._set_start_stop_controls(
+                self.force_pressure_start_btn,
+                self.force_pressure_stop_btn,
+                running,
+            )
+
+    def _set_loadcell_controls(self, running):
+        super()._set_loadcell_controls(running)
+        if hasattr(self, "force_loadcell_start_btn"):
+            self._set_start_stop_controls(
+                self.force_loadcell_start_btn,
+                self.force_loadcell_stop_btn,
+                running,
+            )
 
     def _build_system_tests_tab(self, tab):
         tab.columnconfigure(0, weight=1)
