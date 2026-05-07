@@ -17,6 +17,12 @@ from surface_measurement import (
     measure_camera_to_surface_mm,
     measure_contact_deformation_mm,
 )
+from tactile_contact_pipeline import (
+    TactileContactConfig,
+    build_tactile_contact_frame,
+    summarize_contact_map,
+    surface_from_contact_map,
+)
 
 try:
     from PIL import Image, ImageTk
@@ -40,6 +46,14 @@ STEPPER_ENA_PIN = 26
 STEPPER_PULSES_PER_REV = 1600
 STEPPER_FREQUENCY_HZ = STEPPER_PULSES_PER_REV
 STEPPER_PULSE_DELAY = 1.0 / (2.0 * STEPPER_FREQUENCY_HZ)
+STEPPER_DEPTH_ENABLED = os.environ.get("BUBBLE_STEPPER_DEPTH_ENABLED", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+STEPPER_MM_PER_REV = float(os.environ.get("BUBBLE_STEPPER_MM_PER_REV", "8.0"))
+STEPPER_MM_PER_PULSE = STEPPER_MM_PER_REV / STEPPER_PULSES_PER_REV
 
 LOADCELL_DT_PIN = 5
 LOADCELL_SCK_PIN = 6
@@ -47,7 +61,37 @@ LOADCELL_CALIBRATION_DELAY_S = 8.0
 LOADCELL_CALIBRATION_FILENAME = "loadcell_calibration.json"
 FORCE_GRAVITY_MPS2 = 9.80665
 FORCE_CALIBRATION_FILENAME = "force_calibration.json"
+FORCE_GRAPH_HISTORY_SECONDS = 120.0
+FORCE_GRAPH_MAX_POINTS = 600
 FORCE_PRESSURE_DELTA_MIN_HPA = 0.25
+FORCE_DEFAULT_PRESSURE_ZERO_HPA = 1032.0
+CAMERA_DEFORM_CALIBRATION_FILENAME = "camera_deform_calibration.json"
+CAMERA_DEFORM_FEATURE_NAMES = (
+    "pressure_delta_hpa",
+    "dot_mean_px",
+    "dot_max_px",
+    "missing_ratio",
+    "contact_peak",
+    "contact_top_mean",
+    "contact_area_ratio",
+    "residual_mean_px",
+    "residual_peak_px",
+    "surface_scale_px",
+)
+CAMERA_DEFORM_CAPTURE_SECONDS = float(os.environ.get("BUBBLE_CAMERA_DEFORM_CAPTURE_SECONDS", "1.5"))
+CAMERA_DEFORM_CAPTURE_MIN_FRAMES = int(os.environ.get("BUBBLE_CAMERA_DEFORM_CAPTURE_MIN_FRAMES", "8"))
+PRESSURE_CONTACT_GATE_ENABLED = os.environ.get("BUBBLE_PRESSURE_CONTACT_GATE", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+PRESSURE_CONTACT_BASELINE_SAMPLES = int(os.environ.get("BUBBLE_PRESSURE_BASELINE_SAMPLES", "6"))
+PRESSURE_CONTACT_MIN_DELTA_HPA = float(os.environ.get("BUBBLE_PRESSURE_CONTACT_DELTA_HPA", "1.0"))
+PRESSURE_CONTACT_RELEASE_DELTA_HPA = float(os.environ.get("BUBBLE_PRESSURE_RELEASE_DELTA_HPA", "0.45"))
+PRESSURE_CONTACT_CONFIRM_SAMPLES = int(os.environ.get("BUBBLE_PRESSURE_CONTACT_CONFIRM_SAMPLES", "2"))
+PRESSURE_CONTACT_RELEASE_SAMPLES = int(os.environ.get("BUBBLE_PRESSURE_RELEASE_SAMPLES", "3"))
+PRESSURE_CONTACT_NOISE_SIGMA = float(os.environ.get("BUBBLE_PRESSURE_CONTACT_NOISE_SIGMA", "5.0"))
 MPRLS_I2C_BUS = 1
 MPRLS_I2C_ADDR = 0x18
 MPRLS_PSI_MIN = 0.0
@@ -178,6 +222,8 @@ class AllInOneTesterGUI:
 
         self.stepper_thread = None
         self.stepper_stop_event = threading.Event()
+        self.stepper_position_mm = 0.0
+        self.stepper_contact_zero_mm = None
 
         self.pressure_thread = None
         self.pressure_stop_event = threading.Event()
@@ -229,6 +275,12 @@ class AllInOneTesterGUI:
         self.flow_max_disp_var = tk.StringVar(value="-")
         self.flow_fps_var = tk.StringVar(value="-")
         self.flow_message_var = tk.StringVar(value="Use Live Detection output type: optical_flow_2d.")
+        self.stepper_position_var = tk.StringVar(value="0.000 mm")
+        self.contact_depth_stepper_var = tk.StringVar(
+            value="-" if STEPPER_DEPTH_ENABLED else "unavailable (manual)"
+        )
+        self.contact_depth_camera_var = tk.StringVar(value="-")
+        self.contact_gate_var = tk.StringVar(value="Pressure gate waiting")
         self.flow_camera_backend_var = tk.StringVar(value="auto")
         self.flow_camera_index_var = tk.StringVar(value="0")
         self.flow_cam_width_var = tk.StringVar(value="1280")
@@ -253,8 +305,25 @@ class AllInOneTesterGUI:
         self.surface_reference_height_map = None
         self.surface_contact_ema = None
         self.surface_zero_ready = False
+        self.surface_tactile_frame = None
+        self.surface_contact_baseline = None
+        self.surface_contact_display_ema = None
+        self.camera_deform_known_mm_var = tk.StringVar(value="0.0")
+        self.camera_deform_estimate_var = tk.StringVar(value="-")
+        self.camera_deform_sample_count_var = tk.StringVar(value="0 samples")
+        self.camera_deform_model_var = tk.StringVar(value="-")
+        self.camera_deform_live_feature_var = tk.StringVar(value="-")
+        self.camera_deform_status_var = tk.StringVar(value="No camera deform calibration.")
+        self.camera_deform_samples = []
+        self.camera_deform_model = None
+        self.camera_deform_latest_features = None
+        self.camera_deform_capture_active = False
+        self.camera_deform_capture_target_mm = None
+        self.camera_deform_capture_started_at = None
+        self.camera_deform_capture_buffer = []
 
         self._init_force_calibration_state()
+        self._init_camera_deform_calibration_state()
         self._build_ui()
         self._setup_gpio_once()
         self.root.after(100, self._drain_log_queue)
@@ -401,12 +470,12 @@ class AllInOneTesterGUI:
         notebook.grid(row=0, column=0, sticky="nsew")
 
         self._build_blob_tab(notebook)
+        self._build_force_tab(notebook)
         self._build_camera_tab(notebook)
         self._build_limit_tab(notebook)
         self._build_stepper_tab(notebook)
         self._build_pressure_tab(notebook)
         self._build_loadcell_tab(notebook)
-        self._build_force_calibration_tab(notebook)
         self._build_system_tests_tab(notebook)
         self._build_session_log_panel(content_pane)
 
@@ -456,9 +525,9 @@ class AllInOneTesterGUI:
     def _build_system_tests_tab(self, notebook):
         tab = ttk.Frame(notebook, padding=12)
         try:
-            notebook.insert(1, tab, text="2) System Tests")
+            notebook.insert(2, tab, text="3) System Tests")
         except tk.TclError:
-            notebook.add(tab, text="2) System Tests")
+            notebook.add(tab, text="3) System Tests")
 
         tab.columnconfigure(0, weight=1)
         tab.columnconfigure(1, weight=1)
@@ -566,7 +635,7 @@ class AllInOneTesterGUI:
 
     def _build_camera_tab(self, notebook):
         tab = ttk.Frame(notebook, padding=12)
-        notebook.add(tab, text="3) Camera Test")
+        notebook.add(tab, text="4) Camera Test")
         tab.columnconfigure(2, weight=1)
 
         self.camera_status_var = tk.StringVar(value="Stopped")
@@ -593,7 +662,7 @@ class AllInOneTesterGUI:
 
     def _build_limit_tab(self, notebook):
         tab = ttk.Frame(notebook, padding=12)
-        notebook.add(tab, text="4) Limit Switch Test")
+        notebook.add(tab, text="5) Limit Switch Test")
         tab.columnconfigure(2, weight=1)
 
         self.limit1_status_var = tk.StringVar(value="not triggered")
@@ -637,7 +706,7 @@ class AllInOneTesterGUI:
 
     def _build_stepper_tab(self, notebook):
         tab = ttk.Frame(notebook, padding=12)
-        notebook.add(tab, text="5) Stepper Test")
+        notebook.add(tab, text="6) Stepper Test")
         tab.columnconfigure(4, weight=1)
 
         self.stepper_direction_var = tk.StringVar(value="up")
@@ -680,11 +749,19 @@ class AllInOneTesterGUI:
         ttk.Label(tab, textvariable=self.stepper_state_var).grid(
             row=3, column=1, sticky="w", pady=(10, 0)
         )
+        ttk.Label(tab, text="Position:").grid(row=4, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(tab, textvariable=self.stepper_position_var).grid(
+            row=4, column=1, sticky="w", pady=(6, 0)
+        )
+        ttk.Label(tab, text="Press depth:").grid(row=5, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(tab, textvariable=self.contact_depth_stepper_var).grid(
+            row=5, column=1, sticky="w", pady=(6, 0)
+        )
         self._set_stepper_controls(False)
 
     def _build_pressure_tab(self, notebook):
         tab = ttk.Frame(notebook, padding=12)
-        notebook.add(tab, text="6) Pressure Test")
+        notebook.add(tab, text="7) Pressure Test")
         tab.columnconfigure(2, weight=1)
 
         self.pressure_value_var = tk.StringVar(value="-")
@@ -725,7 +802,7 @@ class AllInOneTesterGUI:
 
     def _build_loadcell_tab(self, notebook):
         tab = ttk.Frame(notebook, padding=12)
-        notebook.add(tab, text="7) Load Cell Test")
+        notebook.add(tab, text="8) Load Cell Test")
         tab.columnconfigure(3, weight=1)
 
         self.loadcell_known_weight_var = tk.StringVar(value="500")
@@ -765,20 +842,65 @@ class AllInOneTesterGUI:
         )
         self._set_loadcell_controls(False)
 
-    def _build_force_calibration_tab(self, notebook):
+    def _build_force_tab(self, notebook):
         tab = ttk.Frame(notebook, padding=12)
-        notebook.add(tab, text="8) Force Calibration")
+        notebook.add(tab, text="2) Force")
         tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(1, weight=1)
+
         ttk.Label(
             tab,
             text=(
-                "Set pressure zero, capture pressure/load-cell pairs, fit F = a*dP + b, then estimate force. "
-                "Load cell readings are converted from kg to newtons."
+                "Pressure-derived force, load-cell force comparison, and live error tracking."
             ),
         ).grid(row=0, column=0, sticky="w", pady=(0, 8))
-        panel = ttk.LabelFrame(tab, text="Pressure -> Force", padding=12)
-        panel.grid(row=1, column=0, sticky="ew")
+
+        force_pane = ttk.Panedwindow(tab, orient="horizontal")
+        force_pane.grid(row=1, column=0, sticky="nsew")
+
+        graph_area = ttk.Frame(force_pane)
+        graph_area.columnconfigure(0, weight=1)
+        graph_area.rowconfigure(0, weight=1)
+        graph_area.rowconfigure(1, weight=1)
+
+        side_area = ttk.Frame(force_pane)
+        side_area.columnconfigure(0, weight=1)
+
+        force_pane.add(graph_area, weight=4)
+        force_pane.add(side_area, weight=2)
+
+        compare_frame = ttk.LabelFrame(graph_area, text="Force comparison", padding=8)
+        compare_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10), pady=(0, 8))
+        compare_frame.columnconfigure(0, weight=1)
+        compare_frame.rowconfigure(0, weight=1)
+        self.force_compare_canvas = tk.Canvas(
+            compare_frame,
+            height=230,
+            background="#f9fbfc",
+            highlightthickness=1,
+            highlightbackground=COLOR_BORDER,
+        )
+        self.force_compare_canvas.grid(row=0, column=0, sticky="nsew")
+        self.force_compare_canvas.bind("<Configure>", lambda _event: self._draw_force_graphs())
+
+        error_frame = ttk.LabelFrame(graph_area, text="Force error", padding=8)
+        error_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 10), pady=(8, 0))
+        error_frame.columnconfigure(0, weight=1)
+        error_frame.rowconfigure(0, weight=1)
+        self.force_error_canvas = tk.Canvas(
+            error_frame,
+            height=230,
+            background="#f9fbfc",
+            highlightthickness=1,
+            highlightbackground=COLOR_BORDER,
+        )
+        self.force_error_canvas.grid(row=0, column=0, sticky="nsew")
+        self.force_error_canvas.bind("<Configure>", lambda _event: self._draw_force_graphs())
+
+        panel = ttk.LabelFrame(side_area, text="Force from pressure", padding=12)
+        panel.grid(row=0, column=0, sticky="new")
         self._build_force_calibration_panel(panel)
+        self.root.after(100, self._draw_force_graphs)
 
     def _build_blob_tab(self, notebook):
         tab = ttk.Frame(notebook, padding=12)
@@ -1052,8 +1174,57 @@ class AllInOneTesterGUI:
             row=3, column=1, sticky="ew", pady=(6, 0)
         )
 
+        deform_cal = ttk.LabelFrame(right_panel, text="Deform Calibration", padding=8)
+        deform_cal.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        deform_cal.columnconfigure(1, weight=1)
+        deform_cal.columnconfigure(3, weight=1)
+
+        ttk.Label(deform_cal, text="Known mm:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(deform_cal, textvariable=self.camera_deform_known_mm_var, width=10).grid(
+            row=0, column=1, sticky="ew"
+        )
+        ttk.Label(deform_cal, text="Estimate:").grid(row=0, column=2, sticky="w", padx=(12, 0))
+        ttk.Label(deform_cal, textvariable=self.camera_deform_estimate_var).grid(
+            row=0, column=3, sticky="w"
+        )
+
+        deform_actions = ttk.Frame(deform_cal)
+        deform_actions.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        for col in range(3):
+            deform_actions.columnconfigure(col, weight=1)
+        ttk.Button(
+            deform_actions,
+            text="Capture Sample",
+            command=self.capture_camera_deform_sample,
+        ).grid(row=0, column=0, sticky="ew")
+        ttk.Button(
+            deform_actions,
+            text="Fit",
+            command=self.fit_camera_deform_calibration,
+        ).grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        ttk.Button(
+            deform_actions,
+            text="Reset",
+            command=self.reset_camera_deform_calibration,
+        ).grid(row=0, column=2, sticky="ew", padx=(8, 0))
+
+        ttk.Label(deform_cal, text="Samples:").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(deform_cal, textvariable=self.camera_deform_sample_count_var).grid(
+            row=2, column=1, sticky="w", pady=(6, 0)
+        )
+        ttk.Label(deform_cal, text="Model:").grid(row=2, column=2, sticky="w", padx=(12, 0), pady=(6, 0))
+        ttk.Label(deform_cal, textvariable=self.camera_deform_model_var).grid(
+            row=2, column=3, sticky="w", pady=(6, 0)
+        )
+        ttk.Label(deform_cal, textvariable=self.camera_deform_live_feature_var).grid(
+            row=3, column=0, columnspan=4, sticky="w", pady=(4, 0)
+        )
+        ttk.Label(deform_cal, textvariable=self.camera_deform_status_var, wraplength=280).grid(
+            row=4, column=0, columnspan=4, sticky="w", pady=(4, 0)
+        )
+
         metrics = ttk.LabelFrame(right_panel, text="Live Metrics", padding=8)
-        metrics.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
+        metrics.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
         metrics.columnconfigure(1, weight=1)
         metrics.columnconfigure(3, weight=1)
 
@@ -1082,12 +1253,21 @@ class AllInOneTesterGUI:
         ttk.Label(metrics, text="Lost tracks:").grid(row=4, column=2, sticky="w", padx=(12, 0), pady=(4, 0))
         ttk.Label(metrics, textvariable=self.blob_lost_tracks_var).grid(row=4, column=3, sticky="w", pady=(4, 0))
 
+        ttk.Label(metrics, text="Stepper depth:").grid(row=5, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(metrics, textvariable=self.contact_depth_stepper_var).grid(row=5, column=1, sticky="w", pady=(4, 0))
+        ttk.Label(metrics, text="Camera depth:").grid(row=5, column=2, sticky="w", padx=(12, 0), pady=(4, 0))
+        ttk.Label(metrics, textvariable=self.contact_depth_camera_var).grid(row=5, column=3, sticky="w", pady=(4, 0))
+        ttk.Label(metrics, text="Contact gate:").grid(row=6, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(metrics, textvariable=self.contact_gate_var).grid(
+            row=6, column=1, columnspan=3, sticky="w", pady=(4, 0)
+        )
+
         ttk.Label(
             metrics,
             textvariable=self.blob_message_var,
             wraplength=300,
             justify="left",
-        ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        ).grid(row=7, column=0, columnspan=4, sticky="w", pady=(10, 0))
 
         self._set_blob_controls(False)
 
@@ -1236,6 +1416,9 @@ class AllInOneTesterGUI:
         self.surface_reference_height_map = None
         self.surface_contact_ema = None
         self.surface_zero_ready = False
+        self.surface_tactile_frame = None
+        self.surface_contact_baseline = None
+        self.surface_contact_display_ema = None
         if hasattr(self, "surface_reset_zero_event"):
             self.surface_reset_zero_event.clear()
         self._set_var(self.surface_status_var, status_text)
@@ -1245,165 +1428,66 @@ class AllInOneTesterGUI:
             self._set_var(self.blob_max_disp_var, "0.00")
 
     def reset_surface_baseline(self):
+        self._reset_pressure_contact_gate("manual reset")
         self._reset_contact_deform_zero_state(
             "Contact deform zero will be set on the next camera frame."
         )
         if not self._is_blob_running():
+            self._set_contact_depth_zero()
             return
 
         self._set_var(self.surface_status_var, "Contact deform zero reset requested.")
+        self._set_contact_depth_zero()
         self.surface_reset_zero_event.set()
         self.log("Contact deform zero reset requested.")
+
+    def _build_tactile_contact_config(self, params):
+        return TactileContactConfig(
+            bubble_width_mm=BUBBLE_WIDTH_MM,
+            bubble_height_mm=BUBBLE_HEIGHT_MM,
+            bubble_max_height_mm=BUBBLE_MAX_HEIGHT_MM,
+            grid_width=self._parse_surface_int(self.surface_grid_var, 52, 24, 140),
+            roi_scale=float(params.get("roi_scale", 1.0)) if params.get("use_roi", False) else 1.0,
+            use_roi=bool(params.get("use_roi", False)),
+            gain=self._parse_surface_float(self.surface_gain_var, 1.0, 0.2, 3.0),
+            smooth=self._parse_surface_float(self.surface_smooth_var, 1.4, 0.0, 4.0),
+        )
 
     def _build_surface_height_map(self, centroids, reference_centroids, displacements, frame_shape, params, cv2):
         if not reference_centroids or not displacements:
             return None, None, None
 
-        points = []
-        vectors = []
-        for ref, disp in zip(reference_centroids, displacements):
-            if ref is None or disp is None:
-                continue
-            points.append(ref)
-            vectors.append(disp)
-
-        if len(points) < 6:
+        config = self._build_tactile_contact_config(params)
+        frame = build_tactile_contact_frame(
+            reference_centroids,
+            displacements,
+            frame_shape,
+            config,
+            cv2=cv2,
+            previous_scale_px=self.surface_scale_ema,
+        )
+        if frame is None:
+            self.surface_tactile_frame = None
             return None, None, None
 
-        points_arr = np.array(points, dtype=np.float32)
-        vectors_arr = np.array(vectors, dtype=np.float32)
-
-        # Remove whole-frame marker motion before estimating local membrane
-        # deformation. Translation-only compensation is too sensitive to small
-        # camera/focus changes, so fit a partial affine field first.
-        current_arr = points_arr + vectors_arr
-        try:
-            affine, _inliers = cv2.estimateAffinePartial2D(
-                points_arr,
-                current_arr,
-                method=cv2.RANSAC,
-                ransacReprojThreshold=3.0,
-                maxIters=120,
-                confidence=0.96,
-            )
-        except Exception:
-            affine = None
-
-        if affine is not None:
-            predicted_arr = cv2.transform(points_arr.reshape(-1, 1, 2), affine).reshape(-1, 2)
-            residual_vectors = current_arr - predicted_arr
-        else:
-            global_shift = np.median(vectors_arr, axis=0)
-            residual_vectors = vectors_arr - global_shift
-        values_arr = np.linalg.norm(residual_vectors, axis=1).astype(np.float32)
-
-        height_px, width_px = frame_shape[:2]
-        ratio = BUBBLE_WIDTH_MM / BUBBLE_HEIGHT_MM if BUBBLE_HEIGHT_MM > 0 else 1.0
-        roi_scale = float(params.get("roi_scale", 1.0)) if params.get("use_roi", False) else 1.0
-
-        if params.get("use_roi", False):
-            cx = width_px * 0.5
-            cy = height_px * 0.5
-            max_rx = max(10.0, width_px * roi_scale * 0.5)
-            max_ry = max(10.0, height_px * roi_scale * 0.5)
-        else:
-            lo = np.percentile(points_arr, 3.0, axis=0)
-            hi = np.percentile(points_arr, 97.0, axis=0)
-            cx = float((lo[0] + hi[0]) * 0.5)
-            cy = float((lo[1] + hi[1]) * 0.5)
-            max_rx = max(10.0, float((hi[0] - lo[0]) * 0.64))
-            max_ry = max(10.0, float((hi[1] - lo[1]) * 0.64))
-
-        if max_rx / max_ry > ratio:
-            ry = max_ry
-            rx = ry * ratio
-        else:
-            rx = max_rx
-            ry = rx / ratio
-
-        rx = min(rx, max(10.0, width_px * 0.49))
-        ry = min(ry, max(10.0, height_px * 0.49))
-        cx = float(np.clip(cx, rx, max(rx, width_px - 1 - rx)))
-        cy = float(np.clip(cy, ry, max(ry, height_px - 1 - ry)))
-
-        grid_w = self._parse_surface_int(self.surface_grid_var, 52, 24, 140)
-        grid_h = max(18, min(int(grid_w / ratio), 120))
-
-        grid_x = np.linspace(cx - rx, cx + rx, grid_w)
-        grid_y = np.linspace(cy - ry, cy + ry, grid_h)
-        gx, gy = np.meshgrid(grid_x, grid_y)
-
-        nx = (gx - cx) / rx
-        ny = (gy - cy) / ry
-        r2 = nx * nx + ny * ny
-        grid_mask = r2 <= 1.0
-
-        base = np.zeros_like(r2, dtype=np.float32)
-        base[grid_mask] = np.sqrt(np.clip(1.0 - r2[grid_mask], 0.0, 1.0))
-
-        dx = gx[..., None] - points_arr[:, 0]
-        dy = gy[..., None] - points_arr[:, 1]
-        dist2 = dx * dx + dy * dy
-
-        sigma = max(8.0, min(rx, ry) * 0.28)
-        weights = np.exp(-dist2 / (2.0 * sigma * sigma)).astype(np.float32)
-        weight_sum = np.sum(weights, axis=-1)
-        disp_map = np.sum(weights * values_arr, axis=-1)
-        disp_map = np.divide(
-            disp_map,
-            weight_sum,
-            out=np.zeros_like(disp_map),
-            where=weight_sum > 1e-6,
-        )
-
-        confidence = np.clip(weight_sum / (np.percentile(weight_sum[grid_mask], 75.0) + 1e-6), 0.0, 1.0)
-        disp_map = np.where(grid_mask, disp_map * confidence, 0.0)
-        disp_map = cv2.GaussianBlur(disp_map, (0, 0), sigmaX=1.1, sigmaY=1.0)
-
-        pctl = float(np.percentile(values_arr, 92.0)) if values_arr.size > 0 else 0.0
-        pctl = max(pctl, 0.05)
-        if self.surface_scale_ema is None:
-            self.surface_scale_ema = pctl
-        else:
-            self.surface_scale_ema = (0.9 * self.surface_scale_ema) + (0.1 * pctl)
-
-        scale = max(self.surface_scale_ema, 0.05)
-        gain = self._parse_surface_float(self.surface_gain_var, 1.0, 0.2, 3.0)
-        smooth = self._parse_surface_float(self.surface_smooth_var, 1.4, 0.0, 4.0)
-
-        disp_norm = np.clip(disp_map / scale, 0.0, 1.35)
-        base_mm = base * BUBBLE_MAX_HEIGHT_MM
-        edge_lock = np.power(np.clip(base, 0.0, 1.0), 0.72)
-        depression_mm = gain * disp_norm * (BUBBLE_MAX_HEIGHT_MM * 0.62) * edge_lock
-        height_low_mm = np.clip(base_mm - depression_mm, 0.0, BUBBLE_MAX_HEIGHT_MM)
-        height_low = height_low_mm / BUBBLE_MAX_HEIGHT_MM
-
-        if smooth > 0.01:
-            low_sigma = max(0.3, smooth * 0.65)
-            height_low = cv2.GaussianBlur(height_low, (0, 0), sigmaX=low_sigma, sigmaY=low_sigma)
-        height_low = np.where(grid_mask, height_low, 0.0)
-
-        height_full = cv2.resize(height_low, (width_px, height_px), interpolation=cv2.INTER_CUBIC)
-        ellipse_mask = self._build_surface_ellipse_mask((height_px, width_px), cx, cy, rx, ry)
-        height_full = np.where(ellipse_mask, np.clip(height_full, 0.0, 1.0), 0.0)
-
-        if smooth > 0.01:
-            height_full = cv2.GaussianBlur(height_full, (0, 0), sigmaX=smooth, sigmaY=smooth)
-            height_full = np.where(ellipse_mask, np.clip(height_full, 0.0, 1.0), 0.0)
-
+        self.surface_tactile_frame = frame
+        self.surface_scale_ema = frame.scale_px
+        height_full = frame.height_map.astype(np.float32)
         if self.surface_height_ema is None or self.surface_height_ema.shape != height_full.shape:
-            self.surface_height_ema = height_full.astype(np.float32)
+            self.surface_height_ema = height_full
         else:
             self.surface_height_ema = cv2.addWeighted(
                 self.surface_height_ema.astype(np.float32),
-                0.78,
-                height_full.astype(np.float32),
-                0.22,
+                0.72,
+                height_full,
+                0.28,
                 0.0,
             )
-        height_full = np.where(ellipse_mask, self.surface_height_ema, 0.0)
-
-        return height_full, ellipse_mask, scale
+        return (
+            np.where(frame.ellipse_mask, self.surface_height_ema, 0.0).astype(np.float32),
+            frame.ellipse_mask,
+            frame.scale_px,
+        )
 
     @staticmethod
     def _measure_camera_to_surface_mm(height_map, ellipse_mask=None):
@@ -1512,7 +1596,7 @@ class AllInOneTesterGUI:
 
         cv2.putText(
             graph,
-            "deformation history (mm)",
+            "contact intensity history",
             (left, 13),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.40,
@@ -1804,6 +1888,668 @@ class AllInOneTesterGUI:
     def _set_var(self, variable, value):
         if self.root.winfo_exists():
             self.root.after(0, variable.set, value)
+
+    def _set_contact_gate_status(self, value):
+        if hasattr(self, "contact_gate_var"):
+            self._set_var(self.contact_gate_var, value)
+
+    def _set_contact_depth_zero(self):
+        if STEPPER_DEPTH_ENABLED:
+            self.stepper_contact_zero_mm = float(self.stepper_position_mm)
+        self._refresh_contact_depth_readouts()
+
+    def _stepper_contact_depth_mm(self):
+        if not STEPPER_DEPTH_ENABLED:
+            return None
+        if self.stepper_contact_zero_mm is None:
+            return None
+        return max(0.0, float(self.stepper_position_mm) - float(self.stepper_contact_zero_mm))
+
+    def _apply_stepper_motion(self, direction_name, pulses=None, elapsed_seconds=None):
+        if pulses is None:
+            seconds = max(0.0, float(elapsed_seconds or 0.0))
+            pulses = int(round(seconds * STEPPER_FREQUENCY_HZ))
+        delta_mm = max(0, int(pulses)) * STEPPER_MM_PER_PULSE
+        if direction_name == "up":
+            delta_mm = -delta_mm
+        self.stepper_position_mm += delta_mm
+        self._refresh_contact_depth_readouts()
+
+    def _estimate_camera_depth_mm(self, contact_stats):
+        if not contact_stats or not contact_stats.get("ready"):
+            return None
+        top_mean = float(contact_stats.get("top_mean", 0.0))
+        peak = float(contact_stats.get("peak", 0.0))
+        area_fraction = np.clip(float(contact_stats.get("area_ratio", 0.0)) / 100.0, 0.0, 0.95)
+        intensity_depth = BUBBLE_MAX_HEIGHT_MM * 0.72 * np.clip(max(top_mean, peak * 0.35), 0.0, 1.0)
+        area_depth = BUBBLE_MAX_HEIGHT_MM * (1.0 - np.sqrt(max(0.0, 1.0 - area_fraction)))
+        return float(max(intensity_depth, area_depth))
+
+    def _camera_deform_calibration_path(self):
+        return Path(__file__).resolve().parent / CAMERA_DEFORM_CALIBRATION_FILENAME
+
+    def _init_camera_deform_calibration_state(self):
+        if not hasattr(self, "camera_deform_samples"):
+            self.camera_deform_samples = []
+        if not hasattr(self, "camera_deform_model"):
+            self.camera_deform_model = None
+        if not hasattr(self, "camera_deform_latest_features"):
+            self.camera_deform_latest_features = None
+        if not hasattr(self, "camera_deform_capture_active"):
+            self.camera_deform_capture_active = False
+            self.camera_deform_capture_target_mm = None
+            self.camera_deform_capture_started_at = None
+            self.camera_deform_capture_buffer = []
+        if not getattr(self, "_camera_deform_calibration_loaded", False):
+            self._camera_deform_calibration_loaded = True
+            self._load_camera_deform_calibration()
+
+    @staticmethod
+    def _camera_deform_feature_vector(features):
+        values = []
+        for name in CAMERA_DEFORM_FEATURE_NAMES:
+            try:
+                value = float(features.get(name, 0.0))
+            except (TypeError, ValueError, AttributeError):
+                value = 0.0
+            if not np.isfinite(value):
+                value = 0.0
+            values.append(value)
+        return np.asarray(values, dtype=np.float64)
+
+    @staticmethod
+    def _fit_camera_deform_model(samples):
+        usable = []
+        for sample in samples:
+            try:
+                target_mm = float(sample["target_mm"])
+                features = sample["features"]
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not np.isfinite(target_mm):
+                continue
+            usable.append((AllInOneTesterGUI._camera_deform_feature_vector(features), max(0.0, target_mm)))
+        if len(usable) < 2:
+            return None
+        x_matrix = np.vstack([item[0] for item in usable])
+        y_vector = np.asarray([item[1] for item in usable], dtype=np.float64)
+        mean = np.mean(x_matrix, axis=0)
+        scale = np.std(x_matrix, axis=0)
+        scale = np.where(scale < 1e-6, 1.0, scale)
+        x_norm = (x_matrix - mean) / scale
+        design = np.column_stack([np.ones(x_norm.shape[0], dtype=np.float64), x_norm])
+        ridge = np.eye(design.shape[1], dtype=np.float64) * 1e-3
+        ridge[0, 0] = 0.0
+        try:
+            solution = np.linalg.solve((design.T @ design) + ridge, design.T @ y_vector)
+        except np.linalg.LinAlgError:
+            solution, *_ = np.linalg.lstsq(design, y_vector, rcond=None)
+        prediction = design @ solution
+        total = float(np.sum((y_vector - float(np.mean(y_vector))) ** 2))
+        residual = float(np.sum((y_vector - prediction) ** 2))
+        r2 = None if total <= 1e-9 else 1.0 - (residual / total)
+        return {
+            "feature_names": list(CAMERA_DEFORM_FEATURE_NAMES),
+            "intercept": float(solution[0]),
+            "coefficients": [float(value) for value in solution[1:]],
+            "mean": [float(value) for value in mean],
+            "scale": [float(value) for value in scale],
+            "sample_count": int(len(usable)),
+            "r2": None if r2 is None else float(r2),
+        }
+
+    def _predict_camera_deform_mm(self, features, model=None):
+        model = self.camera_deform_model if model is None else model
+        if not model:
+            return None
+        try:
+            if list(model.get("feature_names", [])) != list(CAMERA_DEFORM_FEATURE_NAMES):
+                return None
+            values = self._camera_deform_feature_vector(features)
+            mean = np.asarray(model["mean"], dtype=np.float64)
+            scale = np.asarray(model["scale"], dtype=np.float64)
+            coeffs = np.asarray(model["coefficients"], dtype=np.float64)
+            estimate = float(model["intercept"] + np.dot((values - mean) / scale, coeffs))
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not np.isfinite(estimate):
+            return None
+        return max(0.0, estimate)
+
+    def _refresh_camera_deform_calibration_readouts(self):
+        sample_count = len(getattr(self, "camera_deform_samples", []))
+        self._set_var(
+            self.camera_deform_sample_count_var,
+            f"{sample_count} sample{'s' if sample_count != 1 else ''}",
+        )
+        model = getattr(self, "camera_deform_model", None)
+        if model:
+            r2 = model.get("r2")
+            r2_text = "" if r2 is None else f" | R2 {float(r2):.3f}"
+            self._set_var(
+                self.camera_deform_model_var,
+                f"linear {int(model.get('sample_count', sample_count))} samples{r2_text}",
+            )
+        else:
+            self._set_var(self.camera_deform_model_var, "-")
+
+    def _load_camera_deform_calibration(self):
+        path = self._camera_deform_calibration_path()
+        if not path.exists():
+            return
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            samples = list(payload.get("samples", []))
+            model = payload.get("model")
+            if model and list(model.get("feature_names", [])) != list(CAMERA_DEFORM_FEATURE_NAMES):
+                model = None
+            if model is None and len(samples) >= 2:
+                model = self._fit_camera_deform_model(samples)
+        except Exception as exc:
+            self.log(f"Could not load camera deform calibration: {exc}")
+            return
+        with self.sensor_data_lock:
+            self.camera_deform_samples = samples
+            self.camera_deform_model = model
+        self._refresh_camera_deform_calibration_readouts()
+        if model:
+            self._set_var(self.camera_deform_status_var, "Loaded camera deform calibration.")
+        elif samples:
+            self._set_var(self.camera_deform_status_var, "Loaded deform samples. Fit calibration when ready.")
+
+    def _save_camera_deform_calibration(self):
+        with self.sensor_data_lock:
+            samples = list(self.camera_deform_samples)
+            model = self.camera_deform_model
+        payload = {
+            "model_type": "deform_mm = linear_ridge(pressure + dot/camera features)",
+            "feature_names": list(CAMERA_DEFORM_FEATURE_NAMES),
+            "model": model,
+            "samples": samples,
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        try:
+            with self._camera_deform_calibration_path().open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2)
+        except Exception as exc:
+            self.log(f"Could not save camera deform calibration: {exc}")
+
+    @staticmethod
+    def _camera_deform_capture_stats(buffer):
+        rows = []
+        for item in buffer:
+            features = item.get("features", item)
+            row = []
+            for name in CAMERA_DEFORM_FEATURE_NAMES:
+                try:
+                    value = float(features.get(name, 0.0))
+                except (TypeError, ValueError, AttributeError):
+                    value = 0.0
+                row.append(value if np.isfinite(value) else 0.0)
+            rows.append(row)
+        if not rows:
+            return None
+        matrix = np.asarray(rows, dtype=np.float64)
+        return {
+            "features": {
+                name: float(value)
+                for name, value in zip(CAMERA_DEFORM_FEATURE_NAMES, np.median(matrix, axis=0))
+            },
+            "feature_std": {
+                name: float(value)
+                for name, value in zip(CAMERA_DEFORM_FEATURE_NAMES, np.std(matrix, axis=0))
+            },
+            "feature_min": {
+                name: float(value)
+                for name, value in zip(CAMERA_DEFORM_FEATURE_NAMES, np.min(matrix, axis=0))
+            },
+            "feature_max": {
+                name: float(value)
+                for name, value in zip(CAMERA_DEFORM_FEATURE_NAMES, np.max(matrix, axis=0))
+            },
+        }
+
+    @staticmethod
+    def _camera_deform_capture_quality(features, feature_std, frame_count):
+        reasons = []
+        quality = "stable"
+        if frame_count < CAMERA_DEFORM_CAPTURE_MIN_FRAMES:
+            quality = "bad"
+            reasons.append("few frames")
+        if float(features.get("missing_ratio", 0.0)) > 0.45:
+            quality = "bad"
+            reasons.append("missing dots high")
+        elif float(features.get("missing_ratio", 0.0)) > 0.25:
+            quality = "noisy"
+            reasons.append("missing dots moderate")
+        if float(feature_std.get("pressure_delta_hpa", 0.0)) > 0.35:
+            quality = "noisy" if quality == "stable" else quality
+            reasons.append("pressure noisy")
+        if float(feature_std.get("dot_mean_px", 0.0)) > 0.35:
+            quality = "noisy" if quality == "stable" else quality
+            reasons.append("dot mean noisy")
+        if float(feature_std.get("dot_max_px", 0.0)) > 0.85:
+            quality = "noisy" if quality == "stable" else quality
+            reasons.append("dot peak noisy")
+        if float(feature_std.get("contact_peak", 0.0)) > 0.06:
+            quality = "noisy" if quality == "stable" else quality
+            reasons.append("contact intensity noisy")
+        return quality, reasons
+
+    def capture_camera_deform_sample(self):
+        try:
+            target_mm = float(self.camera_deform_known_mm_var.get())
+        except (TypeError, ValueError):
+            messagebox.showwarning("Camera Deform Calibration", "Enter a valid deform distance in mm.")
+            return
+        if target_mm < 0.0:
+            messagebox.showwarning("Camera Deform Calibration", "Deform distance must be 0 mm or greater.")
+            return
+        with self.sensor_data_lock:
+            features = None if self.camera_deform_latest_features is None else dict(self.camera_deform_latest_features)
+            capture_active = bool(self.camera_deform_capture_active)
+        if capture_active:
+            messagebox.showwarning("Camera Deform Calibration", "A deform sample capture is already running.")
+            return
+        if not self._is_blob_running():
+            messagebox.showwarning(
+                "Camera Deform Calibration",
+                "Start Live Detection before capturing a deform sample.",
+            )
+            return
+        if not features:
+            messagebox.showwarning(
+                "Camera Deform Calibration",
+                "Start Live Detection and wait for camera/pressure features before capturing.",
+            )
+            return
+
+        now = time.monotonic()
+        with self.sensor_data_lock:
+            self.camera_deform_capture_active = True
+            self.camera_deform_capture_target_mm = float(target_mm)
+            self.camera_deform_capture_started_at = now
+            self.camera_deform_capture_buffer = [{"t": now, "features": dict(features)}]
+        self._set_var(
+            self.camera_deform_status_var,
+            (
+                f"Capturing {CAMERA_DEFORM_CAPTURE_SECONDS:.1f}s sample for "
+                f"{target_mm:.3f} mm..."
+            ),
+        )
+        self.log(
+            f"Camera deform robust capture started: target={target_mm:.3f} mm, "
+            f"duration={CAMERA_DEFORM_CAPTURE_SECONDS:.1f}s."
+        )
+        self.root.after(
+            max(100, int(CAMERA_DEFORM_CAPTURE_SECONDS * 1000.0)),
+            self._finish_camera_deform_sample_capture,
+        )
+
+    def _finish_camera_deform_sample_capture(self):
+        with self.sensor_data_lock:
+            if not self.camera_deform_capture_active:
+                return
+            target_mm = self.camera_deform_capture_target_mm
+            started_at = self.camera_deform_capture_started_at
+            buffer = list(self.camera_deform_capture_buffer)
+            self.camera_deform_capture_active = False
+            self.camera_deform_capture_target_mm = None
+            self.camera_deform_capture_started_at = None
+            self.camera_deform_capture_buffer = []
+
+        stats = self._camera_deform_capture_stats(buffer)
+        frame_count = len(buffer)
+        if stats is None or frame_count < CAMERA_DEFORM_CAPTURE_MIN_FRAMES:
+            self._set_var(
+                self.camera_deform_status_var,
+                (
+                    f"Capture failed: only {frame_count} frame"
+                    f"{'s' if frame_count != 1 else ''}. Keep Live Detection running."
+                ),
+            )
+            self.log(f"Camera deform sample rejected: only {frame_count} capture frame(s).")
+            return
+
+        features = stats["features"]
+        feature_std = stats["feature_std"]
+        quality, reasons = self._camera_deform_capture_quality(features, feature_std, frame_count)
+        duration = 0.0 if started_at is None else max(0.0, time.monotonic() - float(started_at))
+        sample = {
+            "target_mm": float(target_mm),
+            "features": features,
+            "feature_std": feature_std,
+            "feature_min": stats["feature_min"],
+            "feature_max": stats["feature_max"],
+            "frame_count": int(frame_count),
+            "capture_seconds": float(duration),
+            "quality": quality,
+            "quality_notes": reasons,
+            "captured_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        with self.sensor_data_lock:
+            self.camera_deform_samples.append(sample)
+            count = len(self.camera_deform_samples)
+        self._refresh_camera_deform_calibration_readouts()
+        note = f" ({', '.join(reasons)})" if reasons else ""
+        self._set_var(
+            self.camera_deform_status_var,
+            f"Captured sample {count}: {quality}, {frame_count} frames{note}.",
+        )
+        self.log(
+            "Camera deform sample "
+            f"{count}: target={target_mm:.3f} mm, "
+            f"dP={sample['features']['pressure_delta_hpa']:+.2f} hPa, "
+            f"dot={sample['features']['dot_mean_px']:.3f}/{sample['features']['dot_max_px']:.3f} px, "
+            f"std dot={sample['feature_std']['dot_mean_px']:.3f}, "
+            f"quality={quality}."
+        )
+        if count >= 2:
+            self.fit_camera_deform_calibration(show_warning=False)
+        else:
+            self._save_camera_deform_calibration()
+
+    def fit_camera_deform_calibration(self, show_warning=True):
+        with self.sensor_data_lock:
+            samples = list(self.camera_deform_samples)
+        model = self._fit_camera_deform_model(samples)
+        if model is None:
+            if show_warning:
+                messagebox.showwarning(
+                    "Camera Deform Calibration",
+                    "Capture at least 2 deform samples before fitting.",
+                )
+            self._set_var(self.camera_deform_status_var, "Need at least 2 deform samples.")
+            return False
+        with self.sensor_data_lock:
+            self.camera_deform_model = model
+        self._refresh_camera_deform_calibration_readouts()
+        self._save_camera_deform_calibration()
+        r2 = model.get("r2")
+        r2_text = "" if r2 is None else f", R2={float(r2):.3f}"
+        self._set_var(
+            self.camera_deform_status_var,
+            f"Camera deform calibrated with {model['sample_count']} samples{r2_text}.",
+        )
+        self.log(f"Camera deform calibration fit with {model['sample_count']} samples{r2_text}.")
+        return True
+
+    def reset_camera_deform_calibration(self):
+        with self.sensor_data_lock:
+            self.camera_deform_samples.clear()
+            self.camera_deform_model = None
+            self.camera_deform_capture_active = False
+            self.camera_deform_capture_target_mm = None
+            self.camera_deform_capture_started_at = None
+            self.camera_deform_capture_buffer = []
+        self._refresh_camera_deform_calibration_readouts()
+        self._set_var(self.camera_deform_estimate_var, "-")
+        self._set_var(self.camera_deform_status_var, "Camera deform calibration reset.")
+        try:
+            self._camera_deform_calibration_path().unlink(missing_ok=True)
+        except Exception as exc:
+            self.log(f"Could not remove camera deform calibration: {exc}")
+        self.log("Camera deform calibration reset.")
+
+    def _update_camera_deform_live_features(
+        self,
+        *,
+        mean_disp,
+        max_disp,
+        missing_ratio,
+        contact_stats=None,
+        tactile_frame=None,
+        scale_px=None,
+        gate=None,
+    ):
+        with self.sensor_data_lock:
+            pressure = self.latest_pressure_hpa
+            contact_zero = getattr(self, "contact_pressure_zero_hpa", None)
+            force_zero = getattr(self, "force_pressure_zero_hpa", None)
+            model = self.camera_deform_model
+        if gate and gate.get("delta") is not None:
+            pressure_delta = float(gate["delta"])
+        elif pressure is not None and contact_zero is not None:
+            pressure_delta = float(pressure) - float(contact_zero)
+        elif pressure is not None and force_zero is not None:
+            pressure_delta = float(pressure) - float(force_zero)
+        elif pressure is not None:
+            pressure_delta = float(pressure) - FORCE_DEFAULT_PRESSURE_ZERO_HPA
+        else:
+            pressure_delta = 0.0
+        stats = contact_stats if contact_stats and contact_stats.get("ready") else {}
+        features = {
+            "pressure_delta_hpa": pressure_delta,
+            "dot_mean_px": float(mean_disp or 0.0),
+            "dot_max_px": float(max_disp or 0.0),
+            "missing_ratio": float(missing_ratio or 0.0),
+            "contact_peak": float(stats.get("peak", 0.0)),
+            "contact_top_mean": float(stats.get("top_mean", 0.0)),
+            "contact_area_ratio": float(stats.get("area_ratio", 0.0)),
+            "residual_mean_px": float(getattr(tactile_frame, "residual_mean_px", 0.0) or 0.0),
+            "residual_peak_px": float(getattr(tactile_frame, "residual_peak_px", 0.0) or 0.0),
+            "surface_scale_px": float(scale_px or 0.0),
+        }
+        with self.sensor_data_lock:
+            self.camera_deform_latest_features = dict(features)
+            if self.camera_deform_capture_active:
+                self.camera_deform_capture_buffer.append(
+                    {"t": time.monotonic(), "features": dict(features)}
+                )
+        self._set_var(
+            self.camera_deform_live_feature_var,
+            (
+                f"dP {features['pressure_delta_hpa']:+.2f} hPa | "
+                f"dot {features['dot_mean_px']:.2f}/{features['dot_max_px']:.2f} px | "
+                f"contact {features['contact_peak']:.3f}"
+            ),
+        )
+        estimate = self._predict_camera_deform_mm(features, model=model)
+        if estimate is None:
+            self._set_var(self.camera_deform_estimate_var, "-")
+        else:
+            self._set_var(self.camera_deform_estimate_var, f"{estimate:.2f} mm cal")
+            self._set_var(self.contact_depth_camera_var, f"{estimate:.2f} mm cal")
+
+    def _refresh_contact_depth_readouts(self, camera_depth_mm=None, update_camera=False):
+        self._set_var(self.stepper_position_var, f"{self.stepper_position_mm:.3f} mm")
+        if not STEPPER_DEPTH_ENABLED:
+            self._set_var(self.contact_depth_stepper_var, "unavailable (manual)")
+        else:
+            stepper_depth = self._stepper_contact_depth_mm()
+            if stepper_depth is None:
+                self._set_var(self.contact_depth_stepper_var, "-")
+            else:
+                self._set_var(self.contact_depth_stepper_var, f"{stepper_depth:.3f} mm")
+        if update_camera:
+            if camera_depth_mm is None:
+                self._set_var(self.contact_depth_camera_var, "-")
+            else:
+                self._set_var(self.contact_depth_camera_var, f"{camera_depth_mm:.2f} mm approx")
+
+    def _reset_pressure_contact_gate(self, source="manual"):
+        if not PRESSURE_CONTACT_GATE_ENABLED:
+            self._set_contact_gate_status("disabled")
+            return
+        with self.sensor_data_lock:
+            latest_pressure = self.latest_pressure_hpa
+            self.contact_pressure_zero_hpa = None
+            self.contact_pressure_noise_hpa = 0.0
+            self.contact_pressure_delta_hpa = None
+            self.contact_pressure_threshold_hpa = PRESSURE_CONTACT_MIN_DELTA_HPA
+            self.contact_pressure_is_contact = False
+            self.contact_pressure_state = "waiting_pressure"
+            self.contact_pressure_baseline_samples = []
+            self.contact_pressure_above_count = 0
+            self.contact_pressure_below_count = 0
+            self.contact_pressure_zero_request_sent = False
+            if latest_pressure is not None:
+                self.contact_pressure_baseline_samples.append(float(latest_pressure))
+                self.contact_pressure_state = "zeroing"
+        status = "zeroing pressure" if latest_pressure is not None else "waiting pressure"
+        self._set_contact_gate_status(status)
+        self.log(f"Pressure contact gate reset ({source}).")
+
+    @staticmethod
+    def _robust_pressure_noise(samples):
+        if not samples:
+            return 0.0
+        arr = np.asarray(samples, dtype=np.float32)
+        median = float(np.median(arr))
+        mad = float(np.median(np.abs(arr - median)))
+        return max(0.03, 1.4826 * mad)
+
+    def _pressure_contact_threshold(self, noise_hpa):
+        return max(
+            PRESSURE_CONTACT_MIN_DELTA_HPA,
+            float(noise_hpa) * PRESSURE_CONTACT_NOISE_SIGMA,
+        )
+
+    def _update_pressure_contact_gate(self, pressure_hpa):
+        if not PRESSURE_CONTACT_GATE_ENABLED:
+            self._set_contact_gate_status("disabled")
+            return
+
+        pressure = float(pressure_hpa)
+        request_camera_zero = False
+        log_message = None
+
+        with self.sensor_data_lock:
+            samples = self.contact_pressure_baseline_samples
+            if self.contact_pressure_zero_hpa is None:
+                samples.append(pressure)
+                max_samples = max(1, PRESSURE_CONTACT_BASELINE_SAMPLES)
+                if len(samples) < max_samples:
+                    self.contact_pressure_state = "zeroing"
+                    self.contact_pressure_delta_hpa = 0.0
+                    status = f"zeroing pressure {len(samples)}/{max_samples}"
+                else:
+                    recent = samples[-max_samples:]
+                    zero = float(np.median(np.asarray(recent, dtype=np.float32)))
+                    noise = self._robust_pressure_noise(recent)
+                    self.contact_pressure_zero_hpa = zero
+                    self.contact_pressure_noise_hpa = noise
+                    self.contact_pressure_threshold_hpa = self._pressure_contact_threshold(noise)
+                    self.contact_pressure_state = "not_touching"
+                    self.contact_pressure_delta_hpa = pressure - zero
+                    status = (
+                        f"not touching dP {self.contact_pressure_delta_hpa:+.2f} hPa "
+                        f"(thr {self.contact_pressure_threshold_hpa:.2f})"
+                    )
+                    log_message = f"Pressure contact zero set at {zero:.2f} hPa."
+            else:
+                zero = float(self.contact_pressure_zero_hpa)
+                delta = pressure - zero
+                noise = float(self.contact_pressure_noise_hpa)
+                threshold = self._pressure_contact_threshold(noise)
+                release_threshold = max(
+                    PRESSURE_CONTACT_RELEASE_DELTA_HPA,
+                    min(threshold * 0.65, threshold - 0.05),
+                )
+                self.contact_pressure_delta_hpa = delta
+                self.contact_pressure_threshold_hpa = threshold
+
+                if self.contact_pressure_is_contact:
+                    if delta <= release_threshold:
+                        self.contact_pressure_below_count += 1
+                    else:
+                        self.contact_pressure_below_count = 0
+
+                    if self.contact_pressure_below_count >= max(1, PRESSURE_CONTACT_RELEASE_SAMPLES):
+                        self.contact_pressure_is_contact = False
+                        self.contact_pressure_state = "not_touching"
+                        self.contact_pressure_zero_request_sent = False
+                        self.contact_pressure_below_count = 0
+                        self.contact_pressure_above_count = 0
+                        self.contact_pressure_zero_hpa = pressure
+                        self.contact_pressure_baseline_samples = [pressure]
+                        self.contact_pressure_delta_hpa = 0.0
+                        status = "not touching dP +0.00 hPa"
+                        log_message = "Pressure contact released; camera contact held at zero."
+                    else:
+                        self.contact_pressure_state = "contact"
+                        status = f"CONTACT dP {delta:+.2f} hPa"
+                else:
+                    if delta >= threshold:
+                        self.contact_pressure_above_count += 1
+                    else:
+                        self.contact_pressure_above_count = 0
+
+                    if self.contact_pressure_above_count >= max(1, PRESSURE_CONTACT_CONFIRM_SAMPLES):
+                        self.contact_pressure_is_contact = True
+                        self.contact_pressure_state = "contact"
+                        self.contact_pressure_below_count = 0
+                        status = f"CONTACT dP {delta:+.2f} hPa"
+                        if not self.contact_pressure_zero_request_sent:
+                            self.contact_pressure_zero_request_sent = True
+                            request_camera_zero = True
+                            log_message = (
+                                "Pressure contact detected; capturing camera zero at first contact "
+                                f"(dP={delta:+.2f} hPa)."
+                            )
+                    else:
+                        self.contact_pressure_state = "not_touching"
+                        if delta < threshold * 0.45:
+                            alpha = 0.025
+                            self.contact_pressure_zero_hpa = (zero * (1.0 - alpha)) + (pressure * alpha)
+                            samples.append(pressure)
+                            keep = max(8, PRESSURE_CONTACT_BASELINE_SAMPLES * 4)
+                            if len(samples) > keep:
+                                del samples[:-keep]
+                            self.contact_pressure_noise_hpa = self._robust_pressure_noise(samples)
+                        status = f"not touching dP {delta:+.2f} hPa (thr {threshold:.2f})"
+
+        self._set_contact_gate_status(status)
+        if log_message:
+            self.log(log_message)
+        if request_camera_zero:
+            self.surface_reset_zero_event.set()
+
+    def _pressure_contact_gate_snapshot(self):
+        if not PRESSURE_CONTACT_GATE_ENABLED:
+            return {
+                "enabled": False,
+                "ready": True,
+                "contact": True,
+                "pressure": None,
+                "zero": None,
+                "delta": None,
+                "threshold": None,
+                "status": "disabled",
+                "state": "disabled",
+            }
+        with self.sensor_data_lock:
+            pressure = self.latest_pressure_hpa
+            zero = self.contact_pressure_zero_hpa
+            delta = self.contact_pressure_delta_hpa
+            threshold = self.contact_pressure_threshold_hpa
+            state = self.contact_pressure_state
+            contact = self.contact_pressure_is_contact
+            samples = len(self.contact_pressure_baseline_samples)
+        ready = pressure is not None and zero is not None
+        if pressure is None:
+            status = "waiting pressure"
+        elif not ready:
+            status = f"zeroing pressure {samples}/{max(1, PRESSURE_CONTACT_BASELINE_SAMPLES)}"
+        elif contact:
+            status = f"CONTACT dP {float(delta or 0.0):+.2f} hPa"
+        else:
+            status = (
+                f"not touching dP {float(delta or 0.0):+.2f} hPa "
+                f"(thr {float(threshold or PRESSURE_CONTACT_MIN_DELTA_HPA):.2f})"
+            )
+        return {
+            "enabled": True,
+            "ready": ready,
+            "contact": bool(contact and ready),
+            "pressure": pressure,
+            "zero": zero,
+            "delta": delta,
+            "threshold": threshold,
+            "status": status,
+            "state": state,
+        }
 
     def _set_system_status(self, value):
         if hasattr(self, "system_status_var"):
@@ -3184,6 +3930,7 @@ class AllInOneTesterGUI:
         return None
 
     def _run_native_stepper(self, runner_path, direction_state, seconds):
+        started_at = time.perf_counter()
         chip_name = os.environ.get("PI_BUBBLE_GPIO_CHIP", "gpiochip0")
         command = [
             runner_path,
@@ -3221,21 +3968,26 @@ class AllInOneTesterGUI:
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=1.0)
-                return True
+                return True, time.perf_counter() - started_at
             time.sleep(0.02)
 
         _stdout, stderr = process.communicate()
         if process.returncode != 0:
             message = stderr.strip() or f"stepper_runner exited with code {process.returncode}"
             raise RuntimeError(message)
-        return False
+        return False, time.perf_counter() - started_at
 
     def _stepper_worker(self, direction_name, direction_state, seconds, native_runner=None):
         try:
             if native_runner is not None:
                 try:
                     self.log(f"Native stepper runner active: {native_runner}")
-                    stopped = self._run_native_stepper(native_runner, direction_state, seconds)
+                    stopped, elapsed_seconds = self._run_native_stepper(
+                        native_runner,
+                        direction_state,
+                        seconds,
+                    )
+                    self._apply_stepper_motion(direction_name, elapsed_seconds=elapsed_seconds)
                     if stopped or self.stepper_stop_event.is_set():
                         self.log("Stepper movement stopped by user.")
                     else:
@@ -3256,11 +4008,15 @@ class AllInOneTesterGUI:
             time.sleep(0.002)
 
             end_time = time.perf_counter() + seconds
+            pulse_count = 0
             while time.perf_counter() < end_time and not self.stepper_stop_event.is_set():
                 GPIO.output(STEPPER_PUL_PIN, GPIO_HIGH)
                 time.sleep(STEPPER_PULSE_DELAY)
                 GPIO.output(STEPPER_PUL_PIN, GPIO_LOW)
                 time.sleep(STEPPER_PULSE_DELAY)
+                pulse_count += 1
+
+            self._apply_stepper_motion(direction_name, pulses=pulse_count)
 
             if self.stepper_stop_event.is_set():
                 self.log("Stepper movement stopped by user.")
@@ -3420,16 +4176,46 @@ class AllInOneTesterGUI:
             self.sensor_data_lock = threading.Lock()
             self.latest_pressure_hpa = None
             self.latest_loadcell_kg = None
-            self.force_pressure_zero_hpa = None
+            self.latest_loadcell_force_n = None
+            self.latest_pressure_force_n = None
+            self.force_pressure_zero_hpa = FORCE_DEFAULT_PRESSURE_ZERO_HPA
             self.force_calibration_samples = []
             self.force_calibration_coeffs = None
+            self.contact_pressure_zero_hpa = None
+            self.contact_pressure_noise_hpa = 0.0
+            self.contact_pressure_delta_hpa = None
+            self.contact_pressure_threshold_hpa = PRESSURE_CONTACT_MIN_DELTA_HPA
+            self.contact_pressure_is_contact = False
+            self.contact_pressure_state = "waiting_pressure"
+            self.contact_pressure_baseline_samples = []
+            self.contact_pressure_above_count = 0
+            self.contact_pressure_below_count = 0
+            self.contact_pressure_zero_request_sent = False
 
+        if not hasattr(self, "latest_loadcell_force_n"):
+            self.latest_loadcell_force_n = None
+        if not hasattr(self, "latest_pressure_force_n"):
+            self.latest_pressure_force_n = None
         if not hasattr(self, "force_pressure_zero_hpa"):
-            self.force_pressure_zero_hpa = None
+            self.force_pressure_zero_hpa = FORCE_DEFAULT_PRESSURE_ZERO_HPA
+        if not hasattr(self, "contact_pressure_zero_hpa"):
+            self.contact_pressure_zero_hpa = None
+            self.contact_pressure_noise_hpa = 0.0
+            self.contact_pressure_delta_hpa = None
+            self.contact_pressure_threshold_hpa = PRESSURE_CONTACT_MIN_DELTA_HPA
+            self.contact_pressure_is_contact = False
+            self.contact_pressure_state = "waiting_pressure"
+            self.contact_pressure_baseline_samples = []
+            self.contact_pressure_above_count = 0
+            self.contact_pressure_below_count = 0
+            self.contact_pressure_zero_request_sent = False
+        if not hasattr(self, "force_graph_history"):
+            self.force_graph_history = []
+            self.force_graph_redraw_pending = False
 
         if not hasattr(self, "force_estimate_var"):
             self.force_estimate_var = tk.StringVar(value="-")
-            self.force_pressure_zero_var = tk.StringVar(value="-")
+            self.force_pressure_zero_var = tk.StringVar(value=f"{FORCE_DEFAULT_PRESSURE_ZERO_HPA:.2f} hPa")
             self.force_calibration_status_var = tk.StringVar(value="Set pressure zero, then capture 2+ bubble samples.")
             self.force_calibration_sample_count_var = tk.StringVar(value="0 samples")
             self.force_calibration_model_var = tk.StringVar(value="F = a*dP + b")
@@ -3466,8 +4252,7 @@ class AllInOneTesterGUI:
         zero = float(pressure_hpa)
         with self.sensor_data_lock:
             self.force_pressure_zero_hpa = zero
-            if hasattr(self, "latest_pressure_force_n"):
-                self.latest_pressure_force_n = None
+            self.latest_pressure_force_n = None
             if hasattr(self, "force_graph_history"):
                 self.force_graph_history.clear()
         self._refresh_force_pressure_zero()
@@ -3488,10 +4273,8 @@ class AllInOneTesterGUI:
             return False
         ok = self._set_force_pressure_zero(pressure, source="manual")
         self._update_force_estimate()
-        if hasattr(self, "_append_force_graph_sample"):
-            self._append_force_graph_sample()
-        if hasattr(self, "_request_force_graph_redraw"):
-            self._request_force_graph_redraw()
+        self._append_force_graph_sample()
+        self._request_force_graph_redraw()
         return ok
 
     def _load_force_calibration(self):
@@ -3528,7 +4311,10 @@ class AllInOneTesterGUI:
         count = len(samples)
         self.force_calibration_sample_count_var.set(f"{count} sample{'s' if count != 1 else ''}")
         self.force_calibration_model_var.set(self._format_force_model(slope, intercept))
-        self.force_calibration_status_var.set("Loaded saved bubble calibration. Set pressure zero before measuring.")
+        self.force_calibration_status_var.set(
+            f"Loaded saved bubble calibration. Pressure zero default {FORCE_DEFAULT_PRESSURE_ZERO_HPA:.2f} hPa."
+        )
+        self._request_force_graph_redraw()
 
     def _save_force_calibration(self):
         with self.sensor_data_lock:
@@ -3559,35 +4345,66 @@ class AllInOneTesterGUI:
     def _build_force_calibration_panel(self, parent):
         self._init_force_calibration_state()
         parent.columnconfigure(1, weight=1)
+        value_wrap = 280
 
         ttk.Label(parent, text="Live pair:").grid(row=0, column=0, sticky="w")
-        ttk.Label(parent, textvariable=self.force_calibration_live_pair_var).grid(
-            row=0, column=1, sticky="w"
+        ttk.Label(
+            parent,
+            textvariable=self.force_calibration_live_pair_var,
+            wraplength=value_wrap,
+            justify="left",
+        ).grid(
+            row=0, column=1, sticky="ew"
         )
 
         ttk.Label(parent, text="Estimated force:").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        ttk.Label(parent, textvariable=self.force_estimate_var).grid(
-            row=1, column=1, sticky="w", pady=(8, 0)
+        ttk.Label(
+            parent,
+            textvariable=self.force_estimate_var,
+            wraplength=value_wrap,
+            justify="left",
+        ).grid(
+            row=1, column=1, sticky="ew", pady=(8, 0)
         )
 
         ttk.Label(parent, text="Pressure zero:").grid(row=2, column=0, sticky="w", pady=(8, 0))
-        ttk.Label(parent, textvariable=self.force_pressure_zero_var).grid(
-            row=2, column=1, sticky="w", pady=(8, 0)
+        ttk.Label(
+            parent,
+            textvariable=self.force_pressure_zero_var,
+            wraplength=value_wrap,
+            justify="left",
+        ).grid(
+            row=2, column=1, sticky="ew", pady=(8, 0)
         )
 
         ttk.Label(parent, text="Samples:").grid(row=3, column=0, sticky="w", pady=(8, 0))
-        ttk.Label(parent, textvariable=self.force_calibration_sample_count_var).grid(
-            row=3, column=1, sticky="w", pady=(8, 0)
+        ttk.Label(
+            parent,
+            textvariable=self.force_calibration_sample_count_var,
+            wraplength=value_wrap,
+            justify="left",
+        ).grid(
+            row=3, column=1, sticky="ew", pady=(8, 0)
         )
 
         ttk.Label(parent, text="Model:").grid(row=4, column=0, sticky="w", pady=(8, 0))
-        ttk.Label(parent, textvariable=self.force_calibration_model_var).grid(
-            row=4, column=1, sticky="w", pady=(8, 0)
+        ttk.Label(
+            parent,
+            textvariable=self.force_calibration_model_var,
+            wraplength=value_wrap,
+            justify="left",
+        ).grid(
+            row=4, column=1, sticky="ew", pady=(8, 0)
         )
 
         ttk.Label(parent, text="Status:").grid(row=5, column=0, sticky="w", pady=(8, 0))
-        ttk.Label(parent, textvariable=self.force_calibration_status_var).grid(
-            row=5, column=1, sticky="w", pady=(8, 0)
+        ttk.Label(
+            parent,
+            textvariable=self.force_calibration_status_var,
+            wraplength=value_wrap,
+            justify="left",
+        ).grid(
+            row=5, column=1, sticky="ew", pady=(8, 0)
         )
 
         actions = ttk.Frame(parent)
@@ -3625,14 +4442,18 @@ class AllInOneTesterGUI:
                 "Pressure zero captured. Press bubble into load cell.",
             )
             self.log(f"Force pressure zero auto-captured at {pressure:.2f} hPa.")
+        self._update_pressure_contact_gate(pressure)
         self._refresh_force_live_pair()
         self._update_force_estimate()
+        self._append_force_graph_sample()
 
     def _record_loadcell_reading(self, weight_kg):
         with self.sensor_data_lock:
             self.latest_loadcell_kg = float(weight_kg)
+            self.latest_loadcell_force_n = float(weight_kg) * FORCE_GRAVITY_MPS2
         self._refresh_force_live_pair()
         self._update_force_estimate()
+        self._append_force_graph_sample()
 
     def _refresh_force_live_pair(self):
         if not hasattr(self, "force_calibration_live_pair_var"):
@@ -3662,13 +4483,404 @@ class AllInOneTesterGUI:
         pressure_delta = self._pressure_delta_from_zero(pressure, zero)
 
         if pressure_delta is None or coeffs is None:
+            with self.sensor_data_lock:
+                self.latest_pressure_force_n = None
             self._set_var(self.force_estimate_var, "-")
             return
 
         slope, intercept = coeffs
         estimated_force = (slope * pressure_delta) + intercept
+        with self.sensor_data_lock:
+            self.latest_pressure_force_n = float(estimated_force)
         estimated_load_kg = float(estimated_force) / FORCE_GRAVITY_MPS2
         self._set_var(self.force_estimate_var, f"{estimated_load_kg:.4f} kg")
+
+    def _append_force_graph_sample(self):
+        now = time.monotonic()
+        with self.sensor_data_lock:
+            load_force = self.latest_loadcell_force_n
+            pressure_force = self.latest_pressure_force_n
+            pressure_hpa = self.latest_pressure_hpa
+
+            if load_force is None and pressure_force is None and pressure_hpa is None:
+                return
+
+            self.force_graph_history.append(
+                (
+                    now,
+                    None if load_force is None else float(load_force),
+                    None if pressure_force is None else float(pressure_force),
+                    None if pressure_hpa is None else float(pressure_hpa),
+                )
+            )
+
+            cutoff = now - FORCE_GRAPH_HISTORY_SECONDS
+            self.force_graph_history = [
+                point for point in self.force_graph_history if point[0] >= cutoff
+            ]
+            if len(self.force_graph_history) > FORCE_GRAPH_MAX_POINTS:
+                del self.force_graph_history[:-FORCE_GRAPH_MAX_POINTS]
+
+        self._request_force_graph_redraw()
+
+    def _request_force_graph_redraw(self):
+        if not self.root.winfo_exists():
+            return
+        if not hasattr(self, "force_compare_canvas"):
+            return
+        if not hasattr(self, "force_error_canvas"):
+            return
+        if getattr(self, "force_graph_redraw_pending", False):
+            return
+
+        self.force_graph_redraw_pending = True
+
+        def redraw():
+            self.force_graph_redraw_pending = False
+            self._draw_force_graphs()
+
+        self.root.after(80, redraw)
+
+    @staticmethod
+    def _finite_number(value):
+        return isinstance(value, (int, float)) and bool(np.isfinite(float(value)))
+
+    @staticmethod
+    def _graph_bounds(values, include_zero=True):
+        finite_values = [float(value) for value in values if AllInOneTesterGUI._finite_number(value)]
+        if not finite_values:
+            return 0.0, 1.0
+
+        min_value = min(finite_values)
+        max_value = max(finite_values)
+        if include_zero:
+            min_value = min(0.0, min_value)
+            max_value = max(0.0, max_value)
+        if abs(max_value - min_value) < 1e-9:
+            pad = max(1.0, abs(max_value) * 0.1)
+        else:
+            pad = (max_value - min_value) * 0.12
+        return min_value - pad, max_value + pad
+
+    def _draw_force_graphs(self):
+        if not self.root.winfo_exists():
+            return
+        if not hasattr(self, "force_compare_canvas"):
+            return
+        if not hasattr(self, "force_error_canvas"):
+            return
+
+        self._draw_force_time_graph(self.force_compare_canvas)
+        self._draw_force_error_graph(self.force_error_canvas)
+
+    def _prepare_graph_canvas(self, canvas, title, x_label, y_label):
+        width = max(1, int(canvas.winfo_width()))
+        height = max(1, int(canvas.winfo_height()))
+        canvas.delete("all")
+        canvas.create_rectangle(0, 0, width, height, fill="#f9fbfc", outline="")
+
+        left = 48
+        right = max(left + 20, width - 12)
+        top = 28
+        bottom = max(top + 20, height - 28)
+        plot_width = max(1, right - left)
+        plot_height = max(1, bottom - top)
+
+        canvas.create_text(
+            10,
+            8,
+            text=title,
+            anchor="nw",
+            fill=COLOR_TEXT,
+            font=("Segoe UI", 9, "bold"),
+        )
+        canvas.create_text(
+            (left + right) / 2,
+            height - 5,
+            text=x_label,
+            anchor="s",
+            fill=COLOR_MUTED,
+            font=("Segoe UI", 8),
+        )
+        canvas.create_text(
+            6,
+            (top + bottom) / 2,
+            text=y_label,
+            anchor="w",
+            fill=COLOR_MUTED,
+            font=("Segoe UI", 8),
+        )
+        canvas.create_rectangle(left, top, right, bottom, outline=COLOR_BORDER)
+        return width, height, left, top, right, bottom, plot_width, plot_height
+
+    def _draw_empty_graph(self, canvas, title, message):
+        width, height, *_ = self._prepare_graph_canvas(canvas, title, "", "")
+        canvas.create_text(
+            width / 2,
+            height / 2,
+            text=message,
+            anchor="center",
+            fill=COLOR_MUTED,
+            font=("Segoe UI", 9),
+        )
+
+    def _draw_force_time_graph(self, canvas):
+        with self.sensor_data_lock:
+            history = list(self.force_graph_history)
+
+        if not history:
+            self._draw_empty_graph(
+                canvas,
+                "Load comparison",
+                "Waiting for load cell / pressure data",
+            )
+            return
+
+        (
+            _width,
+            _height,
+            left,
+            top,
+            right,
+            bottom,
+            plot_width,
+            plot_height,
+        ) = self._prepare_graph_canvas(
+            canvas,
+            "Load comparison",
+            f"last {int(FORCE_GRAPH_HISTORY_SECONDS)} s",
+            "kg",
+        )
+
+        now = max(point[0] for point in history)
+        x_min = now - FORCE_GRAPH_HISTORY_SECONDS
+        x_max = now
+        y_values = []
+        for _timestamp, load_force, pressure_force, _pressure_hpa in history:
+            if self._finite_number(load_force):
+                y_values.append(float(load_force) / FORCE_GRAVITY_MPS2)
+            if self._finite_number(pressure_force):
+                y_values.append(float(pressure_force) / FORCE_GRAVITY_MPS2)
+
+        if not y_values:
+            canvas.create_text(
+                (left + right) / 2,
+                (top + bottom) / 2,
+                text="Waiting for force calibration",
+                anchor="center",
+                fill=COLOR_MUTED,
+                font=("Segoe UI", 9),
+            )
+            return
+
+        y_min, y_max = self._graph_bounds(y_values, include_zero=True)
+
+        def x_for(timestamp):
+            ratio = (float(timestamp) - x_min) / max(1e-9, x_max - x_min)
+            return left + (np.clip(ratio, 0.0, 1.0) * plot_width)
+
+        def y_for(value):
+            ratio = (float(value) - y_min) / max(1e-9, y_max - y_min)
+            return bottom - (np.clip(ratio, 0.0, 1.0) * plot_height)
+
+        for idx in range(4):
+            ratio = idx / 3.0
+            y = top + (ratio * plot_height)
+            value = y_max - (ratio * (y_max - y_min))
+            canvas.create_line(left, y, right, y, fill="#e1e8ea")
+            canvas.create_text(
+                left - 5,
+                y,
+                text=f"{value:.1f}",
+                anchor="e",
+                fill=COLOR_MUTED,
+                font=("Segoe UI", 7),
+            )
+
+        for idx in range(3):
+            ratio = idx / 2.0
+            x = left + (ratio * plot_width)
+            seconds_ago = int(round((1.0 - ratio) * FORCE_GRAPH_HISTORY_SECONDS))
+            label = "now" if seconds_ago == 0 else f"-{seconds_ago}s"
+            canvas.create_line(x, top, x, bottom, fill="#edf2f3")
+            canvas.create_text(
+                x,
+                bottom + 4,
+                text=label,
+                anchor="n",
+                fill=COLOR_MUTED,
+                font=("Segoe UI", 7),
+            )
+
+        def draw_series(value_index, color, dash=None):
+            coords = []
+            last_point = None
+            for point in history:
+                value = point[value_index]
+                if not self._finite_number(value):
+                    if len(coords) >= 4:
+                        canvas.create_line(*coords, fill=color, width=2, smooth=True, dash=dash)
+                    coords = []
+                    continue
+                value = float(value) / FORCE_GRAVITY_MPS2
+                x = x_for(point[0])
+                y = y_for(value)
+                coords.extend((x, y))
+                last_point = (x, y)
+            if len(coords) >= 4:
+                canvas.create_line(*coords, fill=color, width=2, smooth=True, dash=dash)
+            if last_point is not None:
+                x, y = last_point
+                canvas.create_oval(x - 3, y - 3, x + 3, y + 3, fill=color, outline=color)
+
+        load_color = COLOR_OK
+        pressure_color = COLOR_WARN
+        draw_series(1, load_color)
+        draw_series(2, pressure_color, dash=(4, 2))
+
+        legend_y = top - 9
+        canvas.create_line(right - 150, legend_y, right - 132, legend_y, fill=load_color, width=2)
+        canvas.create_text(
+            right - 128,
+            legend_y,
+            text="load cell kg",
+            anchor="w",
+            fill=COLOR_MUTED,
+            font=("Segoe UI", 7),
+        )
+        canvas.create_line(
+            right - 80,
+            legend_y,
+            right - 62,
+            legend_y,
+            fill=pressure_color,
+            width=2,
+            dash=(4, 2),
+        )
+        canvas.create_text(
+            right - 58,
+            legend_y,
+            text="pressure kg-eq",
+            anchor="w",
+            fill=COLOR_MUTED,
+            font=("Segoe UI", 7),
+        )
+
+    def _draw_force_error_graph(self, canvas):
+        with self.sensor_data_lock:
+            history = list(self.force_graph_history)
+
+        error_points = []
+        for timestamp, load_force, pressure_force, _pressure_hpa in history:
+            if self._finite_number(load_force) and self._finite_number(pressure_force):
+                error_points.append(
+                    (
+                        float(timestamp),
+                        (float(pressure_force) - float(load_force)) / FORCE_GRAVITY_MPS2,
+                    )
+                )
+
+        if not error_points:
+            self._draw_empty_graph(
+                canvas,
+                "Force error",
+                "Waiting for both force lines",
+            )
+            return
+
+        (
+            _width,
+            _height,
+            left,
+            top,
+            right,
+            bottom,
+            plot_width,
+            plot_height,
+        ) = self._prepare_graph_canvas(
+            canvas,
+            "Load error (pressure kg-eq - load cell kg)",
+            f"last {int(FORCE_GRAPH_HISTORY_SECONDS)} s",
+            "kg",
+        )
+
+        now = max(point[0] for point in history) if history else error_points[-1][0]
+        x_min = now - FORCE_GRAPH_HISTORY_SECONDS
+        x_max = now
+        y_min, y_max = self._graph_bounds([point[1] for point in error_points], include_zero=True)
+
+        def x_for(timestamp):
+            ratio = (float(timestamp) - x_min) / max(1e-9, x_max - x_min)
+            return left + (np.clip(ratio, 0.0, 1.0) * plot_width)
+
+        def y_for(value):
+            ratio = (float(value) - y_min) / max(1e-9, y_max - y_min)
+            return bottom - (np.clip(ratio, 0.0, 1.0) * plot_height)
+
+        for idx in range(4):
+            ratio = idx / 3.0
+            y = top + (ratio * plot_height)
+            value = y_max - (ratio * (y_max - y_min))
+            canvas.create_line(left, y, right, y, fill="#e1e8ea")
+            canvas.create_text(
+                left - 5,
+                y,
+                text=f"{value:.1f}",
+                anchor="e",
+                fill=COLOR_MUTED,
+                font=("Segoe UI", 7),
+            )
+
+        for idx in range(3):
+            ratio = idx / 2.0
+            x = left + (ratio * plot_width)
+            seconds_ago = int(round((1.0 - ratio) * FORCE_GRAPH_HISTORY_SECONDS))
+            label = "now" if seconds_ago == 0 else f"-{seconds_ago}s"
+            canvas.create_line(x, top, x, bottom, fill="#edf2f3")
+            canvas.create_text(
+                x,
+                bottom + 4,
+                text=label,
+                anchor="n",
+                fill=COLOR_MUTED,
+                font=("Segoe UI", 7),
+            )
+
+        zero_y = y_for(0.0)
+        canvas.create_line(left, zero_y, right, zero_y, fill=COLOR_ACCENT, width=1, dash=(3, 2))
+
+        error_color = "#a34b2a"
+        coords = []
+        last_point = None
+        for timestamp, error_n in error_points:
+            x = x_for(timestamp)
+            y = y_for(error_n)
+            coords.extend((x, y))
+            last_point = (x, y, error_n)
+        if len(coords) >= 4:
+            canvas.create_line(*coords, fill=error_color, width=2, smooth=True)
+        if last_point is not None:
+            x, y, error_n = last_point
+            canvas.create_oval(x - 3, y - 3, x + 3, y + 3, fill=error_color, outline=error_color)
+            canvas.create_text(
+                right - 6,
+                top + 4,
+                text=f"latest {error_n:+.3f} kg | abs {abs(error_n):.3f} kg",
+                anchor="ne",
+                fill=COLOR_MUTED,
+                font=("Segoe UI", 7),
+            )
+
+        legend_y = top - 9
+        canvas.create_line(right - 160, legend_y, right - 142, legend_y, fill=error_color, width=2)
+        canvas.create_text(
+            right - 138,
+            legend_y,
+            text="pressure kg-eq - load kg",
+            anchor="w",
+            fill=COLOR_MUTED,
+            font=("Segoe UI", 7),
+        )
 
     def add_force_calibration_sample(self):
         with self.sensor_data_lock:
@@ -3755,17 +4967,17 @@ class AllInOneTesterGUI:
         self.log(f"Force calibration fit: F(N) = {slope:.6f} * dP(hPa) + {intercept:.3f}.")
         self._save_force_calibration()
         self._update_force_estimate()
+        self._request_force_graph_redraw()
         return True
 
     def reset_force_bubble_samples(self):
         with self.sensor_data_lock:
             self.force_calibration_samples.clear()
             self.force_calibration_coeffs = None
-            zero = self.force_pressure_zero_hpa
-            if hasattr(self, "latest_pressure_force_n"):
-                self.latest_pressure_force_n = None
+            self.latest_pressure_force_n = None
             if hasattr(self, "force_graph_history"):
                 self.force_graph_history.clear()
+            zero = self.force_pressure_zero_hpa
 
         self.force_calibration_sample_count_var.set("0 samples")
         self.force_calibration_model_var.set("F = a*dP + b")
@@ -3781,17 +4993,14 @@ class AllInOneTesterGUI:
         except Exception as exc:
             self.log(f"Could not remove saved force calibration: {exc}")
         self.log("Bubble force calibration samples reset.")
-        if hasattr(self, "_request_force_graph_redraw"):
-            self._request_force_graph_redraw()
+        self._request_force_graph_redraw()
 
     def clear_force_calibration(self):
         with self.sensor_data_lock:
             self.force_calibration_samples.clear()
             self.force_calibration_coeffs = None
-            pressure = self.latest_pressure_hpa
-            self.force_pressure_zero_hpa = None if pressure is None else float(pressure)
-            if hasattr(self, "latest_pressure_force_n"):
-                self.latest_pressure_force_n = None
+            self.latest_pressure_force_n = None
+            self.force_pressure_zero_hpa = FORCE_DEFAULT_PRESSURE_ZERO_HPA
             if hasattr(self, "force_graph_history"):
                 self.force_graph_history.clear()
         self.force_calibration_sample_count_var.set("0 samples")
@@ -3799,15 +5008,15 @@ class AllInOneTesterGUI:
         self.force_estimate_var.set("-")
         self._refresh_force_pressure_zero()
         self._refresh_force_live_pair()
-        if pressure is None:
-            self.force_calibration_status_var.set("Calibration cleared. Waiting for pressure zero.")
-        else:
-            self.force_calibration_status_var.set("Calibration cleared. Pressure zero reset.")
+        self.force_calibration_status_var.set(
+            f"Calibration cleared. Pressure zero reset to {FORCE_DEFAULT_PRESSURE_ZERO_HPA:.2f} hPa."
+        )
         try:
             self._force_calibration_path().unlink(missing_ok=True)
         except Exception as exc:
             self.log(f"Could not remove saved force calibration: {exc}")
         self.log("Force calibration cleared.")
+        self._request_force_graph_redraw()
 
     def _load_hx711_class(self):
         base_path = Path(__file__).resolve().parent
@@ -4038,6 +5247,9 @@ class AllInOneTesterGUI:
         self.blob_preview_label.configure(image="", text="Starting preview...")
         self.blob_reset_reference_event.clear()
         self._reset_contact_deform_zero_state("Contact deform zero pending. Press Reset Zero.")
+        self._reset_pressure_contact_gate("live detection start")
+        if PRESSURE_CONTACT_GATE_ENABLED and not self._is_thread_running(self.pressure_thread):
+            self.start_pressure_read()
 
         self.blob_thread = threading.Thread(target=self._blob_worker, daemon=True)
         self.blob_thread.start()
@@ -4185,6 +5397,8 @@ class AllInOneTesterGUI:
                     self.surface_height_ema = None
                     self.surface_reference_height_map = None
                     self.surface_contact_ema = None
+                    self.surface_contact_baseline = None
+                    self.surface_contact_display_ema = None
                     self.surface_zero_ready = False
                     contact_zero_pending = False
                     contact_zero_ready = False
@@ -4208,6 +5422,8 @@ class AllInOneTesterGUI:
                     self.surface_height_ema = None
                     self.surface_reference_height_map = None
                     self.surface_contact_ema = None
+                    self.surface_contact_baseline = None
+                    self.surface_contact_display_ema = None
                     self.surface_zero_ready = False
                     contact_zero_pending = False
                     contact_zero_ready = False
@@ -4225,6 +5441,8 @@ class AllInOneTesterGUI:
                         self.surface_reset_zero_event.clear()
                         self.surface_reference_height_map = None
                         self.surface_contact_ema = None
+                        self.surface_contact_baseline = None
+                        self.surface_contact_display_ema = None
                         self.surface_zero_ready = False
                         contact_zero_pending = True
                         contact_zero_ready = False
@@ -4281,6 +5499,10 @@ class AllInOneTesterGUI:
                 vector_vis = None
                 heatmap_vis = None
                 pointcloud_vis = None
+                deform_contact_stats = None
+                deform_tactile_frame = None
+                deform_surface_scale = None
+                deform_gate = None
 
                 if display_mode in {"blob", "vector", "overlay", "mosaic"}:
                     blob_vis = pipe.build_blob_view(binary, frame_bgr)
@@ -4415,35 +5637,99 @@ class AllInOneTesterGUI:
                             )
 
                             if height_map is not None:
-                                if contact_zero_active:
-                                    contact_zero_samples.append(height_map.astype(np.float32).copy())
-                                    if len(contact_zero_samples) >= CONTACT_ZERO_SAMPLE_COUNT:
-                                        self.surface_reference_height_map = np.median(
-                                            np.stack(contact_zero_samples[-CONTACT_ZERO_SAMPLE_COUNT:], axis=0),
-                                            axis=0,
-                                        ).astype(np.float32)
-                                        self.surface_contact_ema = np.zeros_like(height_map, dtype=np.float32)
-                                        contact_zero_samples.clear()
+                                tactile_frame = self.surface_tactile_frame
+                                tactile_config = self._build_tactile_contact_config(params)
+                                raw_contact_map = (
+                                    tactile_frame.contact_map
+                                    if tactile_frame is not None
+                                    else None
+                                )
+                                base_map = tactile_frame.base_map if tactile_frame is not None else None
+                                contact_stats = None
+                                gate = self._pressure_contact_gate_snapshot()
+                                gate_blocks_contact = False
+                                if raw_contact_map is not None and base_map is not None:
+                                    gate_blocks_contact = bool(gate["enabled"]) and not bool(gate["contact"])
+                                    if gate_blocks_contact:
                                         contact_zero_pending = False
-                                        contact_zero_ready = True
-                                        self.surface_zero_ready = True
-                                        self.log("Contact deform zero captured from averaged surface frames.")
-                                    contact_stats = {
-                                        "ready": True,
-                                        "mean": 0.0,
-                                        "top_mean": 0.0,
-                                        "peak": 0.0,
-                                        "area_ratio": 0.0,
-                                        "noise_floor": SURFACE_CONTACT_DEADBAND_MM,
-                                    }
-                                elif contact_zero_ready and self.surface_reference_height_map is not None:
-                                    contact_stats = self._measure_contact_deformation_mm(
-                                        height_map,
+                                        contact_zero_ready = False
+                                        contact_zero_active = False
+                                        contact_zero_samples.clear()
+                                        self.surface_contact_baseline = None
+                                        self.surface_contact_display_ema = None
+                                        self.surface_zero_ready = False
+                                        contact_map_for_display = np.zeros_like(raw_contact_map, dtype=np.float32)
+                                    else:
+                                        if gate["enabled"] and not contact_zero_ready and not contact_zero_pending:
+                                            contact_zero_pending = True
+                                            contact_zero_samples.clear()
+                                            self.surface_contact_baseline = None
+                                            self.surface_contact_display_ema = None
+                                            self.surface_zero_ready = False
+                                        contact_zero_active = bool(centroids) and contact_zero_pending
+
+                                    if not gate_blocks_contact and contact_zero_active:
+                                        contact_zero_samples.append(raw_contact_map.astype(np.float32).copy())
+                                        if len(contact_zero_samples) >= CONTACT_ZERO_SAMPLE_COUNT:
+                                            self.surface_contact_baseline = np.median(
+                                                np.stack(
+                                                    contact_zero_samples[-CONTACT_ZERO_SAMPLE_COUNT:],
+                                                    axis=0,
+                                                ),
+                                                axis=0,
+                                            ).astype(np.float32)
+                                            self.surface_contact_display_ema = np.zeros_like(
+                                                raw_contact_map,
+                                                dtype=np.float32,
+                                            )
+                                            contact_zero_samples.clear()
+                                            contact_zero_pending = False
+                                            contact_zero_ready = True
+                                            self.surface_zero_ready = True
+                                            self.log("Contact zero captured from averaged contact maps.")
+                                        contact_map_for_display = np.zeros_like(raw_contact_map, dtype=np.float32)
+                                    elif not gate_blocks_contact and (
+                                        contact_zero_ready
+                                        and self.surface_contact_baseline is not None
+                                        and self.surface_contact_baseline.shape == raw_contact_map.shape
+                                    ):
+                                        contact_map_for_display = np.maximum(
+                                            raw_contact_map - self.surface_contact_baseline,
+                                            0.0,
+                                        ).astype(np.float32)
+                                        if (
+                                            self.surface_contact_display_ema is None
+                                            or self.surface_contact_display_ema.shape != contact_map_for_display.shape
+                                        ):
+                                            self.surface_contact_display_ema = contact_map_for_display
+                                        else:
+                                            self.surface_contact_display_ema = cv2.addWeighted(
+                                                self.surface_contact_display_ema.astype(np.float32),
+                                                0.68,
+                                                contact_map_for_display,
+                                                0.32,
+                                                0.0,
+                                            )
+                                        contact_map_for_display = self.surface_contact_display_ema
+                                    else:
+                                        contact_map_for_display = np.zeros_like(raw_contact_map, dtype=np.float32)
+
+                                    height_map = surface_from_contact_map(
+                                        contact_map_for_display,
+                                        base_map,
                                         ellipse_mask,
-                                        cv2,
+                                        tactile_config,
+                                        cv2=cv2,
                                     )
-                                else:
-                                    contact_stats = None
+                                    contact_stats = summarize_contact_map(
+                                        contact_map_for_display,
+                                        ellipse_mask,
+                                        tactile_config.contact_area_threshold,
+                                    )
+                                deform_contact_stats = contact_stats
+                                deform_tactile_frame = tactile_frame
+                                deform_surface_scale = scale
+                                deform_gate = gate
                                 if contact_stats is not None and contact_stats["ready"]:
                                     surface_graph_history.append(
                                         (
@@ -4468,9 +5754,17 @@ class AllInOneTesterGUI:
                                         )
                                         if contact_zero_active
                                         else (
-                                            "Surface running."
+                                            (
+                                                "Surface running."
+                                                if not gate["enabled"]
+                                                else gate["status"]
+                                            )
                                             if contact_zero_ready
-                                            else "Press Reset Zero to set contact deform zero."
+                                            else (
+                                                gate["status"]
+                                                if gate_blocks_contact
+                                                else "Press Reset Zero to set contact deform zero."
+                                            )
                                         )
                                     ),
                                 )
@@ -4486,25 +5780,66 @@ class AllInOneTesterGUI:
                                 flow_distance_mean = mean_disp
                                 flow_distance_max = max_disp
                                 if contact_stats is not None and contact_stats["ready"]:
+                                    camera_depth_mm = self._estimate_camera_depth_mm(contact_stats)
+                                    if gate_blocks_contact:
+                                        camera_depth_mm = 0.0
+                                    stepper_depth_mm = self._stepper_contact_depth_mm()
+                                    self._refresh_contact_depth_readouts(
+                                        camera_depth_mm,
+                                        update_camera=True,
+                                    )
                                     flow_distance_mean = contact_stats["top_mean"]
                                     flow_distance_max = contact_stats["peak"]
+                                    peak_pct = contact_stats["peak"] * 100.0
+                                    top_pct = contact_stats["top_mean"] * 100.0
+                                    stepper_text = (
+                                        f"{stepper_depth_mm:.3f} mm"
+                                        if stepper_depth_mm is not None
+                                        else ("manual" if not STEPPER_DEPTH_ENABLED else "-")
+                                    )
+                                    camera_text = (
+                                        f"{camera_depth_mm:.2f} mm approx"
+                                        if camera_depth_mm is not None
+                                        else "-"
+                                    )
                                     distance_text = (
-                                        f"Contact deform peak: {contact_stats['peak']:.2f} mm | "
-                                        f"top mean: {contact_stats['top_mean']:.2f} mm | "
-                                        f"area: {contact_stats['area_ratio']:.1f}%"
+                                        f"Depth stepper: {stepper_text} | "
+                                        f"camera: {camera_text} | contact {peak_pct:.0f}%"
                                     )
                                     overlay_lines = [
+                                        f"Pressure gate: {gate['status']}",
                                         (
-                                            f"Contact deform peak {contact_stats['peak']:.2f} mm | "
-                                            f"top {contact_stats['top_mean']:.2f} mm"
+                                            f"Contact intensity peak {peak_pct:.0f}% | "
+                                            f"top {top_pct:.0f}%"
                                         ),
                                         (
                                             f"Area {contact_stats['area_ratio']:.1f}% | "
-                                            f"noise gate {contact_stats['noise_floor']:.2f} mm"
+                                            f"residual floor {tactile_frame.residual_floor_px:.3f} px"
                                         ),
                                     ]
-                                    overlay_lines.append(f"Disp mean {mean_disp:.3f} px | scale {scale:.3f}")
+                                    overlay_lines.append(
+                                        f"Residual mean {tactile_frame.residual_mean_px:.3f} px | "
+                                        f"peak {tactile_frame.residual_peak_px:.3f} px | "
+                                        f"scale {scale:.3f}"
+                                    )
+                                    overlay_lines.append(
+                                        (
+                                            f"Depth stepper {stepper_depth_mm:.3f} mm"
+                                            if stepper_depth_mm is not None
+                                            else (
+                                                "Depth stepper unavailable (manual)"
+                                                if not STEPPER_DEPTH_ENABLED
+                                                else "Depth stepper -"
+                                            )
+                                        )
+                                    )
+                                    overlay_lines[-1] += (
+                                        f" | camera approx {camera_depth_mm:.2f} mm"
+                                        if camera_depth_mm is not None
+                                        else " | camera approx -"
+                                    )
                                 else:
+                                    self._refresh_contact_depth_readouts(None, update_camera=True)
                                     distance_text = "Press Reset Zero to set contact deform zero."
                                     overlay_lines = [
                                         "Press Reset Zero to set contact deform zero.",
@@ -4580,6 +5915,15 @@ class AllInOneTesterGUI:
                 payload_mean_disp = mean_disp if flow_distance_mean is None else flow_distance_mean
                 payload_max_disp = max_disp if flow_distance_max is None else flow_distance_max
                 payload_mode = f"{params['mode']} | {display_mode}"
+                self._update_camera_deform_live_features(
+                    mean_disp=mean_disp,
+                    max_disp=max_disp,
+                    missing_ratio=missing_ratio,
+                    contact_stats=deform_contact_stats,
+                    tactile_frame=deform_tactile_frame,
+                    scale_px=deform_surface_scale,
+                    gate=deform_gate,
+                )
 
                 self._enqueue_blob_frame(
                     {

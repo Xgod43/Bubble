@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import time
 import tkinter as tk
 from tkinter import ttk
@@ -9,7 +8,6 @@ from all_in_one_gui import (
     AllInOneTesterGUI,
     COLOR_ACCENT,
     COLOR_ACCENT_SOFT,
-    FORCE_GRAVITY_MPS2,
     COLOR_OK,
     COLOR_WARN,
     LIMIT_1_PIN,
@@ -25,8 +23,6 @@ COLOR_BORDER_DARK = "#22384d"
 COLOR_TEXT_BRIGHT = "#eef5fb"
 COLOR_TEXT_MUTED = "#93a9bc"
 COLOR_DANGER = "#c25b5b"
-FORCE_GRAPH_HISTORY_SECONDS = 120.0
-FORCE_GRAPH_MAX_POINTS = 600
 
 
 class MissionControlGUI(AllInOneTesterGUI):
@@ -412,211 +408,6 @@ class MissionControlGUI(AllInOneTesterGUI):
         self._build_force_measurement_tab(side_content)
         self.root.after(120, self._draw_force_graphs)
 
-    def _record_pressure_reading(self, pressure_hpa):
-        pressure = float(pressure_hpa)
-        zero_captured = False
-        with self.sensor_data_lock:
-            self.latest_pressure_hpa = pressure
-            if self.force_pressure_zero_hpa is None:
-                self.force_pressure_zero_hpa = pressure
-                zero_captured = True
-        if zero_captured:
-            self._refresh_force_pressure_zero()
-            self._set_var(
-                self.force_calibration_status_var,
-                "Pressure zero captured. Press bubble into load cell.",
-            )
-            self.log(f"Force pressure zero auto-captured at {pressure:.2f} hPa.")
-        self._refresh_force_live_pair()
-        self._update_force_estimate()
-        self._append_force_graph_sample()
-
-    def _record_loadcell_reading(self, weight_kg):
-        with self.sensor_data_lock:
-            self.latest_loadcell_kg = float(weight_kg)
-            self.latest_loadcell_force_n = float(weight_kg) * FORCE_GRAVITY_MPS2
-        self._refresh_force_live_pair()
-        self._update_force_estimate()
-        self._append_force_graph_sample()
-
-    def _update_force_estimate(self):
-        if not hasattr(self, "force_estimate_var"):
-            return
-        with self.sensor_data_lock:
-            pressure = self.latest_pressure_hpa
-            zero = self.force_pressure_zero_hpa
-            coeffs = self.force_calibration_coeffs
-
-        pressure_delta = self._pressure_delta_from_zero(pressure, zero)
-
-        if pressure_delta is None or coeffs is None:
-            with self.sensor_data_lock:
-                self.latest_pressure_force_n = None
-            self._set_var(self.force_estimate_var, "-")
-            return
-
-        slope, intercept = coeffs
-        estimated_force = (slope * pressure_delta) + intercept
-        with self.sensor_data_lock:
-            self.latest_pressure_force_n = float(estimated_force)
-        estimated_load_kg = float(estimated_force) / FORCE_GRAVITY_MPS2
-        self._set_var(self.force_estimate_var, f"{estimated_load_kg:.4f} kg")
-
-    def _append_force_graph_sample(self):
-        now = time.monotonic()
-        with self.sensor_data_lock:
-            if not hasattr(self, "force_graph_history"):
-                self.force_graph_history = []
-            load_force = getattr(self, "latest_loadcell_force_n", None)
-            pressure_force = getattr(self, "latest_pressure_force_n", None)
-            pressure_hpa = self.latest_pressure_hpa
-            if load_force is None and pressure_force is None and pressure_hpa is None:
-                return
-            self.force_graph_history.append((now, load_force, pressure_force, pressure_hpa))
-            cutoff = now - FORCE_GRAPH_HISTORY_SECONDS
-            self.force_graph_history = [
-                point for point in self.force_graph_history if point[0] >= cutoff
-            ]
-            if len(self.force_graph_history) > FORCE_GRAPH_MAX_POINTS:
-                del self.force_graph_history[:-FORCE_GRAPH_MAX_POINTS]
-        self._request_force_graph_redraw()
-
-    def _request_force_graph_redraw(self):
-        if not self.root.winfo_exists():
-            return
-        if not hasattr(self, "force_compare_canvas") or not hasattr(self, "force_error_canvas"):
-            return
-        if getattr(self, "force_graph_redraw_pending", False):
-            return
-        self.force_graph_redraw_pending = True
-
-        def redraw():
-            self.force_graph_redraw_pending = False
-            self._draw_force_graphs()
-
-        self.root.after(80, redraw)
-
-    @staticmethod
-    def _finite_number(value):
-        return isinstance(value, (int, float)) and math.isfinite(float(value))
-
-    @staticmethod
-    def _graph_bounds(values):
-        finite_values = [float(value) for value in values if MissionControlGUI._finite_number(value)]
-        if not finite_values:
-            return -1.0, 1.0
-        low = min(0.0, min(finite_values))
-        high = max(0.0, max(finite_values))
-        pad = max(0.5, (high - low) * 0.12)
-        return low - pad, high + pad
-
-    def _draw_force_graphs(self):
-        if not hasattr(self, "force_compare_canvas") or not hasattr(self, "force_error_canvas"):
-            return
-        self._draw_force_compare_graph(self.force_compare_canvas)
-        self._draw_force_error_graph(self.force_error_canvas)
-
-    def _prepare_force_graph(self, canvas, title, y_label):
-        width = max(1, int(canvas.winfo_width()))
-        height = max(1, int(canvas.winfo_height()))
-        canvas.delete("all")
-        canvas.create_rectangle(0, 0, width, height, fill="#0a131b", outline="")
-        left, top = 48, 28
-        right, bottom = max(68, width - 12), max(48, height - 28)
-        canvas.create_text(10, 8, text=title, anchor="nw", fill=COLOR_TEXT_BRIGHT, font=("Segoe UI", 9, "bold"))
-        canvas.create_text(8, (top + bottom) / 2, text=y_label, anchor="w", fill=COLOR_TEXT_MUTED, font=("Segoe UI", 8))
-        canvas.create_text((left + right) / 2, height - 5, text=f"last {int(FORCE_GRAPH_HISTORY_SECONDS)} s", anchor="s", fill=COLOR_TEXT_MUTED, font=("Segoe UI", 8))
-        canvas.create_rectangle(left, top, right, bottom, outline=COLOR_BORDER_DARK)
-        return left, top, right, bottom
-
-    def _draw_empty_force_graph(self, canvas, title, message):
-        left, top, right, bottom = self._prepare_force_graph(canvas, title, "")
-        canvas.create_text((left + right) / 2, (top + bottom) / 2, text=message, fill=COLOR_TEXT_MUTED, font=("Segoe UI", 9))
-
-    def _draw_force_compare_graph(self, canvas):
-        with self.sensor_data_lock:
-            history = list(getattr(self, "force_graph_history", []))
-        if not history:
-            self._draw_empty_force_graph(canvas, "Load comparison", "Waiting for load cell / pressure data")
-            return
-        left, top, right, bottom = self._prepare_force_graph(canvas, "Load comparison", "kg")
-        now = max(point[0] for point in history)
-        x_min = now - FORCE_GRAPH_HISTORY_SECONDS
-        values = []
-        for _ts, load_force, pressure_force, _pressure in history:
-            if self._finite_number(load_force):
-                values.append(float(load_force) / FORCE_GRAVITY_MPS2)
-            if self._finite_number(pressure_force):
-                values.append(float(pressure_force) / FORCE_GRAVITY_MPS2)
-        if not values:
-            canvas.create_text((left + right) / 2, (top + bottom) / 2, text="Waiting for force calibration", fill=COLOR_TEXT_MUTED, font=("Segoe UI", 9))
-            return
-        y_min, y_max = self._graph_bounds(values)
-
-        def x_for(timestamp):
-            return left + ((float(timestamp) - x_min) / FORCE_GRAPH_HISTORY_SECONDS) * (right - left)
-
-        def y_for(value):
-            return bottom - ((float(value) - y_min) / max(1e-9, y_max - y_min)) * (bottom - top)
-
-        for idx in range(4):
-            y = top + (idx / 3.0) * (bottom - top)
-            canvas.create_line(left, y, right, y, fill="#1d3347")
-        for idx in range(3):
-            x = left + (idx / 2.0) * (right - left)
-            canvas.create_line(x, top, x, bottom, fill="#15283a")
-
-        def draw_series(value_index, color, dash=None):
-            coords = []
-            for point in history:
-                value = point[value_index]
-                if not self._finite_number(value):
-                    if len(coords) >= 4:
-                        canvas.create_line(*coords, fill=color, width=2, smooth=True, dash=dash)
-                    coords = []
-                    continue
-                value = float(value) / FORCE_GRAVITY_MPS2
-                coords.extend((x_for(point[0]), y_for(value)))
-            if len(coords) >= 4:
-                canvas.create_line(*coords, fill=color, width=2, smooth=True, dash=dash)
-
-        draw_series(1, COLOR_OK)
-        draw_series(2, COLOR_WARN, dash=(4, 2))
-        canvas.create_text(right - 8, top + 6, text="green load kg | orange pressure kg-eq", anchor="ne", fill=COLOR_TEXT_MUTED, font=("Segoe UI", 7))
-
-    def _draw_force_error_graph(self, canvas):
-        with self.sensor_data_lock:
-            history = list(getattr(self, "force_graph_history", []))
-        error_points = [
-            (ts, (float(pressure_force) - float(load_force)) / FORCE_GRAVITY_MPS2)
-            for ts, load_force, pressure_force, _pressure in history
-            if self._finite_number(load_force) and self._finite_number(pressure_force)
-        ]
-        if not error_points:
-            self._draw_empty_force_graph(canvas, "Force error", "Waiting for both force lines")
-            return
-        left, top, right, bottom = self._prepare_force_graph(canvas, "Load error (pressure kg-eq - load cell kg)", "kg")
-        now = max(point[0] for point in history)
-        x_min = now - FORCE_GRAPH_HISTORY_SECONDS
-        y_min, y_max = self._graph_bounds([point[1] for point in error_points])
-
-        def x_for(timestamp):
-            return left + ((float(timestamp) - x_min) / FORCE_GRAPH_HISTORY_SECONDS) * (right - left)
-
-        def y_for(value):
-            return bottom - ((float(value) - y_min) / max(1e-9, y_max - y_min)) * (bottom - top)
-
-        zero_y = y_for(0.0)
-        canvas.create_line(left, zero_y, right, zero_y, fill=COLOR_ACCENT, dash=(3, 2))
-        coords = []
-        latest_error = 0.0
-        for timestamp, error_n in error_points:
-            coords.extend((x_for(timestamp), y_for(error_n)))
-            latest_error = error_n
-        if len(coords) >= 4:
-            canvas.create_line(*coords, fill=COLOR_DANGER, width=2, smooth=True)
-        canvas.create_text(right - 8, top + 6, text=f"latest {latest_error:+.3f} kg | abs {abs(latest_error):.3f} kg", anchor="ne", fill=COLOR_TEXT_MUTED, font=("Segoe UI", 7))
-
     def _init_blob_defaults(self):
         self.blob_state_var = tk.StringVar(value="Stopped")
         self.blob_dot_count_var = tk.StringVar(value="-")
@@ -628,6 +419,10 @@ class MissionControlGUI(AllInOneTesterGUI):
         self.blob_missing_ratio_var = tk.StringVar(value="-")
         self.blob_new_tracks_var = tk.StringVar(value="-")
         self.blob_lost_tracks_var = tk.StringVar(value="-")
+        self.stepper_position_var = tk.StringVar(value="0.000 mm")
+        self.contact_depth_stepper_var = tk.StringVar(value="unavailable (manual)")
+        self.contact_depth_camera_var = tk.StringVar(value="-")
+        self.contact_gate_var = tk.StringVar(value="Pressure gate waiting")
         self.blob_message_var = tk.StringVar(value="Tune the live detection profile and press Start Detection.")
 
         self.blob_camera_backend_var = tk.StringVar(value="auto")
@@ -811,6 +606,10 @@ class MissionControlGUI(AllInOneTesterGUI):
         self._metric_cell(metrics, 1, 1, "Mean disp", self.blob_mean_disp_var)
         self._metric_cell(metrics, 1, 2, "Max disp", self.blob_max_disp_var)
         self._metric_cell(metrics, 1, 3, "Missing", self.blob_missing_ratio_var, pad_right=0)
+        self._metric_cell(metrics, 2, 0, "Stepper depth", self.contact_depth_stepper_var)
+        self._metric_cell(metrics, 2, 1, "Camera depth", self.contact_depth_camera_var)
+        self._metric_cell(metrics, 2, 2, "Stepper pos", self.stepper_position_var)
+        self._metric_cell(metrics, 2, 3, "Contact gate", self.contact_gate_var, pad_right=0)
 
         control_card = ttk.LabelFrame(card, text="Detection Command Deck", padding=8)
         control_card.grid(row=4, column=0, sticky="ew")
@@ -982,6 +781,9 @@ class MissionControlGUI(AllInOneTesterGUI):
         self._status_line(summary, 2, "Frame time", self.blob_latency_var)
         self._status_line(summary, 3, "Track health", self.blob_missing_ratio_var)
         self._status_line(summary, 4, "Estimated force", self.force_estimate_var)
+        self._status_line(summary, 5, "Stepper depth", self.contact_depth_stepper_var)
+        self._status_line(summary, 6, "Camera depth", self.contact_depth_camera_var)
+        self._status_line(summary, 7, "Contact gate", self.contact_gate_var)
 
         notes = ttk.LabelFrame(tab, text="Run Notes", padding=8)
         notes.grid(row=1, column=0, sticky="ew", pady=(4, 0))

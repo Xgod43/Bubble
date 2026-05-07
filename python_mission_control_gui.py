@@ -419,6 +419,10 @@ class MissionControlGUI(AllInOneTesterGUI):
         self.blob_missing_ratio_var = tk.StringVar(value="-")
         self.blob_new_tracks_var = tk.StringVar(value="-")
         self.blob_lost_tracks_var = tk.StringVar(value="-")
+        self.stepper_position_var = tk.StringVar(value="0.000 mm")
+        self.contact_depth_stepper_var = tk.StringVar(value="unavailable (manual)")
+        self.contact_depth_camera_var = tk.StringVar(value="-")
+        self.contact_gate_var = tk.StringVar(value="Pressure gate waiting")
         self.blob_message_var = tk.StringVar(value="Tune the live detection profile and press Start Detection.")
 
         self.blob_camera_backend_var = tk.StringVar(value="auto")
@@ -602,6 +606,10 @@ class MissionControlGUI(AllInOneTesterGUI):
         self._metric_cell(metrics, 1, 1, "Mean disp", self.blob_mean_disp_var)
         self._metric_cell(metrics, 1, 2, "Max disp", self.blob_max_disp_var)
         self._metric_cell(metrics, 1, 3, "Missing", self.blob_missing_ratio_var, pad_right=0)
+        self._metric_cell(metrics, 2, 0, "Stepper depth", self.contact_depth_stepper_var)
+        self._metric_cell(metrics, 2, 1, "Camera depth", self.contact_depth_camera_var)
+        self._metric_cell(metrics, 2, 2, "Stepper pos", self.stepper_position_var)
+        self._metric_cell(metrics, 2, 3, "Contact gate", self.contact_gate_var, pad_right=0)
 
         control_card = ttk.LabelFrame(card, text="Detection Command Deck", padding=8)
         control_card.grid(row=4, column=0, sticky="ew")
@@ -773,6 +781,9 @@ class MissionControlGUI(AllInOneTesterGUI):
         self._status_line(summary, 2, "Frame time", self.blob_latency_var)
         self._status_line(summary, 3, "Track health", self.blob_missing_ratio_var)
         self._status_line(summary, 4, "Estimated force", self.force_estimate_var)
+        self._status_line(summary, 5, "Stepper depth", self.contact_depth_stepper_var)
+        self._status_line(summary, 6, "Camera depth", self.contact_depth_camera_var)
+        self._status_line(summary, 7, "Contact gate", self.contact_gate_var)
 
         notes = ttk.LabelFrame(tab, text="Run Notes", padding=8)
         notes.grid(row=1, column=0, sticky="ew", pady=(4, 0))
