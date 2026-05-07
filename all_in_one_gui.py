@@ -3677,7 +3677,7 @@ class AllInOneTesterGUI:
 
         actions = ttk.Frame(parent)
         actions.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(12, 0))
-        for col in range(5):
+        for col in range(6):
             actions.columnconfigure(col, weight=1)
         ttk.Button(actions, text="Set Zero", command=self.set_force_pressure_zero).grid(
             row=0, column=0, sticky="ew", padx=(0, 8)
@@ -3691,8 +3691,11 @@ class AllInOneTesterGUI:
         ttk.Button(actions, text="Fit Calibration", command=self.fit_force_calibration).grid(
             row=0, column=3, sticky="ew", padx=(0, 8)
         )
+        ttk.Button(actions, text="Show Graph", command=self.show_force_calibration_graph).grid(
+            row=0, column=4, sticky="ew", padx=(0, 8)
+        )
         ttk.Button(actions, text="Clear", command=self.clear_force_calibration).grid(
-            row=0, column=4, sticky="ew"
+            row=0, column=5, sticky="ew"
         )
 
     def _record_pressure_reading(self, pressure_hpa):
@@ -4149,6 +4152,226 @@ class AllInOneTesterGUI:
             font=("Segoe UI", 7),
         )
 
+    @staticmethod
+    def _fit_force_samples(samples):
+        usable = [(float(pressure_delta), float(force_n)) for pressure_delta, force_n in samples]
+        if len(usable) < 2:
+            return None
+        n = float(len(usable))
+        sum_x = sum(sample[0] for sample in usable)
+        sum_y = sum(sample[1] for sample in usable)
+        sum_xx = sum(sample[0] * sample[0] for sample in usable)
+        sum_xy = sum(sample[0] * sample[1] for sample in usable)
+        denominator = (n * sum_xx) - (sum_x * sum_x)
+        if abs(denominator) < 1e-9:
+            return None
+        slope = ((n * sum_xy) - (sum_x * sum_y)) / denominator
+        intercept = (sum_y - (slope * sum_x)) / n
+        return slope, intercept
+
+    @staticmethod
+    def _force_sample_graph_points(samples):
+        points = []
+        for index, (pressure_delta, force_n) in enumerate(samples, start=1):
+            force_kg = float(force_n) / FORCE_GRAVITY_MPS2
+            points.append((index, float(pressure_delta), force_kg))
+        return points
+
+    def show_force_calibration_graph(self):
+        with self.sensor_data_lock:
+            samples = list(self.force_calibration_samples)
+
+        if not samples:
+            messagebox.showwarning(
+                "Force Calibration Graph",
+                "Capture at least one bubble sample before showing the graph.",
+            )
+            return
+
+        graph_window = tk.Toplevel(self.root)
+        graph_window.title("Force Calibration Linear Equation")
+        graph_window.geometry("720x520")
+        graph_window.minsize(520, 360)
+
+        canvas = tk.Canvas(
+            graph_window,
+            background="#f9fbfc",
+            highlightthickness=1,
+            highlightbackground=COLOR_BORDER,
+        )
+        canvas.pack(fill="both", expand=True, padx=10, pady=10)
+
+        hint = ttk.Label(
+            graph_window,
+            text="Sample graph: x = pressure change dP (hPa), y = load-cell force converted to kg.",
+        )
+        hint.pack(fill="x", padx=10, pady=(0, 10))
+
+        canvas.bind("<Configure>", lambda _event: self._draw_force_calibration_sample_graph(canvas))
+        self.root.after(50, lambda: self._draw_force_calibration_sample_graph(canvas))
+
+    def _draw_force_calibration_sample_graph(self, canvas):
+        with self.sensor_data_lock:
+            samples = list(self.force_calibration_samples)
+
+        coeffs = self._fit_force_samples(samples)
+
+        if not samples:
+            self._draw_empty_graph(
+                canvas,
+                "Force calibration linear equation",
+                "No bubble samples captured",
+            )
+            return
+
+        sample_points = self._force_sample_graph_points(samples)
+
+        (
+            _width,
+            _height,
+            left,
+            top,
+            right,
+            bottom,
+            plot_width,
+            plot_height,
+        ) = self._prepare_graph_canvas(
+            canvas,
+            "Force calibration linear equation",
+            "dP from pressure zero (hPa)",
+            "kg",
+        )
+
+        if not sample_points:
+            canvas.create_text(
+                (left + right) / 2,
+                (top + bottom) / 2,
+                text="No valid calibration samples",
+                anchor="center",
+                fill=COLOR_MUTED,
+                font=("Segoe UI", 9),
+            )
+            return
+
+        x_values = [point[1] for point in sample_points]
+        y_values = [point[2] for point in sample_points]
+        if coeffs is not None:
+            slope, intercept = coeffs
+            x_lo, x_hi = min(x_values), max(x_values)
+            y_values.extend(
+                [
+                    ((slope * x_lo) + intercept) / FORCE_GRAVITY_MPS2,
+                    ((slope * x_hi) + intercept) / FORCE_GRAVITY_MPS2,
+                ]
+            )
+
+        x_min, x_max = self._graph_bounds(x_values, include_zero=True)
+        y_min, y_max = self._graph_bounds(y_values, include_zero=True)
+
+        def x_for(value):
+            ratio = (float(value) - x_min) / max(1e-9, x_max - x_min)
+            return left + (np.clip(ratio, 0.0, 1.0) * plot_width)
+
+        def y_for(value):
+            ratio = (float(value) - y_min) / max(1e-9, y_max - y_min)
+            return bottom - (np.clip(ratio, 0.0, 1.0) * plot_height)
+
+        for idx in range(5):
+            ratio = idx / 4.0
+            x = left + (ratio * plot_width)
+            x_value = x_min + (ratio * (x_max - x_min))
+            canvas.create_line(x, top, x, bottom, fill="#edf2f3")
+            canvas.create_text(
+                x,
+                bottom + 4,
+                text=f"{x_value:.1f}",
+                anchor="n",
+                fill=COLOR_MUTED,
+                font=("Segoe UI", 7),
+            )
+
+        for idx in range(5):
+            ratio = idx / 4.0
+            y = top + (ratio * plot_height)
+            y_value = y_max - (ratio * (y_max - y_min))
+            canvas.create_line(left, y, right, y, fill="#e1e8ea")
+            canvas.create_text(
+                left - 5,
+                y,
+                text=f"{y_value:.2f}",
+                anchor="e",
+                fill=COLOR_MUTED,
+                font=("Segoe UI", 7),
+            )
+
+        zero_x = x_for(0.0)
+        zero_y = y_for(0.0)
+        canvas.create_line(zero_x, top, zero_x, bottom, fill=COLOR_ACCENT, width=1, dash=(3, 2))
+        canvas.create_line(left, zero_y, right, zero_y, fill=COLOR_ACCENT, width=1, dash=(3, 2))
+
+        if coeffs is not None:
+            slope, intercept = coeffs
+            line_color = COLOR_WARN
+            line_x0 = min(x_values)
+            line_x1 = max(x_values)
+            line_y0 = ((slope * line_x0) + intercept) / FORCE_GRAVITY_MPS2
+            line_y1 = ((slope * line_x1) + intercept) / FORCE_GRAVITY_MPS2
+            canvas.create_line(
+                x_for(line_x0),
+                y_for(line_y0),
+                x_for(line_x1),
+                y_for(line_y1),
+                fill=line_color,
+                width=2,
+            )
+            slope_kg = slope / FORCE_GRAVITY_MPS2
+            intercept_kg = intercept / FORCE_GRAVITY_MPS2
+            sign = "+" if intercept_kg >= 0 else "-"
+            equation = f"kg-eq = {slope_kg:.6f}dP {sign} {abs(intercept_kg):.4f}"
+
+            y_actual = np.asarray(y_values[: len(sample_points)], dtype=np.float32)
+            y_fit = np.asarray(
+                [((slope * x_value) + intercept) / FORCE_GRAVITY_MPS2 for _index, x_value, _force_kg in sample_points],
+                dtype=np.float32,
+            )
+            total = float(np.sum((y_actual - float(np.mean(y_actual))) ** 2))
+            residual = float(np.sum((y_actual - y_fit) ** 2))
+            r2_text = ""
+            if total > 1e-9:
+                r2_text = f" | R2 {1.0 - (residual / total):.3f}"
+
+            canvas.create_text(
+                right - 6,
+                top + 6,
+                text=f"{equation}{r2_text}",
+                anchor="ne",
+                fill=COLOR_TEXT,
+                font=("Segoe UI", 9, "bold"),
+            )
+        else:
+            canvas.create_text(
+                right - 6,
+                top + 6,
+                text="Need 2+ distinct pressure samples for a line",
+                anchor="ne",
+                fill=COLOR_MUTED,
+                font=("Segoe UI", 9, "bold"),
+            )
+
+        point_color = COLOR_OK
+        for index, pressure_delta, force_kg in sample_points:
+            x = x_for(pressure_delta)
+            y = y_for(force_kg)
+            canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill=point_color, outline=point_color)
+            canvas.create_text(
+                x + 6,
+                y - 6,
+                text=str(index),
+                anchor="sw",
+                fill=COLOR_TEXT,
+                font=("Segoe UI", 7, "bold"),
+            )
+
     def add_force_calibration_sample(self):
         with self.sensor_data_lock:
             pressure = self.latest_pressure_hpa
@@ -4206,25 +4429,27 @@ class AllInOneTesterGUI:
             if show_warning:
                 messagebox.showwarning("Force Calibration", "Capture at least 2 bubble samples before fitting.")
             self.force_calibration_status_var.set("Need at least 2 bubble samples.")
+            with self.sensor_data_lock:
+                self.force_calibration_coeffs = None
+                self.latest_pressure_force_n = None
+            self._update_force_estimate()
             return False
 
-        n = float(len(samples))
-        sum_x = sum(sample[0] for sample in samples)
-        sum_y = sum(sample[1] for sample in samples)
-        sum_xx = sum(sample[0] * sample[0] for sample in samples)
-        sum_xy = sum(sample[0] * sample[1] for sample in samples)
-        denominator = (n * sum_xx) - (sum_x * sum_x)
-        if abs(denominator) < 1e-9:
+        coeffs = self._fit_force_samples(samples)
+        if coeffs is None:
             if show_warning:
                 messagebox.showwarning(
                     "Force Calibration",
                     "Pressure values are too similar. Capture samples at different loads.",
                 )
             self.force_calibration_status_var.set("Need distinct pressure points.")
+            with self.sensor_data_lock:
+                self.force_calibration_coeffs = None
+                self.latest_pressure_force_n = None
+            self._update_force_estimate()
             return False
 
-        slope = ((n * sum_xy) - (sum_x * sum_y)) / denominator
-        intercept = (sum_y - (slope * sum_x)) / n
+        slope, intercept = coeffs
         with self.sensor_data_lock:
             self.force_calibration_coeffs = (slope, intercept)
 

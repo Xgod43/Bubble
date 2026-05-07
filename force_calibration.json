@@ -1,0 +1,60 @@
+{
+  "model": "force_n = slope_n_per_hpa * pressure_delta_hpa + intercept_n",
+  "slope": 60.83001662350695,
+  "intercept": -2034.8463692041516,
+  "pressure_zero_hpa": 999.926688291383,
+  "samples": [
+    {
+      "pressure_delta_hpa": 42.52622361850672,
+      "force_n": 527.4829075801103
+    },
+    {
+      "pressure_delta_hpa": 62.811829588569026,
+      "force_n": 1763.1598174585633
+    },
+    {
+      "pressure_delta_hpa": 68.0656907041589,
+      "force_n": 2127.3387049723756
+    },
+    {
+      "pressure_delta_hpa": 60.080489617746025,
+      "force_n": 1677.1993830718227
+    },
+    {
+      "pressure_delta_hpa": 51.759329091626796,
+      "force_n": 1090.27408959116
+    },
+    {
+      "pressure_delta_hpa": 47.4726356138151,
+      "force_n": 818.4445876685082
+    },
+    {
+      "pressure_delta_hpa": 44.73603022363886,
+      "force_n": 657.6978818563534
+    },
+    {
+      "pressure_delta_hpa": 40.834739757508714,
+      "force_n": 447.7467160220994
+    },
+    {
+      "pressure_delta_hpa": 39.40061932050571,
+      "force_n": 352.79667186740323
+    },
+    {
+      "pressure_delta_hpa": 33.07543800383405,
+      "force_n": -4.715860861878452
+    },
+    {
+      "pressure_delta_hpa": 31.819956550252755,
+      "force_n": -84.80747575690607
+    },
+    {
+      "pressure_delta_hpa": 31.890847074227395,
+      "force_n": -84.71211827624307
+    },
+    {
+      "pressure_delta_hpa": 31.686523118351033,
+      "force_n": -84.76413144751382
+    }
+  ]
+}
