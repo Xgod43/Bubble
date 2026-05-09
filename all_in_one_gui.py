@@ -87,7 +87,7 @@ FORCE_CYCLE_SETTLE_SECONDS = float(os.environ.get("BUBBLE_FORCE_CYCLE_SETTLE_SEC
 FORCE_DEFAULT_PRESSURE_ZERO_HPA = 1032.0
 REMOTE_VISION_DEFAULT_URL = os.environ.get("BUBBLE_REMOTE_VISION_URL", "http://192.168.4.2:8765")
 REMOTE_VISION_TIMEOUT_SECONDS = float(os.environ.get("BUBBLE_REMOTE_VISION_TIMEOUT_SECONDS", "3.5"))
-REMOTE_VISION_TARGET_FPS = float(os.environ.get("BUBBLE_REMOTE_VISION_TARGET_FPS", "4.0"))
+REMOTE_VISION_TARGET_FPS = float(os.environ.get("BUBBLE_REMOTE_VISION_TARGET_FPS", "8.0"))
 REMOTE_VISION_CAPTURE_WIDTH = int(os.environ.get("BUBBLE_REMOTE_VISION_CAPTURE_WIDTH", "640"))
 REMOTE_VISION_CAPTURE_HEIGHT = int(os.environ.get("BUBBLE_REMOTE_VISION_CAPTURE_HEIGHT", "480"))
 REMOTE_VISION_JPEG_QUALITY = int(os.environ.get("BUBBLE_REMOTE_VISION_JPEG_QUALITY", "62"))
@@ -7230,7 +7230,14 @@ class AllInOneTesterGUI:
                 displacements.append((float(disp[0]), float(disp[1])))
         return displacements
 
-    def _post_remote_vision_frame(self, cv2, frame_bgr, params, reset_reference=False):
+    def _post_remote_vision_frame(
+        self,
+        cv2,
+        frame_bgr,
+        params,
+        reset_reference=False,
+        surface_reset=False,
+    ):
         ok, encoded = cv2.imencode(
             ".jpg",
             frame_bgr,
@@ -7239,11 +7246,20 @@ class AllInOneTesterGUI:
         if not ok:
             raise RuntimeError("Could not encode camera frame for remote vision.")
 
+        view_type = str(params.get("view_type", "overlay")).strip().lower()
+        remote_preview = REMOTE_VISION_PREVIEW_ENABLED or view_type in {
+            "surface_3d",
+            "optical_flow_3d",
+            "pointcloud",
+            "heatmap",
+        }
         query = urlencode(
             {
                 "reset": "1" if reset_reference else "0",
-                "preview": "1" if REMOTE_VISION_PREVIEW_ENABLED else "0",
+                "preview": "1" if remote_preview else "0",
                 "points": "1",
+                "view": view_type,
+                "surface_reset": "1" if surface_reset else "0",
                 "mode": params.get("mode", "auto"),
                 "use_roi": "1" if params.get("use_roi", True) else "0",
                 "roi_scale": f"{float(params.get('roi_scale', 0.68)):.4f}",
@@ -7251,6 +7267,9 @@ class AllInOneTesterGUI:
                 "max_area": int(float(params.get("max_area", 8000))),
                 "min_circularity": f"{float(params.get('min_circularity', 0.35)):.4f}",
                 "match_dist": f"{float(params.get('match_dist', 9.0)):.4f}",
+                "surface_grid": self._parse_surface_int(self.surface_grid_var, 52, 24, 140),
+                "surface_gain": f"{self._parse_surface_float(self.surface_gain_var, 1.0, 0.2, 3.0):.4f}",
+                "surface_smooth": f"{self._parse_surface_float(self.surface_smooth_var, 1.4, 0.0, 4.0):.4f}",
             }
         )
         url = f"{params['remote_vision_url']}/process?{query}"
@@ -7456,19 +7475,14 @@ class AllInOneTesterGUI:
                         self.blob_reset_reference_event.clear()
                         reset_remote = True
                         self.log("Remote CUDA reference reset requested.")
-                    if self.surface_reset_zero_event.is_set():
-                        self.surface_reset_zero_event.clear()
-                        self._set_var(
-                            self.surface_status_var,
-                            "Remote CUDA mode uses dot displacement; local surface zero is skipped.",
-                        )
-
+                    surface_reset_requested = self.surface_reset_zero_event.is_set()
                     try:
                         remote_payload, remote_preview_bgr = self._post_remote_vision_frame(
                             cv2,
                             frame_for_detection,
                             params,
                             reset_reference=reset_remote,
+                            surface_reset=surface_reset_requested,
                         )
                         remote_fail_count = 0
                         remote_reset_reference_pending = False
@@ -7485,6 +7499,13 @@ class AllInOneTesterGUI:
                         time.sleep(0.04)
                         continue
 
+                    if surface_reset_requested and (
+                        remote_payload.get("surface_zero_accepted")
+                        or remote_payload.get("surface_zero_pending")
+                        or remote_payload.get("surface_zero_ready")
+                    ):
+                        self.surface_reset_zero_event.clear()
+
                     centroids = self._remote_points_from_payload(remote_payload, "centroids")
                     reference_centroids = self._remote_points_from_payload(
                         remote_payload,
@@ -7496,15 +7517,352 @@ class AllInOneTesterGUI:
                     missing_ratio = float(remote_payload.get("missing_ratio", 0.0) or 0.0)
                     new_count = int(remote_payload.get("new_tracks", 0) or 0)
                     lost_count = int(remote_payload.get("lost_tracks", 0) or 0)
-                    display_bgr = (
-                        remote_preview_bgr
-                        if remote_preview_bgr is not None
-                        else frame_for_detection.copy()
-                    )
+                    if remote_payload.get("reference_reset"):
+                        self.surface_scale_ema = None
+                        self.surface_height_ema = None
+                        self.surface_reference_height_map = None
+                        self.surface_contact_ema = None
+                        self.surface_contact_baseline = None
+                        self.surface_contact_display_ema = None
+                        self.surface_zero_ready = False
+                        contact_zero_pending = False
+                        contact_zero_ready = False
+                        contact_zero_samples.clear()
+                        surface_display_cache = None
+                        surface_distance_text_cache = ""
+                        surface_mean_cache = None
+                        surface_max_cache = None
+                        surface_graph_history.clear()
+                        self._set_var(self.surface_status_var, "Remote reference reset. Press Reset Zero.")
+
+                    if self.surface_reset_zero_event.is_set():
+                        if centroids:
+                            self.surface_reset_zero_event.clear()
+                            self.surface_reference_height_map = None
+                            self.surface_contact_ema = None
+                            self.surface_contact_baseline = None
+                            self.surface_contact_display_ema = None
+                            self.surface_zero_ready = False
+                            contact_zero_pending = True
+                            contact_zero_ready = False
+                            contact_zero_samples.clear()
+                            surface_display_cache = None
+                            surface_distance_text_cache = ""
+                            surface_mean_cache = None
+                            surface_max_cache = None
+                            surface_graph_history.clear()
+                            self._set_var(self.surface_status_var, "Capturing remote contact deform zero...")
+                            self.log("Remote CUDA contact deform zero capture requested.")
+                        else:
+                            self._set_var(self.surface_status_var, "Waiting for remote dots to reset contact zero.")
+
+                    contact_zero_active = bool(centroids) and contact_zero_pending
+                    view_type = params.get("view_type", "auto")
+                    display_mode = view_type
+                    if view_type == "auto":
+                        if params["use_mosaic"]:
+                            display_mode = "mosaic"
+                        elif params["use_pointcloud"]:
+                            display_mode = "pointcloud"
+                        else:
+                            display_mode = "overlay"
+
                     distance_text = (
                         f"Remote CUDA: mean {mean_disp:.3f}px | "
                         f"max {max_disp:.3f}px | dots {len(centroids)}"
                     )
+                    display_bgr = None
+                    flow_distance_mean = mean_disp
+                    flow_distance_max = max_disp
+                    deform_contact_stats = None
+                    deform_tactile_frame = None
+                    deform_surface_scale = None
+                    deform_gate = None
+                    remote_surface_rendered = (
+                        display_mode in {"surface_3d", "optical_flow_3d"}
+                        and remote_preview_bgr is not None
+                        and bool(remote_payload.get("surface_rendered"))
+                    )
+
+                    if remote_surface_rendered:
+                        display_bgr = remote_preview_bgr
+                        center_payload = remote_payload.get("contact_center")
+                        center = (
+                            None
+                            if center_payload is None or len(center_payload) < 2
+                            else (float(center_payload[0]), float(center_payload[1]))
+                        )
+                        deform_contact_stats = {
+                            "ready": bool(remote_payload.get("contact_ready")),
+                            "peak": float(remote_payload.get("contact_peak", 0.0) or 0.0),
+                            "top_mean": float(remote_payload.get("contact_top_mean", 0.0) or 0.0),
+                            "area_ratio": float(remote_payload.get("contact_area_ratio", 0.0) or 0.0),
+                            "center": center,
+                        }
+                        deform_surface_scale = float(remote_payload.get("surface_scale_px", 0.0) or 0.0)
+                        status_text = str(
+                            remote_payload.get("surface_status")
+                            or "Remote surface running."
+                        )
+                        self._set_var(self.surface_status_var, status_text)
+                        if deform_contact_stats["ready"]:
+                            camera_depth_mm = self._estimate_camera_depth_mm(deform_contact_stats)
+                            self._refresh_contact_depth_readouts(
+                                camera_depth_mm,
+                                update_camera=True,
+                            )
+                            flow_distance_mean = deform_contact_stats["top_mean"]
+                            flow_distance_max = deform_contact_stats["peak"]
+                            distance_text = (
+                                f"Remote CUDA surface: contact "
+                                f"{deform_contact_stats['peak'] * 100.0:.0f}% | "
+                                f"area {deform_contact_stats['area_ratio']:.1f}%"
+                            )
+                        else:
+                            self._refresh_contact_depth_readouts(None, update_camera=True)
+                            distance_text = status_text
+                    elif display_mode in {"surface_3d", "optical_flow_3d"}:
+                        flow_gray = cv2.cvtColor(frame_for_detection, cv2.COLOR_BGR2GRAY)
+                        height_map, ellipse_mask, scale = self._build_surface_height_map(
+                            centroids,
+                            reference_centroids,
+                            displacements,
+                            frame_for_detection.shape,
+                            params,
+                            cv2,
+                        )
+                        if height_map is not None:
+                            tactile_frame = self.surface_tactile_frame
+                            tactile_config = self._build_tactile_contact_config(params)
+                            raw_contact_map = (
+                                tactile_frame.contact_map
+                                if tactile_frame is not None
+                                else None
+                            )
+                            base_map = tactile_frame.base_map if tactile_frame is not None else None
+                            contact_stats = None
+                            gate = self._pressure_contact_gate_snapshot()
+                            gate_blocks_contact = False
+                            if raw_contact_map is not None and base_map is not None:
+                                gate_blocks_contact = bool(gate["enabled"]) and not bool(gate["contact"])
+                                if gate_blocks_contact:
+                                    contact_zero_pending = False
+                                    contact_zero_ready = False
+                                    contact_zero_active = False
+                                    contact_zero_samples.clear()
+                                    self.surface_contact_baseline = None
+                                    self.surface_contact_display_ema = None
+                                    self.surface_zero_ready = False
+                                    contact_map_for_display = np.zeros_like(raw_contact_map, dtype=np.float32)
+                                else:
+                                    if gate["enabled"] and not contact_zero_ready and not contact_zero_pending:
+                                        contact_zero_pending = True
+                                        contact_zero_samples.clear()
+                                        self.surface_contact_baseline = None
+                                        self.surface_contact_display_ema = None
+                                        self.surface_zero_ready = False
+                                    contact_zero_active = bool(centroids) and contact_zero_pending
+
+                                if not gate_blocks_contact and contact_zero_active:
+                                    contact_zero_samples.append(raw_contact_map.astype(np.float32).copy())
+                                    if len(contact_zero_samples) >= CONTACT_ZERO_SAMPLE_COUNT:
+                                        self.surface_contact_baseline = np.median(
+                                            np.stack(
+                                                contact_zero_samples[-CONTACT_ZERO_SAMPLE_COUNT:],
+                                                axis=0,
+                                            ),
+                                            axis=0,
+                                        ).astype(np.float32)
+                                        self.surface_contact_display_ema = np.zeros_like(
+                                            raw_contact_map,
+                                            dtype=np.float32,
+                                        )
+                                        contact_zero_samples.clear()
+                                        contact_zero_pending = False
+                                        contact_zero_ready = True
+                                        self.surface_zero_ready = True
+                                        self.log("Remote CUDA contact zero captured from averaged contact maps.")
+                                    contact_map_for_display = np.zeros_like(raw_contact_map, dtype=np.float32)
+                                elif not gate_blocks_contact and (
+                                    contact_zero_ready
+                                    and self.surface_contact_baseline is not None
+                                    and self.surface_contact_baseline.shape == raw_contact_map.shape
+                                ):
+                                    contact_map_for_display = np.maximum(
+                                        raw_contact_map - self.surface_contact_baseline,
+                                        0.0,
+                                    ).astype(np.float32)
+                                    if (
+                                        self.surface_contact_display_ema is None
+                                        or self.surface_contact_display_ema.shape != contact_map_for_display.shape
+                                    ):
+                                        self.surface_contact_display_ema = contact_map_for_display
+                                    else:
+                                        self.surface_contact_display_ema = cv2.addWeighted(
+                                            self.surface_contact_display_ema.astype(np.float32),
+                                            0.68,
+                                            contact_map_for_display,
+                                            0.32,
+                                            0.0,
+                                        )
+                                    contact_map_for_display = self.surface_contact_display_ema
+                                else:
+                                    contact_map_for_display = np.zeros_like(raw_contact_map, dtype=np.float32)
+
+                                height_map = surface_from_contact_map(
+                                    contact_map_for_display,
+                                    base_map,
+                                    ellipse_mask,
+                                    tactile_config,
+                                    cv2=cv2,
+                                )
+                                contact_stats = summarize_contact_map(
+                                    contact_map_for_display,
+                                    ellipse_mask,
+                                    tactile_config.contact_area_threshold,
+                                )
+
+                            deform_contact_stats = contact_stats
+                            deform_tactile_frame = tactile_frame
+                            deform_surface_scale = scale
+                            deform_gate = gate
+                            if contact_stats is not None and contact_stats["ready"]:
+                                surface_graph_history.append(
+                                    (
+                                        float(contact_stats["peak"]),
+                                        float(contact_stats["top_mean"]),
+                                    )
+                                )
+                            else:
+                                surface_graph_history.append((None, None))
+                            if len(surface_graph_history) > 180:
+                                del surface_graph_history[:-180]
+
+                            self._set_var(
+                                self.surface_status_var,
+                                (
+                                    (
+                                        (
+                                            f"Remote contact zeroing {len(contact_zero_samples)}/"
+                                            f"{CONTACT_ZERO_SAMPLE_COUNT}..."
+                                        )
+                                        if contact_zero_pending
+                                        else "Remote contact zero set."
+                                    )
+                                    if contact_zero_active
+                                    else (
+                                        (
+                                            "Remote surface running."
+                                            if not gate["enabled"]
+                                            else gate["status"]
+                                        )
+                                        if contact_zero_ready
+                                        else (
+                                            gate["status"]
+                                            if gate_blocks_contact
+                                            else "Press Reset Zero to set contact deform zero."
+                                        )
+                                    )
+                                ),
+                            )
+
+                            display_bgr = self._build_flow_3d_plot(
+                                flow_gray,
+                                height_map,
+                                cv2,
+                                roi_mask=ellipse_mask,
+                                camera_gray_frame=flow_gray,
+                                surface_history=surface_graph_history,
+                            )
+                            if contact_stats is not None and contact_stats["ready"]:
+                                camera_depth_mm = self._estimate_camera_depth_mm(contact_stats)
+                                if gate_blocks_contact:
+                                    camera_depth_mm = 0.0
+                                stepper_depth_mm = self._stepper_contact_depth_mm()
+                                self._refresh_contact_depth_readouts(
+                                    camera_depth_mm,
+                                    update_camera=True,
+                                )
+                                flow_distance_mean = contact_stats["top_mean"]
+                                flow_distance_max = contact_stats["peak"]
+                                peak_pct = contact_stats["peak"] * 100.0
+                                top_pct = contact_stats["top_mean"] * 100.0
+                                stepper_text = (
+                                    f"{stepper_depth_mm:.3f} mm"
+                                    if stepper_depth_mm is not None
+                                    else ("manual" if not STEPPER_DEPTH_ENABLED else "-")
+                                )
+                                camera_text = (
+                                    f"{camera_depth_mm:.2f} mm approx"
+                                    if camera_depth_mm is not None
+                                    else "-"
+                                )
+                                distance_text = (
+                                    f"Depth stepper: {stepper_text} | "
+                                    f"camera: {camera_text} | contact {peak_pct:.0f}%"
+                                )
+                                overlay_lines = [
+                                    "Remote CUDA surface",
+                                    f"Pressure gate: {gate['status']}",
+                                    (
+                                        f"Contact intensity peak {peak_pct:.0f}% | "
+                                        f"top {top_pct:.0f}%"
+                                    ),
+                                    (
+                                        f"Area {contact_stats['area_ratio']:.1f}% | "
+                                        f"residual floor {tactile_frame.residual_floor_px:.3f} px"
+                                    ),
+                                ]
+                            else:
+                                self._refresh_contact_depth_readouts(None, update_camera=True)
+                                distance_text = "Press Reset Zero to set contact deform zero."
+                                overlay_lines = [
+                                    "Remote CUDA surface",
+                                    "Press Reset Zero to set contact deform zero.",
+                                    f"Disp mean {mean_disp:.3f} px | scale {scale:.3f}",
+                                ]
+
+                            for line_index, overlay_line in enumerate(overlay_lines):
+                                cv2.putText(
+                                    display_bgr,
+                                    overlay_line,
+                                    (12, 50 + (line_index * 20)),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.54,
+                                    (250, 245, 85),
+                                    2,
+                                )
+                        else:
+                            self._set_var(self.surface_status_var, "Remote surface waiting for dots.")
+                            display_bgr = frame_for_detection.copy()
+                    elif remote_preview_bgr is not None and display_mode in {"pointcloud", "heatmap"}:
+                        display_bgr = remote_preview_bgr
+                    elif display_mode == "pointcloud":
+                        display_bgr = pipe.build_pointcloud_view(
+                            frame_for_detection.shape,
+                            reference_centroids,
+                            displacements,
+                        )
+                    else:
+                        vector_vis = pipe.draw_displacement_vectors(
+                            frame_for_detection.copy(),
+                            reference_centroids,
+                            displacements,
+                        )
+                        if display_mode == "heatmap":
+                            heatmap = pipe.build_displacement_heatmap(
+                                frame_for_detection.shape,
+                                reference_centroids,
+                                displacements,
+                            )
+                            display_bgr = pipe.overlay_heatmap(frame_for_detection, heatmap)
+                        elif remote_preview_bgr is not None:
+                            display_bgr = remote_preview_bgr
+                        else:
+                            display_bgr = vector_vis
+
+                    if display_bgr is None:
+                        display_bgr = frame_for_detection.copy()
                     cv2.putText(
                         display_bgr,
                         distance_text,
@@ -7526,16 +7884,20 @@ class AllInOneTesterGUI:
                     frame_ms = (time.perf_counter() - loop_start) * 1000.0
 
                     self._update_camera_deform_live_features(
-                        mean_disp=mean_disp,
-                        max_disp=max_disp,
+                        mean_disp=flow_distance_mean,
+                        max_disp=flow_distance_max,
                         missing_ratio=missing_ratio,
+                        contact_stats=deform_contact_stats,
+                        tactile_frame=deform_tactile_frame,
+                        scale_px=deform_surface_scale,
+                        gate=deform_gate,
                     )
-                    self._set_var(self.surface_status_var, "Remote CUDA deformation tracking.")
                     self._set_var(
                         self.blob_message_var,
                         (
                             f"Remote CUDA running "
-                            f"({remote_payload.get('roundtrip_ms', 0.0):.1f} ms network)."
+                            f"({remote_payload.get('roundtrip_ms', 0.0):.1f} ms network, "
+                            f"{remote_payload.get('process_backend', 'remote')})."
                         ),
                     )
 
@@ -7543,11 +7905,11 @@ class AllInOneTesterGUI:
                         {
                             "frame_rgb": frame_rgb_preview,
                             "dot_count": len(centroids),
-                            "picked_mode": "remote CUDA | dot displacement",
+                            "picked_mode": f"remote CUDA | {display_mode}",
                             "fps": fps,
                             "frame_ms": frame_ms,
-                            "mean_disp": mean_disp,
-                            "max_disp": max_disp,
+                            "mean_disp": flow_distance_mean,
+                            "max_disp": flow_distance_max,
                             "missing_ratio": missing_ratio,
                             "new_tracks": new_count,
                             "lost_tracks": lost_count,
