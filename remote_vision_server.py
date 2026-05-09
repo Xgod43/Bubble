@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -20,21 +21,105 @@ if str(ROOT_DIR) not in sys.path:
 from JNR import dot_pipeline as pipe
 
 
+SERVICE_BACKEND = "remote-cuda-opencv"
+CUDA_PREPROCESS_ENABLED = os.environ.get(
+    "BUBBLE_REMOTE_VISION_CUDA_PREPROCESS",
+    "1",
+).strip().lower() in {"1", "true", "yes", "on"}
+
+
 class RemoteVisionState:
     def __init__(self):
         self.reference_centroids = None
         self.last_frame_shape = None
+        self.last_frame_at = None
+        self.last_process_ms = None
+        self.last_process_backend = "not-started"
+        self.cuda_error = None
         self.frame_count = 0
         self.started_at = time.perf_counter()
 
     def reset(self):
         self.reference_centroids = None
         self.last_frame_shape = None
+        self.last_frame_at = None
+        self.last_process_ms = None
+        self.last_process_backend = "not-started"
+        self.cuda_error = None
         self.frame_count = 0
         self.started_at = time.perf_counter()
 
 
 STATE = RemoteVisionState()
+_CUDA_DEVICE_COUNT = None
+_CUDA_FILTERS = {}
+
+
+def _cuda_device_count():
+    global _CUDA_DEVICE_COUNT
+    if _CUDA_DEVICE_COUNT is not None:
+        return _CUDA_DEVICE_COUNT
+    try:
+        _CUDA_DEVICE_COUNT = int(cv2.cuda.getCudaEnabledDeviceCount())
+    except Exception:
+        _CUDA_DEVICE_COUNT = 0
+    return _CUDA_DEVICE_COUNT
+
+
+def _cuda_preprocess(frame_bgr):
+    if not CUDA_PREPROCESS_ENABLED or _cuda_device_count() <= 0:
+        return None
+
+    try:
+        gpu_frame = cv2.cuda_GpuMat()
+        gpu_frame.upload(frame_bgr)
+        gpu_gray = cv2.cuda.cvtColor(gpu_frame, cv2.COLOR_BGR2GRAY)
+
+        if pipe.MEDIAN_BLUR_KSIZE >= 3 and pipe.MEDIAN_BLUR_KSIZE % 2 == 1:
+            median_key = ("median", int(pipe.MEDIAN_BLUR_KSIZE))
+            median_filter = _CUDA_FILTERS.get(median_key)
+            if median_filter is None:
+                median_filter = cv2.cuda.createMedianFilter(
+                    cv2.CV_8UC1,
+                    int(pipe.MEDIAN_BLUR_KSIZE),
+                )
+                _CUDA_FILTERS[median_key] = median_filter
+            gpu_gray = median_filter.apply(gpu_gray)
+
+        gauss_key = ("gaussian", 3, 3)
+        gauss_filter = _CUDA_FILTERS.get(gauss_key)
+        if gauss_filter is None:
+            gauss_filter = cv2.cuda.createGaussianFilter(
+                cv2.CV_8UC1,
+                cv2.CV_8UC1,
+                (3, 3),
+                0,
+            )
+            _CUDA_FILTERS[gauss_key] = gauss_filter
+        return gauss_filter.apply(gpu_gray).download()
+    except Exception as exc:
+        STATE.cuda_error = str(exc)
+        return None
+
+
+def _preprocess(frame_bgr):
+    pre = _cuda_preprocess(frame_bgr)
+    if pre is not None:
+        return pre, "cuda-preprocess"
+    return pipe.preprocess(frame_bgr), "opencv-cpu"
+
+
+def _warm_cuda_preprocess():
+    if not CUDA_PREPROCESS_ENABLED or _cuda_device_count() <= 0:
+        return
+    started_at = time.perf_counter()
+    sample = np.zeros((64, 64, 3), dtype=np.uint8)
+    pre = _cuda_preprocess(sample)
+    elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+    if pre is None:
+        print(f"CUDA preprocess warmup skipped: {STATE.cuda_error}")
+    else:
+        print(f"CUDA preprocess warmup complete in {elapsed_ms:.1f} ms")
 
 
 def _query_float(query, name, default):
@@ -65,7 +150,7 @@ def _detect_centroids(frame_bgr, query):
     use_roi = _query_bool(query, "use_roi", True)
     roi_scale = float(np.clip(_query_float(query, "roi_scale", 0.68), 0.1, 1.0))
 
-    pre = pipe.preprocess(frame_bgr)
+    pre, process_backend = _preprocess(frame_bgr)
     binary = pipe.threshold_image(pre, polarity=polarity)
 
     if use_roi:
@@ -86,7 +171,7 @@ def _detect_centroids(frame_bgr, query):
     if not centroids:
         centroids = pipe.extract_centroids(pipe.detect_blobs(binary))
 
-    return binary, centroids, match_dist
+    return binary, centroids, match_dist, process_backend
 
 
 def _process_frame(frame_bgr, query):
@@ -94,7 +179,8 @@ def _process_frame(frame_bgr, query):
     include_preview = _query_bool(query, "preview", False)
     include_points = _query_bool(query, "points", False)
 
-    binary, centroids, match_dist = _detect_centroids(frame_bgr, query)
+    started_at = time.perf_counter()
+    binary, centroids, match_dist, process_backend = _detect_centroids(frame_bgr, query)
 
     if reset_reference or not STATE.reference_centroids:
         STATE.reference_centroids = list(centroids)
@@ -115,11 +201,19 @@ def _process_frame(frame_bgr, query):
 
     STATE.frame_count += 1
     STATE.last_frame_shape = frame_bgr.shape[:2]
+    STATE.last_frame_at = time.perf_counter()
+    STATE.last_process_ms = (STATE.last_frame_at - started_at) * 1000.0
+    STATE.last_process_backend = process_backend
     elapsed = max(1e-6, time.perf_counter() - STATE.started_at)
 
     payload = {
         "ok": True,
-        "backend": "remote-cuda-opencv",
+        "backend": SERVICE_BACKEND,
+        "processor_backend": pipe.get_detection_backend_name(),
+        "process_backend": process_backend,
+        "process_ms": STATE.last_process_ms,
+        "cuda_device_count": _cuda_device_count(),
+        "cuda_preprocess_enabled": CUDA_PREPROCESS_ENABLED,
         "frame_count": STATE.frame_count,
         "fps_est": STATE.frame_count / elapsed,
         "dot_count": len(centroids),
@@ -173,9 +267,20 @@ class RemoteVisionHandler(BaseHTTPRequestHandler):
             {
                 "ok": True,
                 "service": "remote_vision_server",
-                "backend": pipe.get_detection_backend_name(),
+                "backend": SERVICE_BACKEND,
+                "processor_backend": pipe.get_detection_backend_name(),
+                "process_backend": STATE.last_process_backend,
+                "process_ms": STATE.last_process_ms,
+                "cuda_device_count": _cuda_device_count(),
+                "cuda_preprocess_enabled": CUDA_PREPROCESS_ENABLED,
+                "cuda_error": STATE.cuda_error,
                 "frame_count": STATE.frame_count,
                 "reference_count": len(STATE.reference_centroids or []),
+                "last_frame_age_s": (
+                    None
+                    if STATE.last_frame_at is None
+                    else max(0.0, time.perf_counter() - STATE.last_frame_at)
+                ),
             },
         )
 
@@ -220,6 +325,7 @@ def main():
     print(f"Remote vision server listening on http://{args.host}:{args.port}")
     print("Health check: GET /health")
     print("Process frame: POST JPEG bytes to /process")
+    _warm_cuda_preprocess()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

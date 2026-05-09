@@ -86,7 +86,17 @@ FORCE_CYCLE_LIMIT_MAX_SECONDS = float(os.environ.get("BUBBLE_FORCE_CYCLE_LIMIT_S
 FORCE_CYCLE_SETTLE_SECONDS = float(os.environ.get("BUBBLE_FORCE_CYCLE_SETTLE_SECONDS", "0.25"))
 FORCE_DEFAULT_PRESSURE_ZERO_HPA = 1032.0
 REMOTE_VISION_DEFAULT_URL = os.environ.get("BUBBLE_REMOTE_VISION_URL", "http://192.168.4.2:8765")
-REMOTE_VISION_TIMEOUT_SECONDS = float(os.environ.get("BUBBLE_REMOTE_VISION_TIMEOUT_SECONDS", "1.8"))
+REMOTE_VISION_TIMEOUT_SECONDS = float(os.environ.get("BUBBLE_REMOTE_VISION_TIMEOUT_SECONDS", "3.5"))
+REMOTE_VISION_TARGET_FPS = float(os.environ.get("BUBBLE_REMOTE_VISION_TARGET_FPS", "4.0"))
+REMOTE_VISION_CAPTURE_WIDTH = int(os.environ.get("BUBBLE_REMOTE_VISION_CAPTURE_WIDTH", "640"))
+REMOTE_VISION_CAPTURE_HEIGHT = int(os.environ.get("BUBBLE_REMOTE_VISION_CAPTURE_HEIGHT", "480"))
+REMOTE_VISION_JPEG_QUALITY = int(os.environ.get("BUBBLE_REMOTE_VISION_JPEG_QUALITY", "62"))
+REMOTE_VISION_PREVIEW_ENABLED = os.environ.get("BUBBLE_REMOTE_VISION_PREVIEW", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 CAMERA_DEFORM_CALIBRATION_FILENAME = "camera_deform_calibration.json"
 CAMERA_DEFORM_FEATURE_NAMES = (
     "pressure_delta_hpa",
@@ -3981,6 +3991,10 @@ class AllInOneTesterGUI:
             raise ValueError("Remote CUDA URL is required.")
         if remote_vision_url and not remote_vision_url.startswith(("http://", "https://")):
             raise ValueError("Remote CUDA URL must start with http:// or https://.")
+        if vision_backend == "remote_cuda" and camera_backend in {"auto", "opencv"}:
+            self.log("Remote CUDA low-load mode uses Picamera2 for Pi CSI capture.")
+            camera_backend = "picamera2"
+            self.blob_camera_backend_var.set("picamera2")
 
         illum_method = self.blob_illum_method_var.get().strip().lower()
         if illum_method not in {"clahe", "clahe_bg"}:
@@ -4013,6 +4027,23 @@ class AllInOneTesterGUI:
         mosaic_scale = float(self.blob_mosaic_scale_var.get().strip())
         distance_scale = float(self.blob_distance_scale_var.get().strip())
         distance_unit = self.blob_distance_unit_var.get().strip()
+
+        if vision_backend == "remote_cuda":
+            capped_width = min(cam_width, REMOTE_VISION_CAPTURE_WIDTH)
+            capped_height = min(cam_height, REMOTE_VISION_CAPTURE_HEIGHT)
+            if (capped_width, capped_height) != (cam_width, cam_height):
+                self.log(
+                    "Remote CUDA low-load capture capped "
+                    f"{cam_width}x{cam_height} -> {capped_width}x{capped_height}."
+                )
+                cam_width = capped_width
+                cam_height = capped_height
+                self.blob_cam_width_var.set(str(cam_width))
+                self.blob_cam_height_var.set(str(cam_height))
+            if proc_scale != 1.0:
+                self.log("Remote CUDA low-load mode disables Pi-side resize.")
+                proc_scale = 1.0
+                self.blob_proc_scale_var.set("1.0")
 
         if camera_index < 0:
             raise ValueError("Camera index must be >= 0.")
@@ -7203,7 +7234,7 @@ class AllInOneTesterGUI:
         ok, encoded = cv2.imencode(
             ".jpg",
             frame_bgr,
-            [int(cv2.IMWRITE_JPEG_QUALITY), 78],
+            [int(cv2.IMWRITE_JPEG_QUALITY), int(np.clip(REMOTE_VISION_JPEG_QUALITY, 35, 92))],
         )
         if not ok:
             raise RuntimeError("Could not encode camera frame for remote vision.")
@@ -7211,7 +7242,7 @@ class AllInOneTesterGUI:
         query = urlencode(
             {
                 "reset": "1" if reset_reference else "0",
-                "preview": "1",
+                "preview": "1" if REMOTE_VISION_PREVIEW_ENABLED else "0",
                 "points": "1",
                 "mode": params.get("mode", "auto"),
                 "use_roi": "1" if params.get("use_roi", True) else "0",
@@ -7357,6 +7388,7 @@ class AllInOneTesterGUI:
                 analogue_gain=params.get("analogue_gain"),
                 awb_mode=params.get("awb_mode", "auto"),
                 colour_gains=params.get("colour_gains"),
+                frame_rate=REMOTE_VISION_TARGET_FPS if remote_backend else None,
             )
 
             self.blob_camera = stream
@@ -7411,7 +7443,7 @@ class AllInOneTesterGUI:
                     )
 
                 frame_for_detection = frame_bgr
-                if params.get("use_illum_norm", False):
+                if params.get("use_illum_norm", False) and not remote_backend:
                     frame_for_detection = self._apply_illumination_normalization(
                         frame_bgr,
                         cv2,
@@ -7530,6 +7562,12 @@ class AllInOneTesterGUI:
                             self._save_blob_snapshot(cv2, display_bgr, binary)
                         except Exception as snapshot_exc:
                             self.log(f"Blob snapshot error: {snapshot_exc}")
+
+                    if REMOTE_VISION_TARGET_FPS > 0:
+                        min_period = 1.0 / max(0.1, REMOTE_VISION_TARGET_FPS)
+                        remaining = min_period - (time.perf_counter() - loop_start)
+                        if remaining > 0:
+                            time.sleep(min(remaining, 0.2))
 
                     continue
 

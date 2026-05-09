@@ -12,6 +12,7 @@ from all_in_one_gui import (
     COLOR_WARN,
     LIMIT_1_PIN,
     LIMIT_2_PIN,
+    REMOTE_VISION_DEFAULT_URL,
 )
 
 
@@ -493,7 +494,7 @@ class MissionControlGUI(AllInOneTesterGUI):
         self.blob_distance_scale_var = tk.StringVar(value="1.0")
         self.blob_distance_unit_var = tk.StringVar(value="px")
         self.vision_backend_var = tk.StringVar(value="local")
-        self.remote_vision_url_var = tk.StringVar(value="http://192.168.4.2:8765")
+        self.remote_vision_url_var = tk.StringVar(value=REMOTE_VISION_DEFAULT_URL)
 
     def _init_hardware_defaults(self):
         self.camera_status_var = tk.StringVar(value="Stopped")
