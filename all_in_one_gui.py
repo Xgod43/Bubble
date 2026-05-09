@@ -922,8 +922,10 @@ class AllInOneTesterGUI:
 
         graph_area = ttk.Frame(force_pane)
         graph_area.columnconfigure(0, weight=1)
-        graph_area.rowconfigure(0, weight=1)
-        graph_area.rowconfigure(1, weight=1)
+        graph_area.rowconfigure(0, weight=2)
+        graph_area.rowconfigure(1, weight=2)
+        graph_area.rowconfigure(2, weight=1)
+        graph_area.rowconfigure(3, weight=1)
 
         side_area = ttk.Frame(force_pane)
         side_area.columnconfigure(0, weight=1)
@@ -958,6 +960,34 @@ class AllInOneTesterGUI:
         )
         self.force_error_canvas.grid(row=0, column=0, sticky="nsew")
         self.force_error_canvas.bind("<Configure>", lambda _event: self._draw_force_graphs())
+
+        deform_frame = ttk.LabelFrame(graph_area, text="Deformation monitor", padding=8)
+        deform_frame.grid(row=2, column=0, sticky="nsew", padx=(0, 10), pady=(8, 0))
+        deform_frame.columnconfigure(0, weight=1)
+        deform_frame.rowconfigure(0, weight=1)
+        self.force_deform_canvas = tk.Canvas(
+            deform_frame,
+            height=150,
+            background="#f9fbfc",
+            highlightthickness=1,
+            highlightbackground=COLOR_BORDER,
+        )
+        self.force_deform_canvas.grid(row=0, column=0, sticky="nsew")
+        self.force_deform_canvas.bind("<Configure>", lambda _event: self._draw_force_graphs())
+
+        distance_frame = ttk.LabelFrame(graph_area, text="Distance estimate", padding=8)
+        distance_frame.grid(row=3, column=0, sticky="nsew", padx=(0, 10), pady=(8, 0))
+        distance_frame.columnconfigure(0, weight=1)
+        distance_frame.rowconfigure(0, weight=1)
+        self.force_distance_canvas = tk.Canvas(
+            distance_frame,
+            height=150,
+            background="#f9fbfc",
+            highlightthickness=1,
+            highlightbackground=COLOR_BORDER,
+        )
+        self.force_distance_canvas.grid(row=0, column=0, sticky="nsew")
+        self.force_distance_canvas.bind("<Configure>", lambda _event: self._draw_force_graphs())
 
         panel = ttk.LabelFrame(side_area, text="Force from pressure", padding=12)
         panel.grid(row=0, column=0, sticky="new")
@@ -5418,6 +5448,7 @@ class AllInOneTesterGUI:
 
     def _append_force_cycle_sample(self, now=None, force=False):
         now = time.monotonic() if now is None else float(now)
+        appended = False
         with self.sensor_data_lock:
             if not getattr(self, "force_cycle_capture_active", False):
                 return
@@ -5476,6 +5507,9 @@ class AllInOneTesterGUI:
                 }
             )
             self.force_cycle_capture_last_time = now
+            appended = True
+        if appended:
+            self._request_force_graph_redraw()
 
     @staticmethod
     def _csv_number(value, digits=6):
@@ -5590,6 +5624,53 @@ class AllInOneTesterGUI:
             ax.grid(True, alpha=0.28)
             fig.tight_layout()
             path = output_dir / f"force_cycle_{timestamp}_indentation_dot.png"
+            fig.savefig(path, dpi=160)
+            plt.close(fig)
+            saved_paths.append(path)
+
+        dot_mean_points = finite_series("dot_mean_px")
+        dot_max_points = finite_series("dot_max_px")
+        depth_points = finite_series("indentation_depth_mm")
+        if dot_mean_points or dot_max_points or depth_points:
+            fig, axes = plt.subplots(2, 1, figsize=(8.5, 6.0), sharex=True)
+            fig.suptitle(f"Deformation and distance estimate: {shape_name}")
+            if dot_mean_points:
+                axes[0].plot(
+                    [point[0] for point in dot_mean_points],
+                    [point[1] for point in dot_mean_points],
+                    label="mean dot displacement",
+                    color="#2f6178",
+                    linewidth=1.5,
+                )
+            if dot_max_points:
+                axes[0].plot(
+                    [point[0] for point in dot_max_points],
+                    [point[1] for point in dot_max_points],
+                    label="max dot displacement",
+                    color="#f0a000",
+                    linewidth=1.2,
+                    linestyle="--",
+                )
+            axes[0].set_ylabel("deformation (px)")
+            axes[0].grid(True, alpha=0.28)
+            if dot_mean_points or dot_max_points:
+                axes[0].legend(loc="best")
+
+            if depth_points:
+                axes[1].plot(
+                    [point[0] for point in depth_points],
+                    [point[1] for point in depth_points],
+                    label="stepper indentation depth",
+                    color="#139a74",
+                    linewidth=1.5,
+                )
+            axes[1].set_xlabel("elapsed (s)")
+            axes[1].set_ylabel("distance estimate (mm)")
+            axes[1].grid(True, alpha=0.28)
+            if depth_points:
+                axes[1].legend(loc="best")
+            fig.tight_layout()
+            path = output_dir / f"force_cycle_{timestamp}_deformation_distance.png"
             fig.savefig(path, dpi=160)
             plt.close(fig)
             saved_paths.append(path)
@@ -5846,8 +5927,8 @@ class AllInOneTesterGUI:
     def _request_force_graph_redraw(self):
         if not self.root.winfo_exists():
             return
-        compare_canvases, error_canvases = self._force_graph_canvases()
-        if not compare_canvases and not error_canvases:
+        graph_canvases = self._force_graph_canvases()
+        if not any(graph_canvases):
             return
         if getattr(self, "force_graph_redraw_pending", False):
             return
@@ -5863,10 +5944,14 @@ class AllInOneTesterGUI:
     def _force_graph_canvases(self):
         compare_canvases = []
         error_canvases = []
+        deform_canvases = []
+        distance_canvases = []
         seen = set()
         for name, target in (
             ("force_compare_canvas", compare_canvases),
             ("force_error_canvas", error_canvases),
+            ("force_deform_canvas", deform_canvases),
+            ("force_distance_canvas", distance_canvases),
         ):
             canvas = getattr(self, name, None)
             if canvas is None:
@@ -5880,7 +5965,7 @@ class AllInOneTesterGUI:
                 continue
             seen.add(id(canvas))
             target.append(canvas)
-        return compare_canvases, error_canvases
+        return compare_canvases, error_canvases, deform_canvases, distance_canvases
 
     @staticmethod
     def _finite_number(value):
@@ -5907,14 +5992,18 @@ class AllInOneTesterGUI:
         if not self.root.winfo_exists():
             return
 
-        compare_canvases, error_canvases = self._force_graph_canvases()
-        if not compare_canvases and not error_canvases:
+        compare_canvases, error_canvases, deform_canvases, distance_canvases = self._force_graph_canvases()
+        if not any((compare_canvases, error_canvases, deform_canvases, distance_canvases)):
             return
 
         for canvas in compare_canvases:
             self._draw_force_time_graph(canvas)
         for canvas in error_canvases:
             self._draw_force_error_graph(canvas)
+        for canvas in deform_canvases:
+            self._draw_force_cycle_deformation_graph(canvas)
+        for canvas in distance_canvases:
+            self._draw_force_cycle_distance_graph(canvas)
 
     def _prepare_graph_canvas(self, canvas, title, x_label, y_label):
         width = max(1, int(canvas.winfo_width()))
@@ -6223,6 +6312,146 @@ class AllInOneTesterGUI:
             anchor="w",
             fill=COLOR_MUTED,
             font=("Segoe UI", 7),
+        )
+
+    def _draw_force_cycle_series_graph(self, canvas, title, y_label, series_specs, empty_message):
+        with self.sensor_data_lock:
+            history = list(getattr(self, "force_cycle_sample_history", []))
+
+        series_points = []
+        y_values = []
+        x_values = []
+        for key, label, color, dash in series_specs:
+            points = []
+            for sample in history:
+                elapsed = sample.get("elapsed_s")
+                value = sample.get(key)
+                if self._finite_number(elapsed) and self._finite_number(value):
+                    point = (float(elapsed), float(value))
+                    points.append(point)
+                    x_values.append(point[0])
+                    y_values.append(point[1])
+            series_points.append((label, color, dash, points))
+
+        if not y_values:
+            self._draw_empty_graph(canvas, title, empty_message)
+            return
+
+        (
+            _width,
+            _height,
+            left,
+            top,
+            right,
+            bottom,
+            plot_width,
+            plot_height,
+        ) = self._prepare_graph_canvas(canvas, title, "cycle elapsed (s)", y_label)
+
+        x_min = 0.0
+        x_max = max(1.0, max(x_values))
+        y_min, y_max = self._graph_bounds(y_values, include_zero=True)
+
+        def x_for(value):
+            ratio = (float(value) - x_min) / max(1e-9, x_max - x_min)
+            return left + (np.clip(ratio, 0.0, 1.0) * plot_width)
+
+        def y_for(value):
+            ratio = (float(value) - y_min) / max(1e-9, y_max - y_min)
+            return bottom - (np.clip(ratio, 0.0, 1.0) * plot_height)
+
+        for idx in range(4):
+            ratio = idx / 3.0
+            y = top + (ratio * plot_height)
+            value = y_max - (ratio * (y_max - y_min))
+            canvas.create_line(left, y, right, y, fill="#e1e8ea")
+            canvas.create_text(
+                left - 5,
+                y,
+                text=f"{value:.1f}",
+                anchor="e",
+                fill=COLOR_MUTED,
+                font=("Segoe UI", 7),
+            )
+
+        for idx in range(3):
+            ratio = idx / 2.0
+            x = left + (ratio * plot_width)
+            value = x_min + (ratio * (x_max - x_min))
+            canvas.create_line(x, top, x, bottom, fill="#edf2f3")
+            canvas.create_text(
+                x,
+                bottom + 4,
+                text=f"{value:.1f}",
+                anchor="n",
+                fill=COLOR_MUTED,
+                font=("Segoe UI", 7),
+            )
+
+        legend_x = right - 150
+        legend_y = top - 9
+        for index, (label, color, dash, points) in enumerate(series_points):
+            if not points:
+                continue
+            coords = []
+            last_point = None
+            for elapsed, value in points:
+                x = x_for(elapsed)
+                y = y_for(value)
+                coords.extend((x, y))
+                last_point = (x, y, value)
+            if len(coords) >= 4:
+                canvas.create_line(*coords, fill=color, width=2, smooth=True, dash=dash)
+            if last_point is not None:
+                x, y, value = last_point
+                canvas.create_oval(x - 3, y - 3, x + 3, y + 3, fill=color, outline=color)
+                if index == 0:
+                    canvas.create_text(
+                        right - 6,
+                        top + 4,
+                        text=f"latest {value:.3f}",
+                        anchor="ne",
+                        fill=COLOR_MUTED,
+                        font=("Segoe UI", 7),
+                    )
+            legend_offset = index * 78
+            canvas.create_line(
+                legend_x + legend_offset,
+                legend_y,
+                legend_x + legend_offset + 18,
+                legend_y,
+                fill=color,
+                width=2,
+                dash=dash,
+            )
+            canvas.create_text(
+                legend_x + legend_offset + 22,
+                legend_y,
+                text=label,
+                anchor="w",
+                fill=COLOR_MUTED,
+                font=("Segoe UI", 7),
+            )
+
+    def _draw_force_cycle_deformation_graph(self, canvas):
+        self._draw_force_cycle_series_graph(
+            canvas,
+            "Cycle deformation monitor",
+            "px",
+            (
+                ("dot_mean_px", "mean dot", COLOR_ACCENT, None),
+                ("dot_max_px", "max dot", COLOR_WARN, (4, 2)),
+            ),
+            "Start Detection, then Run Force Cycle",
+        )
+
+    def _draw_force_cycle_distance_graph(self, canvas):
+        self._draw_force_cycle_series_graph(
+            canvas,
+            "Cycle distance estimate",
+            "mm",
+            (("indentation_depth_mm", "stepper depth", COLOR_OK, None),),
+            "Run Force Cycle to estimate indentation depth",
         )
 
     @staticmethod

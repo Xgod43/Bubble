@@ -369,8 +369,10 @@ class MissionControlGUI(AllInOneTesterGUI):
 
         graph_area = ttk.Frame(pane, style="App.TFrame", padding=(0, 0, 8, 0))
         graph_area.columnconfigure(0, weight=1)
-        graph_area.rowconfigure(0, weight=1)
-        graph_area.rowconfigure(1, weight=1)
+        graph_area.rowconfigure(0, weight=2)
+        graph_area.rowconfigure(1, weight=2)
+        graph_area.rowconfigure(2, weight=1)
+        graph_area.rowconfigure(3, weight=1)
 
         side_shell, side_content = self._build_scrollable_tab(pane, padding=8)
 
@@ -404,6 +406,34 @@ class MissionControlGUI(AllInOneTesterGUI):
         )
         self.force_error_canvas.grid(row=0, column=0, sticky="nsew")
         self.force_error_canvas.bind("<Configure>", lambda _event: self._draw_force_graphs())
+
+        deform = ttk.LabelFrame(graph_area, text="Deformation monitor", padding=8)
+        deform.grid(row=2, column=0, sticky="nsew", pady=(6, 0))
+        deform.columnconfigure(0, weight=1)
+        deform.rowconfigure(0, weight=1)
+        self.force_deform_canvas = tk.Canvas(
+            deform,
+            height=160,
+            background="#0a131b",
+            highlightthickness=1,
+            highlightbackground=COLOR_BORDER_DARK,
+        )
+        self.force_deform_canvas.grid(row=0, column=0, sticky="nsew")
+        self.force_deform_canvas.bind("<Configure>", lambda _event: self._draw_force_graphs())
+
+        distance = ttk.LabelFrame(graph_area, text="Distance estimate", padding=8)
+        distance.grid(row=3, column=0, sticky="nsew", pady=(6, 0))
+        distance.columnconfigure(0, weight=1)
+        distance.rowconfigure(0, weight=1)
+        self.force_distance_canvas = tk.Canvas(
+            distance,
+            height=150,
+            background="#0a131b",
+            highlightthickness=1,
+            highlightbackground=COLOR_BORDER_DARK,
+        )
+        self.force_distance_canvas.grid(row=0, column=0, sticky="nsew")
+        self.force_distance_canvas.bind("<Configure>", lambda _event: self._draw_force_graphs())
 
         self._build_force_measurement_tab(side_content)
         self.root.after(120, self._draw_force_graphs)
