@@ -11,6 +11,8 @@ SYNC_PAIRS = [
     ("hx711v0_5_1.py", "single_folder_runtime/library/hx711py/hx711v0_5_1.py"),
     ("requirements-pi-bookworm.txt", "single_folder_runtime/requirements-pi-bookworm.txt"),
     ("python_mission_control_gui.py", "single_folder_runtime/python_mission_control_gui.py"),
+    ("remote_vision_server.py", "single_folder_runtime/remote_vision_server.py"),
+    ("remote_vision_smoke_test.py", "single_folder_runtime/remote_vision_smoke_test.py"),
     ("stepper_test_gui.py", "single_folder_runtime/stepper_test_gui.py"),
     ("launch_bubble_app.py", "single_folder_runtime/launch_bubble_app.py"),
     ("main.py", "single_folder_runtime/main.py"),

@@ -492,6 +492,8 @@ class MissionControlGUI(AllInOneTesterGUI):
         self.blob_illum_method_var = tk.StringVar(value="clahe")
         self.blob_distance_scale_var = tk.StringVar(value="1.0")
         self.blob_distance_unit_var = tk.StringVar(value="px")
+        self.vision_backend_var = tk.StringVar(value="local")
+        self.remote_vision_url_var = tk.StringVar(value="http://192.168.4.2:8765")
 
     def _init_hardware_defaults(self):
         self.camera_status_var = tk.StringVar(value="Stopped")
@@ -767,8 +769,21 @@ class MissionControlGUI(AllInOneTesterGUI):
             row=3, column=3, sticky="ew"
         )
 
+        ttk.Label(control_card, text="Vision backend").grid(row=4, column=0, sticky="w", pady=(4, 0))
+        ttk.Combobox(
+            control_card,
+            textvariable=self.vision_backend_var,
+            values=("local", "remote CUDA"),
+            state="readonly",
+        ).grid(row=5, column=0, sticky="ew", padx=(0, 6))
+
+        ttk.Label(control_card, text="Remote URL").grid(row=4, column=1, sticky="w", pady=(4, 0))
+        ttk.Entry(control_card, textvariable=self.remote_vision_url_var).grid(
+            row=5, column=1, columnspan=3, sticky="ew"
+        )
+
         toggles = ttk.Frame(control_card, style="Surface.TFrame")
-        toggles.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(4, 0))
+        toggles.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(4, 0))
         ttk.Checkbutton(toggles, text="Use ROI", variable=self.blob_use_roi_var).grid(row=0, column=0, sticky="w")
         ttk.Checkbutton(toggles, text="Point Cloud", variable=self.blob_use_pointcloud_var).grid(row=0, column=1, sticky="w", padx=(8, 0))
         ttk.Checkbutton(toggles, text="Mosaic", variable=self.blob_use_mosaic_var).grid(row=0, column=2, sticky="w", padx=(8, 0))

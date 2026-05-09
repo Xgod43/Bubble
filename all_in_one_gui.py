@@ -1,4 +1,5 @@
 import csv
+import base64
 import json
 import queue
 import os
@@ -7,6 +8,8 @@ import sys
 import threading
 import time
 from pathlib import Path
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 import tkinter as tk
 import numpy as np
@@ -82,6 +85,8 @@ FORCE_CALIBRATION_MIN_SAMPLE_FORCE_N = float(
 FORCE_CYCLE_LIMIT_MAX_SECONDS = float(os.environ.get("BUBBLE_FORCE_CYCLE_LIMIT_SECONDS", "45.0"))
 FORCE_CYCLE_SETTLE_SECONDS = float(os.environ.get("BUBBLE_FORCE_CYCLE_SETTLE_SECONDS", "0.25"))
 FORCE_DEFAULT_PRESSURE_ZERO_HPA = 1032.0
+REMOTE_VISION_DEFAULT_URL = os.environ.get("BUBBLE_REMOTE_VISION_URL", "http://192.168.4.2:8765")
+REMOTE_VISION_TIMEOUT_SECONDS = float(os.environ.get("BUBBLE_REMOTE_VISION_TIMEOUT_SECONDS", "1.8"))
 CAMERA_DEFORM_CALIBRATION_FILENAME = "camera_deform_calibration.json"
 CAMERA_DEFORM_FEATURE_NAMES = (
     "pressure_delta_hpa",
@@ -1042,6 +1047,10 @@ class AllInOneTesterGUI:
         self.blob_illum_method_var = tk.StringVar(value="clahe")
         self.blob_distance_scale_var = tk.StringVar(value="1.0")
         self.blob_distance_unit_var = tk.StringVar(value="px")
+        self.vision_backend_var = tk.StringVar(
+            value=os.environ.get("BUBBLE_VISION_BACKEND", "local")
+        )
+        self.remote_vision_url_var = tk.StringVar(value=REMOTE_VISION_DEFAULT_URL)
 
         ttk.Label(
             tab,
@@ -1195,8 +1204,22 @@ class AllInOneTesterGUI:
             row=7, column=3, sticky="ew", pady=(6, 0)
         )
 
+        ttk.Label(controls, text="Vision backend:").grid(row=8, column=0, sticky="w", pady=(6, 0))
+        ttk.Combobox(
+            controls,
+            textvariable=self.vision_backend_var,
+            values=("local", "remote CUDA"),
+            state="readonly",
+        ).grid(row=8, column=1, sticky="ew", pady=(6, 0))
+        ttk.Label(controls, text="Remote URL:").grid(
+            row=8, column=2, sticky="w", pady=(6, 0), padx=(12, 0)
+        )
+        ttk.Entry(controls, textvariable=self.remote_vision_url_var, width=18).grid(
+            row=8, column=3, sticky="ew", pady=(6, 0)
+        )
+
         action_row = ttk.Frame(controls)
-        action_row.grid(row=8, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        action_row.grid(row=9, column=0, columnspan=4, sticky="ew", pady=(10, 0))
         action_row.columnconfigure(0, weight=1)
         action_row.columnconfigure(1, weight=1)
         action_row.columnconfigure(2, weight=1)
@@ -3948,6 +3971,17 @@ class AllInOneTesterGUI:
                 "Output type must be one of: auto, mosaic, overlay, vector, heatmap, pointcloud, binary, blob, optical_flow_2d, surface_3d, optical_flow_3d."
             )
 
+        vision_backend = self.vision_backend_var.get().strip().lower().replace(" ", "_")
+        if vision_backend in {"remote", "cuda", "remote_nvidia"}:
+            vision_backend = "remote_cuda"
+        if vision_backend not in {"local", "remote_cuda"}:
+            raise ValueError("Vision backend must be local or remote CUDA.")
+        remote_vision_url = self.remote_vision_url_var.get().strip().rstrip("/")
+        if vision_backend == "remote_cuda" and not remote_vision_url:
+            raise ValueError("Remote CUDA URL is required.")
+        if remote_vision_url and not remote_vision_url.startswith(("http://", "https://")):
+            raise ValueError("Remote CUDA URL must start with http:// or https://.")
+
         illum_method = self.blob_illum_method_var.get().strip().lower()
         if illum_method not in {"clahe", "clahe_bg"}:
             raise ValueError("Illumination method must be clahe or clahe_bg.")
@@ -4029,6 +4063,8 @@ class AllInOneTesterGUI:
             "run_robust_test": bool(self.blob_run_robust_test_var.get()),
             "distance_scale": distance_scale,
             "distance_unit": distance_unit,
+            "vision_backend": vision_backend,
+            "remote_vision_url": remote_vision_url,
         }
         params["mode"] = mode
         params["min_area"] = min_area
@@ -7144,6 +7180,72 @@ class AllInOneTesterGUI:
         self._refresh_system_status()
         self.log("Load cell stop requested.")
 
+    @staticmethod
+    def _remote_points_from_payload(payload, key):
+        points = []
+        for point in payload.get(key, []) or []:
+            if point is None or len(point) < 2:
+                continue
+            points.append((int(point[0]), int(point[1])))
+        return points
+
+    @staticmethod
+    def _remote_displacements_from_payload(payload):
+        displacements = []
+        for disp in payload.get("displacements", []) or []:
+            if disp is None or len(disp) < 2:
+                displacements.append(None)
+            else:
+                displacements.append((float(disp[0]), float(disp[1])))
+        return displacements
+
+    def _post_remote_vision_frame(self, cv2, frame_bgr, params, reset_reference=False):
+        ok, encoded = cv2.imencode(
+            ".jpg",
+            frame_bgr,
+            [int(cv2.IMWRITE_JPEG_QUALITY), 78],
+        )
+        if not ok:
+            raise RuntimeError("Could not encode camera frame for remote vision.")
+
+        query = urlencode(
+            {
+                "reset": "1" if reset_reference else "0",
+                "preview": "1",
+                "points": "1",
+                "mode": params.get("mode", "auto"),
+                "use_roi": "1" if params.get("use_roi", True) else "0",
+                "roi_scale": f"{float(params.get('roi_scale', 0.68)):.4f}",
+                "min_area": int(float(params.get("min_area", 20))),
+                "max_area": int(float(params.get("max_area", 8000))),
+                "min_circularity": f"{float(params.get('min_circularity', 0.35)):.4f}",
+                "match_dist": f"{float(params.get('match_dist', 9.0)):.4f}",
+            }
+        )
+        url = f"{params['remote_vision_url']}/process?{query}"
+        request = Request(
+            url,
+            data=encoded.tobytes(),
+            headers={"Content-Type": "image/jpeg"},
+            method="POST",
+        )
+        started_at = time.perf_counter()
+        with urlopen(request, timeout=REMOTE_VISION_TIMEOUT_SECONDS) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        roundtrip_ms = (time.perf_counter() - started_at) * 1000.0
+        if not payload.get("ok"):
+            raise RuntimeError(str(payload.get("error", "remote vision failed")))
+
+        preview_bgr = None
+        preview_text = payload.get("preview_jpeg_b64")
+        if preview_text:
+            preview_bytes = base64.b64decode(preview_text)
+            preview_array = np.frombuffer(preview_bytes, dtype=np.uint8)
+            preview_bgr = cv2.imdecode(preview_array, cv2.IMREAD_COLOR)
+
+        payload["roundtrip_ms"] = roundtrip_ms
+        return payload, preview_bgr
+
     def start_blob_test(self):
         if self._is_blob_running():
             self.log("Blob detector is already running.")
@@ -7233,6 +7335,9 @@ class AllInOneTesterGUI:
             pipe = self.blob_module
             cv2 = self.blob_cv2
             params = dict(self.blob_params)
+            remote_backend = params.get("vision_backend") == "remote_cuda"
+            remote_reset_reference_pending = remote_backend
+            remote_fail_count = 0
 
             pipe.MIN_BLOB_AREA = int(params["min_area"])
             pipe.MAX_BLOB_AREA = int(params["max_area"])
@@ -7312,6 +7417,121 @@ class AllInOneTesterGUI:
                         cv2,
                         params.get("illum_method", "clahe_bg"),
                     )
+
+                if remote_backend:
+                    reset_remote = remote_reset_reference_pending
+                    if self.blob_reset_reference_event.is_set():
+                        self.blob_reset_reference_event.clear()
+                        reset_remote = True
+                        self.log("Remote CUDA reference reset requested.")
+                    if self.surface_reset_zero_event.is_set():
+                        self.surface_reset_zero_event.clear()
+                        self._set_var(
+                            self.surface_status_var,
+                            "Remote CUDA mode uses dot displacement; local surface zero is skipped.",
+                        )
+
+                    try:
+                        remote_payload, remote_preview_bgr = self._post_remote_vision_frame(
+                            cv2,
+                            frame_for_detection,
+                            params,
+                            reset_reference=reset_remote,
+                        )
+                        remote_fail_count = 0
+                        remote_reset_reference_pending = False
+                    except Exception as remote_exc:
+                        remote_fail_count += 1
+                        if remote_fail_count == 1 or remote_fail_count % 5 == 0:
+                            self.log(f"Remote CUDA vision retry {remote_fail_count}: {remote_exc}")
+                        self._set_var(
+                            self.blob_message_var,
+                            f"Remote CUDA retry {remote_fail_count}: {remote_exc}",
+                        )
+                        if remote_fail_count >= 12:
+                            raise RuntimeError(f"Remote CUDA vision failed: {remote_exc}") from remote_exc
+                        time.sleep(0.04)
+                        continue
+
+                    centroids = self._remote_points_from_payload(remote_payload, "centroids")
+                    reference_centroids = self._remote_points_from_payload(
+                        remote_payload,
+                        "reference_centroids",
+                    )
+                    displacements = self._remote_displacements_from_payload(remote_payload)
+                    mean_disp = float(remote_payload.get("mean_disp", 0.0) or 0.0)
+                    max_disp = float(remote_payload.get("max_disp", 0.0) or 0.0)
+                    missing_ratio = float(remote_payload.get("missing_ratio", 0.0) or 0.0)
+                    new_count = int(remote_payload.get("new_tracks", 0) or 0)
+                    lost_count = int(remote_payload.get("lost_tracks", 0) or 0)
+                    display_bgr = (
+                        remote_preview_bgr
+                        if remote_preview_bgr is not None
+                        else frame_for_detection.copy()
+                    )
+                    distance_text = (
+                        f"Remote CUDA: mean {mean_disp:.3f}px | "
+                        f"max {max_disp:.3f}px | dots {len(centroids)}"
+                    )
+                    cv2.putText(
+                        display_bgr,
+                        distance_text,
+                        (12, 28),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.58,
+                        (255, 245, 80),
+                        2,
+                    )
+                    frame_rgb_preview = cv2.cvtColor(display_bgr, cv2.COLOR_BGR2RGB)
+
+                    frame_counter += 1
+                    now = time.perf_counter()
+                    elapsed = now - fps_start
+                    if elapsed >= 0.5:
+                        fps = frame_counter / elapsed
+                        frame_counter = 0
+                        fps_start = now
+                    frame_ms = (time.perf_counter() - loop_start) * 1000.0
+
+                    self._update_camera_deform_live_features(
+                        mean_disp=mean_disp,
+                        max_disp=max_disp,
+                        missing_ratio=missing_ratio,
+                    )
+                    self._set_var(self.surface_status_var, "Remote CUDA deformation tracking.")
+                    self._set_var(
+                        self.blob_message_var,
+                        (
+                            f"Remote CUDA running "
+                            f"({remote_payload.get('roundtrip_ms', 0.0):.1f} ms network)."
+                        ),
+                    )
+
+                    self._enqueue_blob_frame(
+                        {
+                            "frame_rgb": frame_rgb_preview,
+                            "dot_count": len(centroids),
+                            "picked_mode": "remote CUDA | dot displacement",
+                            "fps": fps,
+                            "frame_ms": frame_ms,
+                            "mean_disp": mean_disp,
+                            "max_disp": max_disp,
+                            "missing_ratio": missing_ratio,
+                            "new_tracks": new_count,
+                            "lost_tracks": lost_count,
+                            "distance_text": distance_text,
+                        }
+                    )
+
+                    if self.blob_snapshot_event.is_set():
+                        self.blob_snapshot_event.clear()
+                        try:
+                            binary = cv2.cvtColor(display_bgr, cv2.COLOR_BGR2GRAY)
+                            self._save_blob_snapshot(cv2, display_bgr, binary)
+                        except Exception as snapshot_exc:
+                            self.log(f"Blob snapshot error: {snapshot_exc}")
+
+                    continue
 
                 pre = pipe.preprocess(frame_for_detection)
                 binary = pipe.threshold_image(pre, polarity=params["mode"])
