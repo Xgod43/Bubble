@@ -5014,6 +5014,8 @@ class AllInOneTesterGUI:
             self.force_cycle_phase_started_at = None
             self.force_cycle_down_seconds = None
             self.force_cycle_shape_name = "sample"
+            self.force_cycle_report_sample_target = None
+            self.force_cycle_trial = 1
 
         if not hasattr(self, "force_estimate_var"):
             self.force_estimate_var = tk.StringVar(value="-")
@@ -5023,8 +5025,14 @@ class AllInOneTesterGUI:
             self.force_calibration_model_var = tk.StringVar(value="F = a*dP + b")
             self.force_calibration_live_pair_var = tk.StringVar(value="Pressure -, dP -, load -")
             self.force_cycle_shape_var = tk.StringVar(value="sample")
+            self.force_cycle_report_sample_count_var = tk.StringVar(value="all")
+            self.force_cycle_trial_var = tk.StringVar(value="1")
         elif not hasattr(self, "force_cycle_shape_var"):
             self.force_cycle_shape_var = tk.StringVar(value="sample")
+        if not hasattr(self, "force_cycle_report_sample_count_var"):
+            self.force_cycle_report_sample_count_var = tk.StringVar(value="all")
+        if not hasattr(self, "force_cycle_trial_var"):
+            self.force_cycle_trial_var = tk.StringVar(value="1")
 
         if not hasattr(self, "_force_calibration_loaded"):
             self._force_calibration_loaded = True
@@ -5085,47 +5093,19 @@ class AllInOneTesterGUI:
         return ok
 
     def _load_force_calibration(self):
-        path = self._force_calibration_path()
-        if not path.exists():
-            return
-
-        try:
-            with path.open("r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-            if "pressure_delta_hpa" not in str(payload.get("model", "")):
-                raise ValueError("saved calibration uses absolute pressure")
-            slope = float(payload["slope"])
-            intercept = float(payload["intercept"])
-            samples = []
-            for sample in payload.get("samples", []):
-                if "pressure_delta_hpa" in sample:
-                    pressure_delta = float(sample["pressure_delta_hpa"])
-                elif "pressure_hpa" in sample and "pressure_zero_hpa" in payload:
-                    pressure_delta = float(sample["pressure_hpa"]) - float(payload["pressure_zero_hpa"])
-                else:
-                    raise ValueError("saved calibration uses absolute pressure")
-                samples.append((pressure_delta, float(sample["force_n"])))
-            if len(samples) < 2:
-                raise ValueError("saved calibration needs at least 2 bubble samples")
-            if abs(intercept) > FORCE_CALIBRATION_MAX_ZERO_FORCE_N:
-                raise ValueError(f"saved calibration zero-force offset is too large ({intercept:.3f} N)")
-            fit_score = self._force_linear_fit_score(samples, slope, intercept)
-            if len(samples) >= 4 and fit_score is not None and fit_score < FORCE_CALIBRATION_MIN_R2:
-                raise ValueError(f"saved calibration fit is unstable (R^2={fit_score:.3f})")
-        except Exception:
-            self.force_calibration_status_var.set("Saved calibration ignored; set zero and recalibrate.")
-            return
-
         with self.sensor_data_lock:
-            self.force_calibration_coeffs = (slope, intercept)
-            self.force_calibration_samples = samples
+            self.force_calibration_coeffs = None
+            self.force_calibration_samples = []
+            self.latest_pressure_force_n = None
 
-        count = len(samples)
-        self.force_calibration_sample_count_var.set(f"{count} sample{'s' if count != 1 else ''}")
-        self.force_calibration_model_var.set(self._format_force_model(slope, intercept))
+        self.force_calibration_sample_count_var.set("0 samples")
+        self.force_calibration_model_var.set("F = a*dP + b")
+        self.force_estimate_var.set("-")
         self.force_calibration_status_var.set(
-            f"Loaded saved bubble calibration. Pressure zero default {FORCE_DEFAULT_PRESSURE_ZERO_HPA:.2f} hPa."
+            "Force calibration required before use. Set P Zero, Zero Load, then capture 2+ samples."
         )
+        if self._force_calibration_path().exists():
+            self.log("Saved force calibration was not auto-loaded; recalibrate force for this session.")
         self._request_force_graph_redraw()
 
     def _save_force_calibration(self):
@@ -5224,8 +5204,29 @@ class AllInOneTesterGUI:
             row=6, column=1, sticky="ew", pady=(8, 0)
         )
 
+        report = ttk.Frame(parent)
+        report.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        report.columnconfigure(1, weight=1)
+        report.columnconfigure(3, weight=1)
+        ttk.Label(report, text="Report samples:").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        ttk.Combobox(
+            report,
+            textvariable=self.force_cycle_report_sample_count_var,
+            values=("all", "10", "25", "50"),
+            state="readonly",
+            width=8,
+        ).grid(row=0, column=1, sticky="ew", padx=(0, 10))
+        ttk.Label(report, text="Trial:").grid(row=0, column=2, sticky="w", padx=(0, 6))
+        ttk.Combobox(
+            report,
+            textvariable=self.force_cycle_trial_var,
+            values=("1", "2", "3"),
+            state="readonly",
+            width=6,
+        ).grid(row=0, column=3, sticky="ew")
+
         actions = ttk.Frame(parent)
-        actions.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        actions.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(12, 0))
         for col in range(3):
             actions.columnconfigure(col, weight=1)
         ttk.Button(actions, text="Set P Zero", command=self.set_force_pressure_zero).grid(
@@ -5453,6 +5454,73 @@ class AllInOneTesterGUI:
         safe = "".join(token).strip("_")
         return (safe or default)[:48]
 
+    def _force_cycle_report_sample_target(self):
+        text = str(self.force_cycle_report_sample_count_var.get() or "all").strip().lower()
+        if text in {"", "all", "full"}:
+            return None
+        try:
+            value = int(float(text))
+        except (TypeError, ValueError):
+            return None
+        return value if value in {10, 25, 50} else None
+
+    def _force_cycle_report_trial(self):
+        text = str(self.force_cycle_trial_var.get() or "1").strip()
+        try:
+            value = int(float(text))
+        except (TypeError, ValueError):
+            value = 1
+        return int(np.clip(value, 1, 3))
+
+    @staticmethod
+    def _downsample_force_cycle_history(history, target_count):
+        samples = list(history or [])
+        if not target_count or target_count <= 0 or len(samples) <= target_count:
+            return samples
+        indexes = np.linspace(0, len(samples) - 1, int(target_count))
+        selected_indexes = []
+        used = set()
+        for index in indexes:
+            rounded = int(round(float(index)))
+            rounded = int(np.clip(rounded, 0, len(samples) - 1))
+            while rounded in used and rounded + 1 < len(samples):
+                rounded += 1
+            while rounded in used and rounded - 1 >= 0:
+                rounded -= 1
+            if rounded not in used:
+                used.add(rounded)
+                selected_indexes.append(rounded)
+        selected_indexes = sorted(selected_indexes)
+        return [samples[index] for index in selected_indexes[: int(target_count)]]
+
+    @staticmethod
+    def _force_cycle_series_min_max(history, key):
+        points = []
+        for sample in history or []:
+            value = sample.get(key)
+            elapsed = sample.get("elapsed_s")
+            if AllInOneTesterGUI._finite_number(value) and AllInOneTesterGUI._finite_number(elapsed):
+                points.append((float(elapsed), float(value)))
+        if not points:
+            return None
+        min_point = min(points, key=lambda point: point[1])
+        max_point = max(points, key=lambda point: point[1])
+        return {
+            "min_elapsed_s": min_point[0],
+            "min_value": min_point[1],
+            "max_elapsed_s": max_point[0],
+            "max_value": max_point[1],
+        }
+
+    @staticmethod
+    def _force_cycle_report_token(report_sample_target, trial):
+        pieces = []
+        if report_sample_target:
+            pieces.append(f"n{int(report_sample_target)}")
+        if trial is not None:
+            pieces.append(f"trial{int(trial)}")
+        return "" if not pieces else "_" + "_".join(pieces)
+
     def _force_cycle_depth_mm_locked(self, now):
         if not getattr(self, "force_cycle_capture_active", False):
             return None
@@ -5485,7 +5553,7 @@ class AllInOneTesterGUI:
 
         return 0.0
 
-    def _start_force_cycle_capture(self, started_at, shape_name):
+    def _start_force_cycle_capture(self, started_at, shape_name, report_sample_target=None, trial=1):
         clean_shape = self._clean_force_cycle_shape_name(shape_name)
         with self.sensor_data_lock:
             self.force_cycle_sample_history = []
@@ -5496,7 +5564,10 @@ class AllInOneTesterGUI:
             self.force_cycle_phase_started_at = float(started_at)
             self.force_cycle_down_seconds = None
             self.force_cycle_shape_name = clean_shape
-        self.log(f"Force cycle capture armed for shape: {clean_shape}.")
+            self.force_cycle_report_sample_target = report_sample_target
+            self.force_cycle_trial = int(trial)
+        target_text = "all" if report_sample_target is None else str(report_sample_target)
+        self.log(f"Force cycle capture armed for shape: {clean_shape}, n={target_text}, trial={trial}.")
 
     def _set_force_cycle_phase(self, phase, phase_started_at=None, down_seconds=None):
         now = time.monotonic() if phase_started_at is None else float(phase_started_at)
@@ -5555,6 +5626,8 @@ class AllInOneTesterGUI:
                     "elapsed_s": max(0.0, now - float(started_at)),
                     "phase": getattr(self, "force_cycle_phase", "idle"),
                     "shape_name": getattr(self, "force_cycle_shape_name", "sample"),
+                    "report_sample_target": getattr(self, "force_cycle_report_sample_target", None),
+                    "trial": getattr(self, "force_cycle_trial", 1),
                     "indentation_depth_mm": indentation_depth_mm,
                     "load_force_n": None if load_force is None else float(load_force),
                     "load_kg": load_kg,
@@ -5590,7 +5663,16 @@ class AllInOneTesterGUI:
             return ""
         return f"{value:.{digits}f}"
 
-    def _save_force_cycle_graphs(self, output_dir, timestamp, shape_name, history):
+    def _save_force_cycle_graphs(
+        self,
+        output_dir,
+        file_stem,
+        shape_name,
+        history,
+        report_sample_target=None,
+        trial=1,
+        raw_sample_count=None,
+    ):
         try:
             import matplotlib
 
@@ -5601,6 +5683,10 @@ class AllInOneTesterGUI:
             return []
 
         saved_paths = []
+        report_text = "all samples" if report_sample_target is None else f"{report_sample_target} samples"
+        title_suffix = f"{shape_name} | report {report_text} | trial {trial}"
+        if raw_sample_count is not None and raw_sample_count != len(history):
+            title_suffix += f" | selected {len(history)}/{raw_sample_count}"
 
         def finite_series(key):
             points = []
@@ -5611,22 +5697,82 @@ class AllInOneTesterGUI:
                     points.append((float(elapsed), float(value)))
             return points
 
+        def min_max_points(points):
+            if not points:
+                return None, None
+            return (
+                min(points, key=lambda point: point[1]),
+                max(points, key=lambda point: point[1]),
+            )
+
+        def add_min_max_summary(ax, lines):
+            if not lines:
+                return
+            ax.text(
+                0.99,
+                0.97,
+                "\n".join(lines),
+                transform=ax.transAxes,
+                ha="right",
+                va="top",
+                fontsize=8,
+                bbox={
+                    "boxstyle": "round,pad=0.25",
+                    "facecolor": "white",
+                    "edgecolor": "#c8d3d8",
+                    "alpha": 0.85,
+                },
+            )
+
+        def mark_min_max(ax, points, label, color, unit):
+            min_point, max_point = min_max_points(points)
+            if min_point is None or max_point is None:
+                return None
+            for marker_label, marker, point in (
+                ("min", "v", min_point),
+                ("max", "^", max_point),
+            ):
+                ax.scatter(
+                    [point[0]],
+                    [point[1]],
+                    color=color,
+                    edgecolor="white",
+                    linewidth=0.6,
+                    s=38,
+                    marker=marker,
+                    zorder=5,
+                )
+                ax.annotate(
+                    f"{marker_label} {point[1]:.3f}",
+                    xy=point,
+                    xytext=(5, 7 if marker_label == "max" else -12),
+                    textcoords="offset points",
+                    fontsize=7,
+                    color=color,
+                )
+            return f"{label} min/max: {min_point[1]:.3f}/{max_point[1]:.3f} {unit}"
+
         load_points = finite_series("load_kg")
         pressure_points = finite_series("pressure_kg_eq")
         error_points = finite_series("error_kg")
-        if load_points or pressure_points or error_points:
-            fig, axes = plt.subplots(2, 1, figsize=(8.5, 6.0), sharex=True)
-            fig.suptitle(f"Force cycle: {shape_name}")
+
+        if load_points or pressure_points:
+            fig, ax = plt.subplots(figsize=(8.5, 4.8))
+            ax.set_title(f"Force comparison: {title_suffix}")
+            force_summary_lines = []
             if load_points:
-                axes[0].plot(
+                ax.plot(
                     [point[0] for point in load_points],
                     [point[1] for point in load_points],
                     label="load cell kg",
                     color="#139a74",
                     linewidth=1.6,
                 )
+                summary = mark_min_max(ax, load_points, "load", "#139a74", "kg")
+                if summary:
+                    force_summary_lines.append(summary)
             if pressure_points:
-                axes[0].plot(
+                ax.plot(
                     [point[0] for point in pressure_points],
                     [point[1] for point in pressure_points],
                     label="pressure kg-eq",
@@ -5634,27 +5780,42 @@ class AllInOneTesterGUI:
                     linewidth=1.4,
                     linestyle="--",
                 )
-            axes[0].set_ylabel("kg")
-            axes[0].grid(True, alpha=0.28)
-            if load_points or pressure_points:
-                axes[0].legend(loc="best")
-
-            if error_points:
-                axes[1].plot(
-                    [point[0] for point in error_points],
-                    [point[1] for point in error_points],
-                    label="pressure kg-eq - load kg",
-                    color="#a34b2a",
-                    linewidth=1.5,
-                )
-            axes[1].axhline(0.0, color="#4f9da6", linewidth=1.0, linestyle=":")
-            axes[1].set_xlabel("elapsed (s)")
-            axes[1].set_ylabel("error kg")
-            axes[1].grid(True, alpha=0.28)
-            if error_points:
-                axes[1].legend(loc="best")
+                summary = mark_min_max(ax, pressure_points, "pressure", "#f0a000", "kg")
+                if summary:
+                    force_summary_lines.append(summary)
+            ax.set_xlabel("elapsed (s)")
+            ax.set_ylabel("kg")
+            ax.grid(True, alpha=0.28)
+            add_min_max_summary(ax, force_summary_lines)
+            ax.legend(loc="best")
             fig.tight_layout()
-            path = output_dir / f"force_cycle_{timestamp}_force.png"
+            path = output_dir / f"{file_stem}_force_comparison.png"
+            fig.savefig(path, dpi=160)
+            plt.close(fig)
+            saved_paths.append(path)
+
+        if error_points:
+            fig, ax = plt.subplots(figsize=(8.5, 4.8))
+            ax.set_title(f"Force error: {title_suffix}")
+            error_summary_lines = []
+            ax.plot(
+                [point[0] for point in error_points],
+                [point[1] for point in error_points],
+                label="pressure kg-eq - load kg",
+                color="#a34b2a",
+                linewidth=1.5,
+            )
+            summary = mark_min_max(ax, error_points, "error", "#a34b2a", "kg")
+            if summary:
+                error_summary_lines.append(summary)
+            ax.axhline(0.0, color="#4f9da6", linewidth=1.0, linestyle=":")
+            ax.set_xlabel("elapsed (s)")
+            ax.set_ylabel("error kg")
+            ax.grid(True, alpha=0.28)
+            add_min_max_summary(ax, error_summary_lines)
+            ax.legend(loc="best")
+            fig.tight_layout()
+            path = output_dir / f"{file_stem}_force_error.png"
             fig.savefig(path, dpi=160)
             plt.close(fig)
             saved_paths.append(path)
@@ -5685,12 +5846,12 @@ class AllInOneTesterGUI:
                 s=18,
                 alpha=0.85,
             )
-            ax.set_title(f"Indentation vs mean dot displacement: {shape_name}")
+            ax.set_title(f"Indentation vs mean dot displacement: {title_suffix}")
             ax.set_xlabel("indentation depth (mm)")
             ax.set_ylabel("mean dot displacement (px)")
             ax.grid(True, alpha=0.28)
             fig.tight_layout()
-            path = output_dir / f"force_cycle_{timestamp}_indentation_dot.png"
+            path = output_dir / f"{file_stem}_indentation_dot.png"
             fig.savefig(path, dpi=160)
             plt.close(fig)
             saved_paths.append(path)
@@ -5700,7 +5861,7 @@ class AllInOneTesterGUI:
         depth_points = finite_series("indentation_depth_mm")
         if dot_mean_points or dot_max_points or depth_points:
             fig, axes = plt.subplots(2, 1, figsize=(8.5, 6.0), sharex=True)
-            fig.suptitle(f"Deformation and distance estimate: {shape_name}")
+            fig.suptitle(f"Deformation and distance estimate: {title_suffix}")
             if dot_mean_points:
                 axes[0].plot(
                     [point[0] for point in dot_mean_points],
@@ -5737,7 +5898,7 @@ class AllInOneTesterGUI:
             if depth_points:
                 axes[1].legend(loc="best")
             fig.tight_layout()
-            path = output_dir / f"force_cycle_{timestamp}_deformation_distance.png"
+            path = output_dir / f"{file_stem}_deformation_distance.png"
             fig.savefig(path, dpi=160)
             plt.close(fig)
             saved_paths.append(path)
@@ -5748,6 +5909,8 @@ class AllInOneTesterGUI:
         with self.sensor_data_lock:
             history = list(getattr(self, "force_cycle_sample_history", []))
             shape_name = getattr(self, "force_cycle_shape_name", "sample")
+            report_sample_target = getattr(self, "force_cycle_report_sample_target", None)
+            trial = getattr(self, "force_cycle_trial", 1)
 
         if not history:
             self.log("Force cycle finished without force samples to save.")
@@ -5757,66 +5920,138 @@ class AllInOneTesterGUI:
         output_dir.mkdir(parents=True, exist_ok=True)
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         shape_token = self._safe_filename_token(shape_name)
-        output_path = output_dir / f"force_cycle_{timestamp}_{shape_token}.csv"
+        report_history = self._downsample_force_cycle_history(history, report_sample_target)
+        report_token = self._force_cycle_report_token(report_sample_target, trial)
+        file_stem = f"force_cycle_{timestamp}_{shape_token}{report_token}"
+        output_path = output_dir / f"{file_stem}.csv"
 
-        with output_path.open("w", newline="", encoding="utf-8") as handle:
+        def write_cycle_csv(path, rows):
+            with path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(
+                    [
+                        "elapsed_s",
+                        "phase",
+                        "shape_name",
+                        "report_sample_target",
+                        "trial",
+                        "indentation_depth_mm",
+                        "load_force_n",
+                        "load_kg",
+                        "pressure_force_n",
+                        "pressure_kg_eq",
+                        "pressure_hpa",
+                        "pressure_delta_hpa",
+                        "error_kg",
+                        "dot_mean_px",
+                        "dot_max_px",
+                        "missing_ratio",
+                        "contact_peak",
+                        "contact_area_ratio",
+                        "residual_mean_px",
+                        "residual_peak_px",
+                        "surface_scale_px",
+                    ]
+                )
+                for sample in rows:
+                    writer.writerow(
+                        [
+                            self._csv_number(sample.get("elapsed_s"), digits=3),
+                            sample.get("phase", ""),
+                            sample.get("shape_name", shape_name),
+                            "" if report_sample_target is None else str(report_sample_target),
+                            str(trial),
+                            self._csv_number(sample.get("indentation_depth_mm"), digits=6),
+                            self._csv_number(sample.get("load_force_n"), digits=6),
+                            self._csv_number(sample.get("load_kg"), digits=6),
+                            self._csv_number(sample.get("pressure_force_n"), digits=6),
+                            self._csv_number(sample.get("pressure_kg_eq"), digits=6),
+                            self._csv_number(sample.get("pressure_hpa"), digits=4),
+                            self._csv_number(sample.get("pressure_delta_hpa"), digits=4),
+                            self._csv_number(sample.get("error_kg"), digits=6),
+                            self._csv_number(sample.get("dot_mean_px"), digits=6),
+                            self._csv_number(sample.get("dot_max_px"), digits=6),
+                            self._csv_number(sample.get("missing_ratio"), digits=6),
+                            self._csv_number(sample.get("contact_peak"), digits=6),
+                            self._csv_number(sample.get("contact_area_ratio"), digits=6),
+                            self._csv_number(sample.get("residual_mean_px"), digits=6),
+                            self._csv_number(sample.get("residual_peak_px"), digits=6),
+                            self._csv_number(sample.get("surface_scale_px"), digits=6),
+                        ]
+                    )
+
+        write_cycle_csv(output_path, report_history)
+        raw_output_path = None
+        if report_sample_target is not None and len(report_history) != len(history):
+            raw_output_path = output_dir / f"{file_stem}_raw.csv"
+            write_cycle_csv(raw_output_path, history)
+
+        summary_path = output_dir / f"{file_stem}_summary.csv"
+        with summary_path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.writer(handle)
             writer.writerow(
                 [
-                    "elapsed_s",
-                    "phase",
+                    "series",
+                    "unit",
                     "shape_name",
-                    "indentation_depth_mm",
-                    "load_force_n",
-                    "load_kg",
-                    "pressure_force_n",
-                    "pressure_kg_eq",
-                    "pressure_hpa",
-                    "pressure_delta_hpa",
-                    "error_kg",
-                    "dot_mean_px",
-                    "dot_max_px",
-                    "missing_ratio",
-                    "contact_peak",
-                    "contact_area_ratio",
-                    "residual_mean_px",
-                    "residual_peak_px",
-                    "surface_scale_px",
+                    "report_sample_target",
+                    "trial",
+                    "sample_count",
+                    "min_value",
+                    "min_elapsed_s",
+                    "max_value",
+                    "max_elapsed_s",
                 ]
             )
-            for sample in history:
+            for series_key, label, unit in (
+                ("load_kg", "load cell", "kg"),
+                ("pressure_kg_eq", "pressure estimate", "kg"),
+                ("error_kg", "force error", "kg"),
+            ):
+                stats = self._force_cycle_series_min_max(report_history, series_key)
+                if stats is None:
+                    continue
                 writer.writerow(
                     [
-                        self._csv_number(sample.get("elapsed_s"), digits=3),
-                        sample.get("phase", ""),
-                        sample.get("shape_name", shape_name),
-                        self._csv_number(sample.get("indentation_depth_mm"), digits=6),
-                        self._csv_number(sample.get("load_force_n"), digits=6),
-                        self._csv_number(sample.get("load_kg"), digits=6),
-                        self._csv_number(sample.get("pressure_force_n"), digits=6),
-                        self._csv_number(sample.get("pressure_kg_eq"), digits=6),
-                        self._csv_number(sample.get("pressure_hpa"), digits=4),
-                        self._csv_number(sample.get("pressure_delta_hpa"), digits=4),
-                        self._csv_number(sample.get("error_kg"), digits=6),
-                        self._csv_number(sample.get("dot_mean_px"), digits=6),
-                        self._csv_number(sample.get("dot_max_px"), digits=6),
-                        self._csv_number(sample.get("missing_ratio"), digits=6),
-                        self._csv_number(sample.get("contact_peak"), digits=6),
-                        self._csv_number(sample.get("contact_area_ratio"), digits=6),
-                        self._csv_number(sample.get("residual_mean_px"), digits=6),
-                        self._csv_number(sample.get("residual_peak_px"), digits=6),
-                        self._csv_number(sample.get("surface_scale_px"), digits=6),
+                        label,
+                        unit,
+                        shape_name,
+                        "" if report_sample_target is None else str(report_sample_target),
+                        str(trial),
+                        str(len(report_history)),
+                        self._csv_number(stats["min_value"], digits=6),
+                        self._csv_number(stats["min_elapsed_s"], digits=3),
+                        self._csv_number(stats["max_value"], digits=6),
+                        self._csv_number(stats["max_elapsed_s"], digits=3),
                     ]
                 )
 
-        graph_paths = self._save_force_cycle_graphs(output_dir, timestamp, shape_name, history)
-        graph_text = ", ".join(path.name for path in graph_paths)
+        graph_paths = self._save_force_cycle_graphs(
+            output_dir,
+            file_stem,
+            shape_name,
+            report_history,
+            report_sample_target=report_sample_target,
+            trial=trial,
+            raw_sample_count=len(history),
+        )
+        saved_names = [output_path.name, summary_path.name]
+        if raw_output_path is not None:
+            saved_names.append(raw_output_path.name)
+        saved_names.extend(path.name for path in graph_paths)
+        graph_text = ", ".join(saved_names)
+        if report_sample_target is not None and len(report_history) < int(report_sample_target):
+            self.log(
+                f"Force cycle requested {report_sample_target} report samples but only "
+                f"{len(report_history)} were available."
+            )
         if graph_text:
             self.log(
-                f"Force cycle data saved: {output_path.name}, {graph_text} ({len(history)} samples)."
+                f"Force cycle data saved: {graph_text} ({len(report_history)} report samples; "
+                f"{len(history)} raw samples)."
             )
         else:
-            self.log(f"Force cycle data saved: {output_path.name} ({len(history)} samples).")
+            self.log(f"Force cycle data saved: {output_path.name} ({len(report_history)} samples).")
         return output_path
 
     def start_force_cycle(self):
@@ -5838,6 +6073,18 @@ class AllInOneTesterGUI:
         if self._load_loadcell_calibration() is None:
             messagebox.showwarning("Force Cycle", "Cal Load once before running a force data cycle.")
             return
+        with self.sensor_data_lock:
+            force_coeffs = self.force_calibration_coeffs
+            force_sample_count = len(self.force_calibration_samples)
+        if force_coeffs is None:
+            messagebox.showwarning(
+                "Force Cycle",
+                "Calibrate force before running a force data cycle. Capture 2+ force samples and press Fit Calibration.",
+            )
+            self.force_calibration_status_var.set(
+                f"Force cycle blocked: force calibration missing ({force_sample_count} sample(s))."
+            )
+            return
         if not self._is_thread_running(self.pressure_thread):
             self.start_pressure_read()
         if not self._is_thread_running(self.loadcell_thread):
@@ -5847,6 +6094,8 @@ class AllInOneTesterGUI:
         self.force_cycle_requested_shape_name = self._clean_force_cycle_shape_name(
             self.force_cycle_shape_var.get()
         )
+        self.force_cycle_requested_report_sample_target = self._force_cycle_report_sample_target()
+        self.force_cycle_requested_trial = self._force_cycle_report_trial()
         if not self._is_blob_running():
             self.log("Force cycle will save force data only; Start Detection first to include shape displacement.")
         self.force_cycle_stop_event.clear()
@@ -5854,7 +6103,15 @@ class AllInOneTesterGUI:
         self.force_cycle_thread.start()
         self._set_force_cycle_controls(True)
         self._set_var(self.force_calibration_status_var, "Force cycle running.")
-        self.log(f"Force cycle started for shape: {self.force_cycle_requested_shape_name}.")
+        target_text = (
+            "all"
+            if self.force_cycle_requested_report_sample_target is None
+            else str(self.force_cycle_requested_report_sample_target)
+        )
+        self.log(
+            f"Force cycle started for shape: {self.force_cycle_requested_shape_name}, "
+            f"report n={target_text}, trial={self.force_cycle_requested_trial}."
+        )
 
     def stop_force_cycle(self):
         self.force_cycle_stop_event.set()
@@ -5953,7 +6210,9 @@ class AllInOneTesterGUI:
                 return
             started_at = time.monotonic()
             shape_name = getattr(self, "force_cycle_requested_shape_name", "sample")
-            self._start_force_cycle_capture(started_at, shape_name)
+            report_sample_target = getattr(self, "force_cycle_requested_report_sample_target", None)
+            trial = getattr(self, "force_cycle_requested_trial", 1)
+            self._start_force_cycle_capture(started_at, shape_name, report_sample_target, trial)
             self._append_force_cycle_sample(now=started_at, force=True)
             down_seconds = self._force_cycle_move_until_limit_timed("down", 1, "Limit 2")
             if down_seconds is None:

@@ -1129,8 +1129,28 @@ class MissionControlGUI(AllInOneTesterGUI):
             pady=(8, 0),
         )
 
+        ttk.Label(sensor, text="Report samples").grid(row=8, column=0, sticky="w", pady=(8, 0))
+        report_controls = ttk.Frame(sensor, style="Surface.TFrame")
+        report_controls.grid(row=8, column=1, sticky="ew", pady=(8, 0))
+        report_controls.columnconfigure(0, weight=1)
+        report_controls.columnconfigure(1, weight=1)
+        ttk.Combobox(
+            report_controls,
+            textvariable=self.force_cycle_report_sample_count_var,
+            values=("all", "10", "25", "50"),
+            state="readonly",
+            width=7,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ttk.Combobox(
+            report_controls,
+            textvariable=self.force_cycle_trial_var,
+            values=("1", "2", "3"),
+            state="readonly",
+            width=5,
+        ).grid(row=0, column=1, sticky="ew")
+
         both = ttk.Frame(sensor, style="Surface.TFrame")
-        both.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        both.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         both.columnconfigure(0, weight=1)
         both.columnconfigure(1, weight=1)
         ttk.Button(both, text="Start Both", style="Accent.TButton", command=self.start_force_measurement).grid(
@@ -1146,7 +1166,7 @@ class MissionControlGUI(AllInOneTesterGUI):
         )
 
         cycle = ttk.Frame(sensor, style="Surface.TFrame")
-        cycle.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        cycle.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         cycle.columnconfigure(0, weight=1)
         cycle.columnconfigure(1, weight=1)
         self.force_cycle_sensor_start_btn = ttk.Button(
