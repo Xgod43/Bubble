@@ -292,11 +292,20 @@ def _build_surface_render(gray_frame, height_map, roi_mask=None, history=None):
     shade = 0.35 + 0.65 * shade
 
     if REMOTE_SURFACE_RENDER_MODE != "mesh":
-        fast_panel = np.clip(color_map.astype(np.float32) * shade[..., None], 0, 255).astype(np.uint8)
+        bg_color = np.array([9, 22, 32], dtype=np.uint8)
+        fast_panel = np.zeros((plot_h, out_w, 3), dtype=np.uint8)
+        fast_panel[:, :, :] = bg_color
+        shaded_color = np.clip(color_map.astype(np.float32) * shade[..., None], 0, 255).astype(np.uint8)
         if plot_roi_binary is not None:
-            fast_panel = np.where(plot_roi_binary[..., None], fast_panel, np.array([9, 22, 32], dtype=np.uint8))
+            active_mask = plot_roi_binary & (height > 0.015)
+            outline_mask = plot_roi_binary.astype(np.uint8) * 255
+            contours, _ = cv2.findContours(outline_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(fast_panel, contours, -1, (58, 95, 112), 1, lineType=cv2.LINE_AA)
+        else:
+            active_mask = height > 0.015
+        fast_panel = np.where(active_mask[..., None], shaded_color, fast_panel)
         contour = ((height * 8.0).astype(np.int32) % 2) == 0
-        edge = contour & (height > 0.03)
+        edge = contour & (height > 0.04)
         if np.any(edge):
             fast_panel[edge] = cv2.addWeighted(
                 fast_panel[edge],
@@ -307,13 +316,24 @@ def _build_surface_render(gray_frame, height_map, roi_mask=None, history=None):
             )
         cv2.putText(
             fast_panel,
-            "bubble surface",
+            "bubble deformation",
             (12, 22),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.48,
             (255, 230, 80),
             1,
         )
+        if not np.any(active_mask):
+            cv2.putText(
+                fast_panel,
+                "no contact deformation",
+                (12, 44),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.42,
+                (130, 170, 186),
+                1,
+                cv2.LINE_AA,
+            )
         output[camera_h:camera_h + plot_h, :, :] = fast_panel
         if graph_canvas is not None:
             cv2.line(output, (0, camera_h + plot_h - 1), (out_w - 1, camera_h + plot_h - 1), (45, 73, 96), 1)
@@ -514,6 +534,8 @@ def _process_surface_preview(frame_bgr, reference, displacements, query):
         config,
         cv2=cv2,
     )
+    deformation_map = np.clip(base_map.astype(np.float32) - height_map.astype(np.float32), 0.0, 1.0)
+    deformation_map = np.where(ellipse_mask, deformation_map, 0.0).astype(np.float32)
     stats = summarize_contact_map(
         contact_map_for_display,
         ellipse_mask,
@@ -526,7 +548,7 @@ def _process_surface_preview(frame_bgr, reference, displacements, query):
     if len(STATE.surface_history) > 180:
         del STATE.surface_history[:-180]
 
-    preview = _build_surface_render(gray, height_map, roi_mask=ellipse_mask, history=STATE.surface_history)
+    preview = _build_surface_render(gray, deformation_map, roi_mask=ellipse_mask, history=STATE.surface_history)
     if STATE.surface_zero_pending:
         status = f"Remote contact zeroing {len(STATE.surface_zero_samples)}/{CONTACT_ZERO_SAMPLE_COUNT}..."
     elif STATE.surface_zero_ready:
