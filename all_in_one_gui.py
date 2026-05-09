@@ -1,3 +1,4 @@
+import csv
 import json
 import queue
 import os
@@ -54,16 +55,32 @@ STEPPER_DEPTH_ENABLED = os.environ.get("BUBBLE_STEPPER_DEPTH_ENABLED", "0").stri
 }
 STEPPER_MM_PER_REV = float(os.environ.get("BUBBLE_STEPPER_MM_PER_REV", "8.0"))
 STEPPER_MM_PER_PULSE = STEPPER_MM_PER_REV / STEPPER_PULSES_PER_REV
+FORCE_CYCLE_STEPPER_FREQUENCY_HZ = float(
+    os.environ.get("BUBBLE_FORCE_CYCLE_FREQUENCY_HZ", str(STEPPER_FREQUENCY_HZ * 0.5))
+)
 
 LOADCELL_DT_PIN = 5
 LOADCELL_SCK_PIN = 6
 LOADCELL_CALIBRATION_DELAY_S = 8.0
 LOADCELL_CALIBRATION_FILENAME = "loadcell_calibration.json"
+LOADCELL_READ_SAMPLES = int(os.environ.get("BUBBLE_LOADCELL_READ_SAMPLES", "9"))
+LOADCELL_FILTER_WINDOW = int(os.environ.get("BUBBLE_LOADCELL_FILTER_WINDOW", "5"))
+LOADCELL_STABLE_NOISE_KG = float(os.environ.get("BUBBLE_LOADCELL_STABLE_NOISE_KG", "0.12"))
 FORCE_GRAVITY_MPS2 = 9.80665
 FORCE_CALIBRATION_FILENAME = "force_calibration.json"
 FORCE_GRAPH_HISTORY_SECONDS = 120.0
 FORCE_GRAPH_MAX_POINTS = 600
+FORCE_CYCLE_SAMPLE_MIN_INTERVAL_SECONDS = 0.03
 FORCE_PRESSURE_DELTA_MIN_HPA = 0.25
+FORCE_CALIBRATION_MIN_R2 = float(os.environ.get("BUBBLE_FORCE_CALIBRATION_MIN_R2", "0.45"))
+FORCE_CALIBRATION_MAX_ZERO_FORCE_N = float(
+    os.environ.get("BUBBLE_FORCE_CALIBRATION_MAX_ZERO_N", "5.0")
+)
+FORCE_CALIBRATION_MIN_SAMPLE_FORCE_N = float(
+    os.environ.get("BUBBLE_FORCE_CALIBRATION_MIN_SAMPLE_N", "-0.50")
+)
+FORCE_CYCLE_LIMIT_MAX_SECONDS = float(os.environ.get("BUBBLE_FORCE_CYCLE_LIMIT_SECONDS", "45.0"))
+FORCE_CYCLE_SETTLE_SECONDS = float(os.environ.get("BUBBLE_FORCE_CYCLE_SETTLE_SECONDS", "0.25"))
 FORCE_DEFAULT_PRESSURE_ZERO_HPA = 1032.0
 CAMERA_DEFORM_CALIBRATION_FILENAME = "camera_deform_calibration.json"
 CAMERA_DEFORM_FEATURE_NAMES = (
@@ -79,7 +96,7 @@ CAMERA_DEFORM_FEATURE_NAMES = (
     "surface_scale_px",
 )
 CAMERA_DEFORM_CAPTURE_SECONDS = float(os.environ.get("BUBBLE_CAMERA_DEFORM_CAPTURE_SECONDS", "1.5"))
-CAMERA_DEFORM_CAPTURE_MIN_FRAMES = int(os.environ.get("BUBBLE_CAMERA_DEFORM_CAPTURE_MIN_FRAMES", "8"))
+CAMERA_DEFORM_CAPTURE_MIN_FRAMES = int(os.environ.get("BUBBLE_CAMERA_DEFORM_CAPTURE_MIN_FRAMES", "5"))
 PRESSURE_CONTACT_GATE_ENABLED = os.environ.get("BUBBLE_PRESSURE_CONTACT_GATE", "1").strip().lower() not in {
     "0",
     "false",
@@ -212,6 +229,7 @@ class AllInOneTesterGUI:
         self._configure_styles()
 
         self.log_queue = queue.Queue()
+        self.gpio_ready = GPIO is not None
 
         self.camera = None
         self.picam2 = None
@@ -219,9 +237,15 @@ class AllInOneTesterGUI:
 
         self.limit_thread = None
         self.limit_stop_event = threading.Event()
+        self.limit_state_lock = threading.Lock()
+        self.limit_trigger_state = (False, False)
+        self.limit_state_sampled = False
 
         self.stepper_thread = None
         self.stepper_stop_event = threading.Event()
+        self.stepper_stop_reason = None
+        self.stepper_active_direction = None
+        self.stepper_limit_guard_disabled = False
         self.stepper_position_mm = 0.0
         self.stepper_contact_zero_mm = None
 
@@ -231,6 +255,8 @@ class AllInOneTesterGUI:
         self.loadcell_thread = None
         self.loadcell_stop_event = threading.Event()
         self.loadcell_hx = None
+        self.force_cycle_thread = None
+        self.force_cycle_stop_event = threading.Event()
 
         self.blob_thread = None
         self.blob_stop_event = threading.Event()
@@ -252,11 +278,21 @@ class AllInOneTesterGUI:
         self.pressure_stop_btn = None
         self.loadcell_start_btn = None
         self.loadcell_stop_btn = None
+        self.loadcell_zero_btn = None
+        self.loadcell_calibrate_btn = None
+        self.loadcell_reset_btn = None
+        self.force_cycle_start_btn = None
+        self.force_cycle_stop_btn = None
         self.blob_start_btn = None
         self.blob_stop_btn = None
         self.blob_snapshot_btn = None
         self.blob_reset_ref_btn = None
         self.surface_reset_btn = None
+        self.deform_calibrate_btn = None
+        self.deform_fit_btn = None
+        self.deform_reset_cal_btn = None
+        self.deform_known_mm_entry = None
+        self.deform_mode_combo = None
         self.blob_reset_reference_event = threading.Event()
         self.surface_reset_zero_event = threading.Event()
 
@@ -308,6 +344,13 @@ class AllInOneTesterGUI:
         self.surface_tactile_frame = None
         self.surface_contact_baseline = None
         self.surface_contact_display_ema = None
+        self.surface_measurement_mode = "flat_deform"
+        self.surface_measurement_mode_var = tk.StringVar(value="Flat Deform")
+        self.contact_peak_var = tk.StringVar(value="-")
+        self.contact_area_var = tk.StringVar(value="-")
+        self.contact_center_var = tk.StringVar(value="-")
+        self.contact_residual_var = tk.StringVar(value="-")
+        self.contact_force_var = tk.StringVar(value="-")
         self.camera_deform_known_mm_var = tk.StringVar(value="0.0")
         self.camera_deform_estimate_var = tk.StringVar(value="-")
         self.camera_deform_sample_count_var = tk.StringVar(value="0 samples")
@@ -345,6 +388,7 @@ class AllInOneTesterGUI:
         style.configure("HeaderCard.TFrame", background=COLOR_PANEL, relief="flat")
         style.configure("HeaderTitle.TLabel", background=COLOR_PANEL, foreground=COLOR_TEXT, font=("Segoe UI", 20, "bold"))
         style.configure("HeaderSubtitle.TLabel", background=COLOR_PANEL, foreground=COLOR_MUTED, font=("Segoe UI", 10))
+        style.configure("SectionTitle.TLabel", background=COLOR_PANEL, foreground=COLOR_TEXT, font=("Segoe UI", 10, "bold"))
         style.configure("SectionHint.TLabel", background=COLOR_PANEL, foreground=COLOR_MUTED, font=("Segoe UI", 9))
         style.configure("StatusLabel.TLabel", background=COLOR_PANEL, foreground=COLOR_MUTED, font=("Segoe UI", 9, "bold"))
         style.configure("StatusReady.TLabel", background=COLOR_ACCENT_SOFT, foreground=COLOR_ACCENT, font=("Segoe UI", 10, "bold"), padding=(10, 4))
@@ -587,9 +631,9 @@ class AllInOneTesterGUI:
             "Limit switches",
             self.limit_monitor_state_var,
             (("Start", self.start_limit_monitor), ("Stop", self.stop_limit_monitor)),
-            detail_var=self.limit1_status_var,
+            detail_var=self.limit1_detail_var,
         )
-        ttk.Label(hardware, textvariable=self.limit2_status_var, style="SectionHint.TLabel").grid(
+        ttk.Label(hardware, textvariable=self.limit2_detail_var, style="SectionHint.TLabel").grid(
             row=2,
             column=1,
             columnspan=2,
@@ -667,6 +711,8 @@ class AllInOneTesterGUI:
 
         self.limit1_status_var = tk.StringVar(value="not triggered")
         self.limit2_status_var = tk.StringVar(value="not triggered")
+        self.limit1_detail_var = tk.StringVar(value="Limit 1: not triggered")
+        self.limit2_detail_var = tk.StringVar(value="Limit 2: not triggered")
         self.limit_monitor_state_var = tk.StringVar(value="Stopped")
 
         ttk.Label(
@@ -711,7 +757,7 @@ class AllInOneTesterGUI:
 
         self.stepper_direction_var = tk.StringVar(value="up")
         self.stepper_seconds_var = tk.StringVar(value="1.0")
-        self.stepper_state_var = tk.StringVar(value="Idle")
+        self.stepper_state_var = tk.StringVar(value="Ready")
 
         ttk.Label(
             tab,
@@ -803,7 +849,7 @@ class AllInOneTesterGUI:
     def _build_loadcell_tab(self, notebook):
         tab = ttk.Frame(notebook, padding=12)
         notebook.add(tab, text="8) Load Cell Test")
-        tab.columnconfigure(3, weight=1)
+        tab.columnconfigure(4, weight=1)
 
         self.loadcell_known_weight_var = tk.StringVar(value="500")
         self.loadcell_weight_var = tk.StringVar(value="-")
@@ -812,8 +858,8 @@ class AllInOneTesterGUI:
         ttk.Label(
             tab,
             text=(
-                "Calibrates with a known weight (grams), then shows measured load in kg. "
-                "(Pins: DT=GPIO5, SCK=GPIO6; calibration wait=8s)"
+                "Start uses the saved load-cell calibration and tares the sensor. "
+                "Use Calibrate only when you want to save a new known-weight calibration."
             ),
         ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
 
@@ -829,6 +875,22 @@ class AllInOneTesterGUI:
         self.loadcell_stop_btn = ttk.Button(tab, text="Stop", command=self.stop_loadcell_read)
         self.loadcell_stop_btn.grid(
             row=2, column=1, sticky="w", pady=(10, 0), padx=(8, 0)
+        )
+        self.loadcell_zero_btn = ttk.Button(tab, text="Zero Load", command=self.zero_loadcell_live)
+        self.loadcell_zero_btn.grid(
+            row=2, column=2, sticky="w", pady=(10, 0), padx=(8, 0)
+        )
+        self.loadcell_calibrate_btn = ttk.Button(
+            tab, text="Cal Load", command=self.calibrate_loadcell
+        )
+        self.loadcell_calibrate_btn.grid(
+            row=2, column=3, sticky="w", pady=(10, 0), padx=(8, 0)
+        )
+        self.loadcell_reset_btn = ttk.Button(
+            tab, text="Reset Load", command=self.reset_loadcell_calibration
+        )
+        self.loadcell_reset_btn.grid(
+            row=2, column=4, sticky="w", pady=(10, 0), padx=(8, 0)
         )
 
         ttk.Label(tab, text="State:").grid(row=3, column=0, sticky="w", pady=(10, 0))
@@ -1151,27 +1213,37 @@ class AllInOneTesterGUI:
             justify="left",
         ).grid(row=0, column=0, columnspan=4, sticky="w")
 
+        ttk.Label(surface, text="Mode:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.deform_mode_combo = ttk.Combobox(
+            surface,
+            textvariable=self.surface_measurement_mode_var,
+            values=("Flat Deform", "3D Object"),
+            state="readonly",
+        )
+        self.deform_mode_combo.grid(row=1, column=1, columnspan=3, sticky="ew", pady=(6, 0))
+        self.deform_mode_combo.bind("<<ComboboxSelected>>", self._apply_surface_measurement_mode)
+
         self.surface_reset_btn = ttk.Button(
             surface,
             text="Reset Zero",
             command=self.reset_surface_baseline,
         )
-        self.surface_reset_btn.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        self.surface_reset_btn.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(6, 0))
 
-        ttk.Label(surface, text="Gain:").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(surface, text="Gain:").grid(row=3, column=0, sticky="w", pady=(6, 0))
         ttk.Entry(surface, textvariable=self.surface_gain_var, width=10).grid(
-            row=2, column=1, sticky="ew", pady=(6, 0)
+            row=3, column=1, sticky="ew", pady=(6, 0)
         )
         ttk.Label(surface, text="Smooth:").grid(
-            row=2, column=2, sticky="w", padx=(12, 0), pady=(6, 0)
+            row=3, column=2, sticky="w", padx=(12, 0), pady=(6, 0)
         )
         ttk.Entry(surface, textvariable=self.surface_smooth_var, width=10).grid(
-            row=2, column=3, sticky="ew", pady=(6, 0)
+            row=3, column=3, sticky="ew", pady=(6, 0)
         )
 
-        ttk.Label(surface, text="Grid:").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(surface, text="Grid:").grid(row=4, column=0, sticky="w", pady=(6, 0))
         ttk.Entry(surface, textvariable=self.surface_grid_var, width=10).grid(
-            row=3, column=1, sticky="ew", pady=(6, 0)
+            row=4, column=1, sticky="ew", pady=(6, 0)
         )
 
         deform_cal = ttk.LabelFrame(right_panel, text="Deform Calibration", padding=8)
@@ -1180,9 +1252,12 @@ class AllInOneTesterGUI:
         deform_cal.columnconfigure(3, weight=1)
 
         ttk.Label(deform_cal, text="Known mm:").grid(row=0, column=0, sticky="w")
-        ttk.Entry(deform_cal, textvariable=self.camera_deform_known_mm_var, width=10).grid(
-            row=0, column=1, sticky="ew"
+        self.deform_known_mm_entry = ttk.Entry(
+            deform_cal,
+            textvariable=self.camera_deform_known_mm_var,
+            width=10,
         )
+        self.deform_known_mm_entry.grid(row=0, column=1, sticky="ew")
         ttk.Label(deform_cal, text="Estimate:").grid(row=0, column=2, sticky="w", padx=(12, 0))
         ttk.Label(deform_cal, textvariable=self.camera_deform_estimate_var).grid(
             row=0, column=3, sticky="w"
@@ -1192,21 +1267,24 @@ class AllInOneTesterGUI:
         deform_actions.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(6, 0))
         for col in range(3):
             deform_actions.columnconfigure(col, weight=1)
-        ttk.Button(
+        self.deform_calibrate_btn = ttk.Button(
             deform_actions,
             text="Capture Sample",
             command=self.capture_camera_deform_sample,
-        ).grid(row=0, column=0, sticky="ew")
-        ttk.Button(
+        )
+        self.deform_calibrate_btn.grid(row=0, column=0, sticky="ew")
+        self.deform_fit_btn = ttk.Button(
             deform_actions,
             text="Fit",
             command=self.fit_camera_deform_calibration,
-        ).grid(row=0, column=1, sticky="ew", padx=(8, 0))
-        ttk.Button(
+        )
+        self.deform_fit_btn.grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        self.deform_reset_cal_btn = ttk.Button(
             deform_actions,
             text="Reset",
             command=self.reset_camera_deform_calibration,
-        ).grid(row=0, column=2, sticky="ew", padx=(8, 0))
+        )
+        self.deform_reset_cal_btn.grid(row=0, column=2, sticky="ew", padx=(8, 0))
 
         ttk.Label(deform_cal, text="Samples:").grid(row=2, column=0, sticky="w", pady=(6, 0))
         ttk.Label(deform_cal, textvariable=self.camera_deform_sample_count_var).grid(
@@ -1261,13 +1339,25 @@ class AllInOneTesterGUI:
         ttk.Label(metrics, textvariable=self.contact_gate_var).grid(
             row=6, column=1, columnspan=3, sticky="w", pady=(4, 0)
         )
+        ttk.Label(metrics, text="Contact peak:").grid(row=7, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(metrics, textvariable=self.contact_peak_var).grid(row=7, column=1, sticky="w", pady=(4, 0))
+        ttk.Label(metrics, text="Area:").grid(row=7, column=2, sticky="w", padx=(12, 0), pady=(4, 0))
+        ttk.Label(metrics, textvariable=self.contact_area_var).grid(row=7, column=3, sticky="w", pady=(4, 0))
+        ttk.Label(metrics, text="Center:").grid(row=8, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(metrics, textvariable=self.contact_center_var).grid(row=8, column=1, sticky="w", pady=(4, 0))
+        ttk.Label(metrics, text="Residual:").grid(row=8, column=2, sticky="w", padx=(12, 0), pady=(4, 0))
+        ttk.Label(metrics, textvariable=self.contact_residual_var).grid(row=8, column=3, sticky="w", pady=(4, 0))
+        ttk.Label(metrics, text="Force:").grid(row=9, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(metrics, textvariable=self.contact_force_var).grid(
+            row=9, column=1, columnspan=3, sticky="w", pady=(4, 0)
+        )
 
         ttk.Label(
             metrics,
             textvariable=self.blob_message_var,
             wraplength=300,
             justify="left",
-        ).grid(row=7, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        ).grid(row=10, column=0, columnspan=4, sticky="w", pady=(10, 0))
 
         self._set_blob_controls(False)
 
@@ -1367,6 +1457,9 @@ class AllInOneTesterGUI:
             self.blob_distance_unit_var.set("px")
 
         self.blob_message_var.set(f"Preset applied: {preset}.")
+        if preset == "measurement" and hasattr(self, "surface_measurement_mode_var"):
+            self.surface_measurement_mode_var.set("3D Object")
+        self._apply_surface_measurement_mode()
         self.log(f"Dot pipeline preset applied: {preset}.")
 
     @staticmethod
@@ -1426,6 +1519,7 @@ class AllInOneTesterGUI:
             self._set_var(self.blob_mean_disp_var, "0.00")
         if hasattr(self, "blob_max_disp_var"):
             self._set_var(self.blob_max_disp_var, "0.00")
+        self._clear_contact_signature_readouts()
 
     def reset_surface_baseline(self):
         self._reset_pressure_contact_gate("manual reset")
@@ -1440,6 +1534,119 @@ class AllInOneTesterGUI:
         self._set_contact_depth_zero()
         self.surface_reset_zero_event.set()
         self.log("Contact deform zero reset requested.")
+
+    def _is_3d_object_mode(self):
+        return getattr(self, "surface_measurement_mode", "flat_deform") == "3d_object"
+
+    def _sync_surface_measurement_mode_from_var(self):
+        value = "Flat Deform"
+        if hasattr(self, "surface_measurement_mode_var"):
+            value = str(self.surface_measurement_mode_var.get()).strip()
+        normalized = value.lower()
+        if normalized in {"3d object", "object 3d", "3d_object", "object"}:
+            self.surface_measurement_mode = "3d_object"
+            if hasattr(self, "surface_measurement_mode_var"):
+                self.surface_measurement_mode_var.set("3D Object")
+        else:
+            self.surface_measurement_mode = "flat_deform"
+            if hasattr(self, "surface_measurement_mode_var"):
+                self.surface_measurement_mode_var.set("Flat Deform")
+        return self.surface_measurement_mode
+
+    def _set_widget_state(self, widget, state):
+        if widget is None:
+            return
+
+        def apply_state():
+            if not self.root.winfo_exists():
+                return
+            try:
+                widget.configure(state=state)
+            except tk.TclError:
+                pass
+
+        if self.root.winfo_exists():
+            self.root.after(0, apply_state)
+
+    def _refresh_deform_mode_controls(self):
+        object_mode = self._is_3d_object_mode()
+        running = self._is_blob_running() if hasattr(self, "_is_blob_running") else False
+        self._set_button_enabled(self.deform_calibrate_btn, running and not object_mode)
+        self._set_button_enabled(self.deform_fit_btn, not object_mode)
+        self._set_button_enabled(self.deform_reset_cal_btn, not object_mode)
+        self._set_widget_state(self.deform_known_mm_entry, "disabled" if object_mode else "normal")
+        self._set_widget_state(self.deform_mode_combo, "disabled" if running else "readonly")
+
+    def _apply_surface_measurement_mode(self, *_event):
+        object_mode = self._sync_surface_measurement_mode_from_var() == "3d_object"
+        if object_mode:
+            if hasattr(self, "blob_view_type_var") and not self._is_blob_running():
+                self.blob_view_type_var.set("surface_3d")
+            self._set_var(self.camera_deform_estimate_var, "3D contact mode")
+            self._set_var(self.contact_depth_camera_var, "relative map")
+            self._set_var(
+                self.camera_deform_status_var,
+                "3D Object mode: Cal Deform disabled. Use Reset Zero before contact.",
+            )
+        else:
+            if str(self.camera_deform_estimate_var.get()).startswith("3D"):
+                self._set_var(self.camera_deform_estimate_var, "-")
+            if str(self.contact_depth_camera_var.get()) == "relative map":
+                self._set_var(self.contact_depth_camera_var, "-")
+            if str(self.camera_deform_status_var.get()).startswith("3D Object mode"):
+                self._set_var(
+                    self.camera_deform_status_var,
+                    "Flat Deform mode: Cal Deform estimates one plain-sheet mm value.",
+                )
+        self._refresh_deform_mode_controls()
+
+    def _clear_contact_signature_readouts(self):
+        for variable in (
+            getattr(self, "contact_peak_var", None),
+            getattr(self, "contact_area_var", None),
+            getattr(self, "contact_center_var", None),
+            getattr(self, "contact_residual_var", None),
+            getattr(self, "contact_force_var", None),
+        ):
+            if variable is not None:
+                self._set_var(variable, "-")
+
+    def _update_contact_signature_readouts(self, features, stats=None, tactile_frame=None):
+        stats = stats if stats and stats.get("ready") else None
+        if stats is None:
+            self._set_var(self.contact_peak_var, "-")
+            self._set_var(self.contact_area_var, "-")
+            self._set_var(self.contact_center_var, "-")
+        else:
+            peak_pct = float(stats.get("peak", 0.0)) * 100.0
+            top_pct = float(stats.get("top_mean", 0.0)) * 100.0
+            area_pct = float(stats.get("area_ratio", 0.0))
+            self._set_var(self.contact_peak_var, f"{peak_pct:.0f}% peak | {top_pct:.0f}% top")
+            self._set_var(self.contact_area_var, f"{area_pct:.1f}%")
+            center = stats.get("center")
+            if center is None:
+                self._set_var(self.contact_center_var, "-")
+            else:
+                cx, cy = center
+                self._set_var(self.contact_center_var, f"{cx:.0f}, {cy:.0f} px")
+
+        residual_mean = float(getattr(tactile_frame, "residual_mean_px", 0.0) or 0.0)
+        residual_peak = float(getattr(tactile_frame, "residual_peak_px", 0.0) or 0.0)
+        if residual_peak > 0.0:
+            self._set_var(self.contact_residual_var, f"{residual_mean:.3f}/{residual_peak:.3f} px")
+        else:
+            self._set_var(self.contact_residual_var, "-")
+
+        with self.sensor_data_lock:
+            load_kg = getattr(self, "latest_loadcell_kg", None)
+            pressure_force = getattr(self, "latest_pressure_force_n", None)
+        if self._finite_number(load_kg):
+            self._set_var(self.contact_force_var, f"{float(load_kg):.4f} kg load")
+        elif self._finite_number(pressure_force):
+            pressure_kg = float(pressure_force) / FORCE_GRAVITY_MPS2
+            self._set_var(self.contact_force_var, f"{pressure_kg:.4f} kg p-eq")
+        else:
+            self._set_var(self.contact_force_var, "-")
 
     def _build_tactile_contact_config(self, params):
         return TactileContactConfig(
@@ -1872,16 +2079,26 @@ class AllInOneTesterGUI:
             self.log("RPi.GPIO is not available. GPIO-based tests cannot run on this machine.")
             return
 
-        GPIO.setwarnings(False)
-        GPIO.setmode(GPIO.BCM)
+        try:
+            GPIO.setwarnings(False)
+            GPIO.setmode(GPIO.BCM)
+            self.gpio_ready = True
+        except Exception as exc:
+            self.gpio_ready = False
+            self.log(f"RPi.GPIO is unavailable on this board/OS: {exc}")
+            self.log("Stepper and limit switch tests will use native libgpiod helpers when available.")
+
+    def _gpio_available(self):
+        return GPIO is not None and bool(getattr(self, "gpio_ready", GPIO is not None))
 
     def _require_gpio(self):
-        if GPIO is not None:
+        if self._gpio_available():
             return True
-        self.log("GPIO test requested, but RPi.GPIO is unavailable.")
+        self.log("GPIO test requested, but RPi.GPIO is unavailable or incompatible.")
         messagebox.showerror(
             "GPIO Unavailable",
-            "RPi.GPIO is not available. On Raspberry Pi OS Bookworm/Pi 5, install rpi-lgpio.",
+            "RPi.GPIO is unavailable or incompatible on this board/OS. "
+            "Use native libgpiod helpers for stepper and limit switch tests.",
         )
         return False
 
@@ -1905,10 +2122,12 @@ class AllInOneTesterGUI:
             return None
         return max(0.0, float(self.stepper_position_mm) - float(self.stepper_contact_zero_mm))
 
-    def _apply_stepper_motion(self, direction_name, pulses=None, elapsed_seconds=None):
+    def _apply_stepper_motion(self, direction_name, pulses=None, elapsed_seconds=None, frequency_hz=None):
+        if not STEPPER_DEPTH_ENABLED:
+            return
         if pulses is None:
             seconds = max(0.0, float(elapsed_seconds or 0.0))
-            pulses = int(round(seconds * STEPPER_FREQUENCY_HZ))
+            pulses = int(round(seconds * float(frequency_hz or STEPPER_FREQUENCY_HZ)))
         delta_mm = max(0, int(pulses)) * STEPPER_MM_PER_PULSE
         if direction_name == "up":
             delta_mm = -delta_mm
@@ -2141,6 +2360,13 @@ class AllInOneTesterGUI:
         return quality, reasons
 
     def capture_camera_deform_sample(self):
+        if self._is_3d_object_mode():
+            messagebox.showwarning(
+                "Camera Deform Calibration",
+                "3D Object mode uses relative contact maps. Switch to Flat Deform to capture mm samples.",
+            )
+            self.log("Cal Deform ignored in 3D Object mode.")
+            return
         try:
             target_mm = float(self.camera_deform_known_mm_var.get())
         except (TypeError, ValueError):
@@ -2256,6 +2482,18 @@ class AllInOneTesterGUI:
             self._save_camera_deform_calibration()
 
     def fit_camera_deform_calibration(self, show_warning=True):
+        if self._is_3d_object_mode():
+            if show_warning:
+                messagebox.showwarning(
+                    "Camera Deform Calibration",
+                    "3D Object mode does not fit a single deform-mm model.",
+                )
+            self._set_var(
+                self.camera_deform_status_var,
+                "3D Object mode: Cal Deform disabled. Use contact signature metrics.",
+            )
+            self.log("Fit Deform ignored in 3D Object mode.")
+            return False
         with self.sensor_data_lock:
             samples = list(self.camera_deform_samples)
         model = self._fit_camera_deform_model(samples)
@@ -2352,12 +2590,33 @@ class AllInOneTesterGUI:
                 f"contact {features['contact_peak']:.3f}"
             ),
         )
+        self._update_contact_signature_readouts(features, stats=stats, tactile_frame=tactile_frame)
+        if self._is_3d_object_mode():
+            center = stats.get("center") if stats else None
+            if center is None:
+                center_text = "-"
+            else:
+                center_text = f"{center[0]:.0f}, {center[1]:.0f} px"
+            self._set_var(
+                self.camera_deform_live_feature_var,
+                (
+                    f"dP {features['pressure_delta_hpa']:+.2f} hPa | "
+                    f"contact {features['contact_peak'] * 100.0:.0f}% | "
+                    f"area {features['contact_area_ratio']:.1f}% | "
+                    f"center {center_text}"
+                ),
+            )
+            self._set_var(self.camera_deform_estimate_var, "3D contact mode")
+            self._set_var(self.contact_depth_camera_var, "relative map")
+            self._append_force_cycle_sample()
+            return
         estimate = self._predict_camera_deform_mm(features, model=model)
         if estimate is None:
             self._set_var(self.camera_deform_estimate_var, "-")
         else:
             self._set_var(self.camera_deform_estimate_var, f"{estimate:.2f} mm cal")
             self._set_var(self.contact_depth_camera_var, f"{estimate:.2f} mm cal")
+        self._append_force_cycle_sample()
 
     def _refresh_contact_depth_readouts(self, camera_depth_mm=None, update_camera=False):
         self._set_var(self.stepper_position_var, f"{self.stepper_position_mm:.3f} mm")
@@ -2375,12 +2634,12 @@ class AllInOneTesterGUI:
             else:
                 self._set_var(self.contact_depth_camera_var, f"{camera_depth_mm:.2f} mm approx")
 
-    def _reset_pressure_contact_gate(self, source="manual"):
+    def _reset_pressure_contact_gate(self, source="manual", seed_latest=True):
         if not PRESSURE_CONTACT_GATE_ENABLED:
             self._set_contact_gate_status("disabled")
             return
         with self.sensor_data_lock:
-            latest_pressure = self.latest_pressure_hpa
+            latest_pressure = self.latest_pressure_hpa if seed_latest else None
             self.contact_pressure_zero_hpa = None
             self.contact_pressure_noise_hpa = 0.0
             self.contact_pressure_delta_hpa = None
@@ -2397,6 +2656,29 @@ class AllInOneTesterGUI:
         status = "zeroing pressure" if latest_pressure is not None else "waiting pressure"
         self._set_contact_gate_status(status)
         self.log(f"Pressure contact gate reset ({source}).")
+
+    def _request_pressure_zero_from_camera_open(self):
+        with self.sensor_data_lock:
+            self.force_pressure_zero_hpa = None
+            self.force_pressure_zero_pending = True
+            self.force_pressure_zero_samples = []
+            self.latest_pressure_force_n = None
+            if hasattr(self, "force_graph_history"):
+                self.force_graph_history.clear()
+
+        self._refresh_force_pressure_zero()
+        self._set_var(
+            self.force_calibration_status_var,
+            "Camera opened; collecting pressure zero baseline.",
+        )
+        self._reset_pressure_contact_gate("camera open", seed_latest=False)
+        self._refresh_force_live_pair()
+        self._update_force_estimate()
+        self._request_force_graph_redraw()
+        self.log("Pressure zero baseline reset for camera-open experiment.")
+
+        if not self._is_thread_running(self.pressure_thread):
+            self.start_pressure_read()
 
     @staticmethod
     def _robust_pressure_noise(samples):
@@ -2590,6 +2872,7 @@ class AllInOneTesterGUI:
         self.root.after(1000, self._update_clock)
 
     def stop_all_tests(self):
+        self.stop_force_cycle()
         self.stop_optical_flow()
         self.stop_blob_test()
         self.stop_camera()
@@ -2634,6 +2917,12 @@ class AllInOneTesterGUI:
 
     def _set_loadcell_controls(self, running):
         self._set_start_stop_controls(self.loadcell_start_btn, self.loadcell_stop_btn, running)
+        self._set_button_enabled(self.loadcell_zero_btn, running)
+        self._set_button_enabled(self.loadcell_calibrate_btn, not running)
+        self._set_button_enabled(self.loadcell_reset_btn, not running)
+
+    def _set_force_cycle_controls(self, running):
+        self._set_start_stop_controls(self.force_cycle_start_btn, self.force_cycle_stop_btn, running)
 
     def _set_blob_controls(self, running):
         self._set_start_stop_controls(self.blob_start_btn, self.blob_stop_btn, running)
@@ -2641,6 +2930,7 @@ class AllInOneTesterGUI:
         self._set_button_enabled(self.blob_reset_ref_btn, running)
         self._set_button_enabled(self.blob_settings_btn, not running)
         self._set_button_enabled(self.surface_reset_btn, running)
+        self._refresh_deform_mode_controls()
 
     def _set_flow_controls(self, running):
         self._set_start_stop_controls(self.flow_start_btn, self.flow_stop_btn, running)
@@ -3589,6 +3879,7 @@ class AllInOneTesterGUI:
         return red_gain, blue_gain
 
     def _collect_blob_params(self):
+        self._sync_surface_measurement_mode_from_var()
         camera_backend = self.blob_camera_backend_var.get().strip().lower()
         if camera_backend not in {"auto", "picamera2", "opencv"}:
             raise ValueError("Backend must be auto, picamera2, or opencv.")
@@ -3602,6 +3893,9 @@ class AllInOneTesterGUI:
             raise ValueError("Mode must be auto, dark, or bright.")
 
         view_type = self.blob_view_type_var.get().strip().lower()
+        if self._is_3d_object_mode():
+            view_type = "surface_3d"
+            self.blob_view_type_var.set("surface_3d")
         if view_type == "optical_flow":
             view_type = "optical_flow_2d"
         if view_type == "optical_flow_3d":
@@ -3713,6 +4007,7 @@ class AllInOneTesterGUI:
         params["use_roi"] = bool(self.blob_use_roi_var.get())
         params["roi_scale"] = roi_percent / 100.0
         params["view_type"] = view_type
+        params["measurement_mode"] = "3d_object" if self._is_3d_object_mode() else "flat_deform"
         params["use_illum_norm"] = bool(self.blob_use_illum_norm_var.get())
         params["illum_method"] = illum_method
         return params
@@ -3755,6 +4050,7 @@ class AllInOneTesterGUI:
             self.camera.start_preview()
             self.camera_running = True
             self._reset_contact_deform_zero_state("Contact deform zero pending. Press Reset Zero.")
+            self._request_pressure_zero_from_camera_open()
             self.camera_status_var.set("Preview running (picamzero)")
             self._set_camera_controls(True)
             self._refresh_system_status()
@@ -3771,6 +4067,7 @@ class AllInOneTesterGUI:
             self.picam2.start()
             self.camera_running = True
             self._reset_contact_deform_zero_state("Contact deform zero pending. Press Reset Zero.")
+            self._request_pressure_zero_from_camera_open()
             self.camera_status_var.set("Camera running (picamera2)")
             self._set_camera_controls(True)
             self._refresh_system_status()
@@ -3820,47 +4117,296 @@ class AllInOneTesterGUI:
             self.log("Camera stopped.")
 
     def start_limit_monitor(self):
-        if not self._require_gpio():
-            return
         if self.limit_thread is not None and self.limit_thread.is_alive():
             self.log("Limit monitor is already running.")
             return
 
-        GPIO.setup(LIMIT_1_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        GPIO.setup(LIMIT_2_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        self._ensure_limit_detail_vars()
+
+        native_reader = None
+        limit_backend = os.environ.get("PI_BUBBLE_LIMIT_BACKEND", "gpio").strip().lower()
+        use_native_first = limit_backend in {"native", "libgpiod"}
+        using_gpio = False
+
+        if not use_native_first:
+            using_gpio = self._setup_limit_gpio_inputs(show_error=False)
+            if using_gpio:
+                self.log("Limit monitor backend: RPi.GPIO.")
+
+        if not using_gpio:
+            native_reader = self._ensure_native_limit_reader()
+            if native_reader is not None:
+                self.log("Limit monitor backend: native libgpiod.")
+            elif use_native_first:
+                self.log("Native limit backend requested but unavailable; trying RPi.GPIO.")
+
+        if native_reader is None and not using_gpio:
+            if not self._require_gpio():
+                return
+            if not self._setup_limit_gpio_inputs(show_error=True):
+                return
+            self.log("Limit monitor backend: RPi.GPIO fallback.")
+
+        with self.limit_state_lock:
+            self.limit_trigger_state = (False, False)
+            self.limit_state_sampled = False
+        self._set_var(self.limit1_status_var, "waiting...")
+        self._set_var(self.limit2_status_var, "waiting...")
+        self._set_var(self.limit1_detail_var, "Limit 1: waiting...")
+        self._set_var(self.limit2_detail_var, "Limit 2: waiting...")
 
         self.limit_stop_event.clear()
-        self.limit_thread = threading.Thread(target=self._limit_worker, daemon=True)
+        self.limit_thread = threading.Thread(target=self._limit_worker, args=(native_reader,), daemon=True)
         self.limit_thread.start()
-        self.limit_monitor_state_var.set("Running")
+        backend_label = "native" if native_reader is not None else "RPi.GPIO"
+        self.limit_monitor_state_var.set(f"Running ({backend_label})")
         self._set_limit_controls(True)
         self._refresh_system_status()
         self.log(
             f"Limit monitor started on GPIO{LIMIT_1_PIN} and GPIO{LIMIT_2_PIN}."
         )
 
-    def _limit_worker(self):
+    def _ensure_limit_detail_vars(self):
+        if not hasattr(self, "limit1_detail_var"):
+            self.limit1_detail_var = tk.StringVar(
+                value=f"Limit 1: {self.limit1_status_var.get()}"
+            )
+        if not hasattr(self, "limit2_detail_var"):
+            self.limit2_detail_var = tk.StringVar(
+                value=f"Limit 2: {self.limit2_status_var.get()}"
+            )
+
+    def _resolve_native_limit_reader(self):
+        env_override = os.environ.get("PI_BUBBLE_LIMIT_READER")
+        if env_override:
+            candidate = Path(env_override)
+            if candidate.exists():
+                return str(candidate)
+
+        reader_name = "limit_reader.exe" if os.name == "nt" else "limit_reader"
+        candidate = Path(__file__).resolve().parent / "native" / "build" / reader_name
+        if candidate.exists():
+            return str(candidate)
+        return None
+
+    def _ensure_native_limit_reader(self):
+        reader = self._resolve_native_limit_reader()
+        if reader is not None:
+            return reader
+
+        script = Path(__file__).resolve().parent / "native" / "build_pi.sh"
+        if not script.exists():
+            self.log("Native limit reader not found; build script is missing.")
+            return None
+
+        try:
+            result = subprocess.run(
+                ["bash", str(script)],
+                cwd=str(script.parent),
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except Exception as exc:
+            self.log(f"Native limit reader auto-build failed: {exc}")
+            return None
+
+        reader = self._resolve_native_limit_reader()
+        if reader is not None:
+            self.log("Native limit reader built automatically.")
+            return reader
+
+        output = (result.stderr or result.stdout or "").strip()
+        if result.returncode == 0:
+            self.log("Native limit reader was not produced; falling back to RPi.GPIO if usable.")
+        else:
+            self.log(f"Native limit reader build failed: {output[:240]}")
+        return None
+
+    def _setup_limit_gpio_inputs(self, show_error=True):
+        if not self._gpio_available():
+            return False
+        try:
+            GPIO.setup(LIMIT_1_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+            GPIO.setup(LIMIT_2_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+            return True
+        except Exception as exc:
+            self._handle_limit_gpio_error(exc, show_dialog=show_error)
+            return False
+
+    def _handle_limit_gpio_error(self, exc, show_dialog=True):
+        message = str(exc)
+        if "Cannot determine SOC peripheral base address" in message:
+            self.gpio_ready = False
+            self.log("RPi.GPIO cannot determine the SOC base address on this board/OS.")
+            self.log("Build/use native limit_reader with libgpiod for limit switch testing.")
+        else:
+            self.log(f"Limit GPIO setup error: {message}")
+        if show_dialog and self.root.winfo_exists():
+            self.root.after(0, lambda: messagebox.showerror("Limit GPIO Error", message))
+
+    def _apply_limit_state(self, current_state, last_state):
+        current_state = (bool(current_state[0]), bool(current_state[1]))
+        with self.limit_state_lock:
+            self.limit_trigger_state = current_state
+            self.limit_state_sampled = True
+
+        self._stop_stepper_if_direction_limit_triggered(current_state)
+
+        if current_state == last_state:
+            return last_state
+
+        l1_triggered, l2_triggered = current_state
+        l1_text = "TRIGGERED" if l1_triggered else "not triggered"
+        l2_text = "TRIGGERED" if l2_triggered else "not triggered"
+        self._set_var(self.limit1_status_var, l1_text)
+        self._set_var(self.limit2_status_var, l2_text)
+        self._set_var(self.limit1_detail_var, f"Limit 1: {l1_text}")
+        self._set_var(self.limit2_detail_var, f"Limit 2: {l2_text}")
+
+        if l1_triggered:
+            self.log("Limit 1 triggered.")
+        if l2_triggered:
+            self.log("Limit 2 triggered.")
+        if not l1_triggered and not l2_triggered:
+            self.log("Both limits are not triggered.")
+
+        return current_state
+
+    def _get_limit_trigger_state(self):
+        with self.limit_state_lock:
+            return tuple(self.limit_trigger_state)
+
+    def _has_limit_state_sample(self):
+        with self.limit_state_lock:
+            return bool(self.limit_state_sampled)
+
+    @staticmethod
+    def _format_triggered_limits(limit_state):
+        names = []
+        if limit_state[0]:
+            names.append("Limit 1")
+        if limit_state[1]:
+            names.append("Limit 2")
+        return " and ".join(names)
+
+    @staticmethod
+    def _limit_block_for_direction(limit_state, direction_name):
+        if direction_name == "up" and limit_state[0]:
+            return "Limit 1"
+        if direction_name == "down" and limit_state[1]:
+            return "Limit 2"
+        return None
+
+    def _stop_stepper_if_direction_limit_triggered(self, limit_state):
+        if self.stepper_limit_guard_disabled:
+            return False
+        if not self._is_thread_running(self.stepper_thread):
+            return False
+        direction_name = self.stepper_active_direction
+        reason_limit = self._limit_block_for_direction(limit_state, direction_name)
+        if reason_limit is None:
+            return False
+
+        reason = f"{reason_limit} while moving {direction_name}"
+        if self.stepper_stop_reason != reason:
+            self.stepper_stop_reason = reason
+            self.log(f"Stepper stop requested by {reason}.")
+        self.stepper_stop_event.set()
+        self._set_var(self.stepper_state_var, f"Stopped by {reason}")
+        return True
+
+    def _ensure_limit_monitor_for_stepper(self, show_dialog=True):
+        if self._is_thread_running(self.limit_thread):
+            return self._wait_for_limit_state_sample(show_dialog=show_dialog)
+
+        self.log("Starting limit monitor before stepper move.")
+        self.start_limit_monitor()
+        return self._wait_for_limit_state_sample(show_dialog=show_dialog)
+
+    def _wait_for_limit_state_sample(self, timeout=1.0, show_dialog=True):
+        deadline = time.perf_counter() + timeout
+        while time.perf_counter() < deadline:
+            if self._has_limit_state_sample():
+                return True
+            if not self._is_thread_running(self.limit_thread):
+                break
+            time.sleep(0.02)
+
+        message = "Limit monitor could not report a fresh state. Stepper move was blocked."
+        self.log(message)
+        if show_dialog and self.root.winfo_exists():
+            messagebox.showerror("Limit Monitor Required", message)
+        return False
+
+    def _run_native_limit_reader(self, reader_path):
+        chip_name = os.environ.get("PI_BUBBLE_GPIO_CHIP", "gpiochip0")
+        command = [
+            reader_path,
+            "--chip",
+            chip_name,
+            "--pin1",
+            str(LIMIT_1_PIN),
+            "--pin2",
+            str(LIMIT_2_PIN),
+            "--interval-ms",
+            "50",
+            "--active-low",
+            "1",
+        ]
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        last_state = (None, None)
+        while not self.limit_stop_event.is_set():
+            line = process.stdout.readline()
+            if not line:
+                break
+            parts = line.strip().split()
+            if len(parts) < 2:
+                continue
+            current_state = (parts[0] == "1", parts[1] == "1")
+            last_state = self._apply_limit_state(current_state, last_state)
+
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=1.0)
+
+        _stdout, stderr = process.communicate()
+        if process.returncode not in (0, -15) and not self.limit_stop_event.is_set():
+            message = stderr.strip() or f"limit_reader exited with code {process.returncode}"
+            raise RuntimeError(message)
+
+    def _limit_worker(self, native_reader=None):
         last_state = (None, None)
         try:
+            if native_reader is not None:
+                try:
+                    self.log(f"Native limit reader active: {native_reader}")
+                    self._run_native_limit_reader(native_reader)
+                    return
+                except Exception as exc:
+                    self.log(f"Native limit reader error: {exc}")
+                    if not self._gpio_available():
+                        return
+                    self.log("Falling back to RPi.GPIO limit polling.")
+                    if not self._setup_limit_gpio_inputs(show_error=True):
+                        return
+
             while not self.limit_stop_event.is_set():
                 l1_triggered = GPIO.input(LIMIT_1_PIN) == GPIO_LOW
                 l2_triggered = GPIO.input(LIMIT_2_PIN) == GPIO_LOW
                 current_state = (l1_triggered, l2_triggered)
-
-                if current_state != last_state:
-                    l1_text = "TRIGGERED" if l1_triggered else "not triggered"
-                    l2_text = "TRIGGERED" if l2_triggered else "not triggered"
-                    self._set_var(self.limit1_status_var, l1_text)
-                    self._set_var(self.limit2_status_var, l2_text)
-
-                    if l1_triggered:
-                        self.log("Limit 1 triggered.")
-                    if l2_triggered:
-                        self.log("Limit 2 triggered.")
-                    if not l1_triggered and not l2_triggered:
-                        self.log("Both limits are not triggered.")
-
-                    last_state = current_state
+                last_state = self._apply_limit_state(current_state, last_state)
 
                 time.sleep(0.05)
         except Exception as exc:
@@ -3881,47 +4427,93 @@ class AllInOneTesterGUI:
         self.log("Limit monitor stopped.")
 
     def start_stepper_move(self):
-        if self.stepper_thread is not None and self.stepper_thread.is_alive():
-            self.log("Stepper is already moving.")
-            return
-
         direction = self.stepper_direction_var.get().strip().lower()
-        if direction not in {"up", "down"}:
-            messagebox.showerror("Invalid Direction", "Direction must be up or down.")
-            return
-
         try:
             seconds = float(self.stepper_seconds_var.get().strip())
         except ValueError:
             messagebox.showerror("Invalid Seconds", "Seconds must be a number.")
             return
 
-        if seconds <= 0:
-            messagebox.showerror("Invalid Seconds", "Seconds must be greater than 0.")
-            return
+        self._start_stepper_move_command(direction, seconds, show_dialog=True)
 
-        native_runner = self._resolve_native_stepper_runner()
+    def _start_stepper_move_command(
+        self,
+        direction,
+        seconds,
+        show_dialog=True,
+        frequency_hz=None,
+        limit_guard_disabled=False,
+    ):
+        if self.stepper_thread is not None and self.stepper_thread.is_alive():
+            self.log("Stepper is already moving.")
+            return False
+
+        direction = str(direction).strip().lower()
+        if direction not in {"up", "down"}:
+            if show_dialog:
+                messagebox.showerror("Invalid Direction", "Direction must be up or down.")
+            self.log(f"Invalid stepper direction requested: {direction}")
+            return False
+
+        if seconds <= 0:
+            if show_dialog:
+                messagebox.showerror("Invalid Seconds", "Seconds must be greater than 0.")
+            self.log("Invalid stepper seconds requested.")
+            return False
+
+        if not self._ensure_limit_monitor_for_stepper(show_dialog=show_dialog):
+            return False
+
+        if not limit_guard_disabled:
+            limit_state = self._get_limit_trigger_state()
+            reason_limit = self._limit_block_for_direction(limit_state, direction)
+            if reason_limit is not None:
+                reason = f"{reason_limit} while moving {direction}"
+                self._set_var(self.stepper_state_var, f"Blocked by {reason}")
+                self.log(f"Stepper move blocked because {reason} is triggered.")
+                if show_dialog:
+                    messagebox.showwarning(
+                        "Limit Triggered",
+                        f"Stepper cannot move {direction} while {reason_limit} is triggered.",
+                    )
+                return False
+        else:
+            self.log(f"Stepper limit guard bypass enabled for {direction} release move.")
+
+        native_runner = self._ensure_native_stepper_runner()
         if native_runner is None:
-            if not self._require_gpio():
-                return
-            GPIO.setup(STEPPER_PUL_PIN, GPIO.OUT, initial=GPIO_LOW)
-            GPIO.setup(STEPPER_DIR_PIN, GPIO.OUT, initial=DIR_DOWN_STATE)
-            GPIO.setup(STEPPER_ENA_PIN, GPIO.OUT, initial=STEPPER_ENA_INACTIVE_STATE)
+            if not self._gpio_available():
+                if show_dialog:
+                    self._require_gpio()
+                else:
+                    self.log("Stepper GPIO unavailable; movement blocked.")
+                return False
+            try:
+                GPIO.setup(STEPPER_PUL_PIN, GPIO.OUT, initial=GPIO_LOW)
+                GPIO.setup(STEPPER_DIR_PIN, GPIO.OUT, initial=DIR_DOWN_STATE)
+                GPIO.setup(STEPPER_ENA_PIN, GPIO.OUT, initial=STEPPER_ENA_INACTIVE_STATE)
+            except Exception as exc:
+                self._handle_stepper_gpio_error(exc)
+                return False
 
         # Keep command naming consistent with existing stepper script wiring.
         direction_state = DIR_DOWN_STATE if direction == "up" else DIR_UP_STATE
 
         self.stepper_stop_event.clear()
+        self.stepper_stop_reason = None
+        self.stepper_active_direction = direction
+        self.stepper_limit_guard_disabled = bool(limit_guard_disabled)
         self.stepper_thread = threading.Thread(
             target=self._stepper_worker,
-            args=(direction, direction_state, seconds, native_runner),
+            args=(direction, direction_state, seconds, native_runner, frequency_hz),
             daemon=True,
         )
         self.stepper_thread.start()
-        self.stepper_state_var.set(f"Running ({direction} for {seconds:.2f}s)")
+        self._set_var(self.stepper_state_var, f"Running ({direction} for {seconds:.2f}s)")
         self._set_stepper_controls(True)
         self._refresh_system_status()
         self.log(f"Stepper command: {direction} for {seconds:.2f} seconds.")
+        return True
 
     def _resolve_native_stepper_runner(self):
         env_override = os.environ.get("PI_BUBBLE_STEPPER_RUNNER")
@@ -3936,8 +4528,55 @@ class AllInOneTesterGUI:
             return str(candidate)
         return None
 
-    def _run_native_stepper(self, runner_path, direction_state, seconds):
+    def _ensure_native_stepper_runner(self):
+        runner = self._resolve_native_stepper_runner()
+        if runner is not None:
+            return runner
+
+        script = Path(__file__).resolve().parent / "native" / "build_pi.sh"
+        if not script.exists():
+            self.log("Native stepper runner not found; build script is missing.")
+            return None
+
+        try:
+            result = subprocess.run(
+                ["bash", str(script)],
+                cwd=str(script.parent),
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except Exception as exc:
+            self.log(f"Native stepper runner auto-build failed: {exc}")
+            return None
+
+        runner = self._resolve_native_stepper_runner()
+        if runner is not None:
+            self.log("Native stepper runner built automatically.")
+            return runner
+
+        output = (result.stderr or result.stdout or "").strip()
+        if result.returncode == 0:
+            self.log("Native stepper runner was not produced; falling back to RPi.GPIO if usable.")
+        else:
+            self.log(f"Native stepper runner build failed: {output[:240]}")
+        return None
+
+    def _handle_stepper_gpio_error(self, exc):
+        message = str(exc)
+        if "Cannot determine SOC peripheral base address" in message:
+            self.gpio_ready = False
+            self.log("RPi.GPIO cannot determine the SOC base address on this board/OS.")
+            self.log("Build/use native stepper_runner with libgpiod for stepper control.")
+        else:
+            self.log(f"Stepper GPIO setup error: {message}")
+        if self.root.winfo_exists():
+            self.root.after(0, lambda: messagebox.showerror("Stepper GPIO Error", message))
+
+    def _run_native_stepper(self, runner_path, direction_state, seconds, frequency_hz=None):
         started_at = time.perf_counter()
+        frequency = float(frequency_hz or STEPPER_FREQUENCY_HZ)
         chip_name = os.environ.get("PI_BUBBLE_GPIO_CHIP", "gpiochip0")
         command = [
             runner_path,
@@ -3956,7 +4595,7 @@ class AllInOneTesterGUI:
             "--ena-inactive",
             str(int(STEPPER_ENA_INACTIVE_STATE)),
             "--frequency",
-            str(float(STEPPER_FREQUENCY_HZ)),
+            str(frequency),
             "--seconds",
             f"{float(seconds):.6f}",
         ]
@@ -3984,7 +4623,9 @@ class AllInOneTesterGUI:
             raise RuntimeError(message)
         return False, time.perf_counter() - started_at
 
-    def _stepper_worker(self, direction_name, direction_state, seconds, native_runner=None):
+    def _stepper_worker(self, direction_name, direction_state, seconds, native_runner=None, frequency_hz=None):
+        frequency = float(frequency_hz or STEPPER_FREQUENCY_HZ)
+        pulse_delay = 1.0 / (2.0 * frequency)
         try:
             if native_runner is not None:
                 try:
@@ -3993,22 +4634,34 @@ class AllInOneTesterGUI:
                         native_runner,
                         direction_state,
                         seconds,
+                        frequency_hz=frequency,
                     )
-                    self._apply_stepper_motion(direction_name, elapsed_seconds=elapsed_seconds)
+                    self._apply_stepper_motion(
+                        direction_name,
+                        elapsed_seconds=elapsed_seconds,
+                        frequency_hz=frequency,
+                    )
                     if stopped or self.stepper_stop_event.is_set():
-                        self.log("Stepper movement stopped by user.")
+                        reason = self.stepper_stop_reason or "user"
+                        self.log(f"Stepper movement stopped by {reason}.")
                     else:
                         self.log(f"Stepper movement complete: {direction_name}.")
                     return
                 except Exception as exc:
                     self.log(f"Native stepper runner error: {exc}")
-                    if GPIO is None:
-                        raise
+                    if not self._gpio_available():
+                        raise RuntimeError(
+                            "Native stepper runner failed and RPi.GPIO fallback is unavailable."
+                        ) from exc
                     self.log("Falling back to Python stepper timing.")
                     native_runner = None
-                    GPIO.setup(STEPPER_PUL_PIN, GPIO.OUT, initial=GPIO_LOW)
-                    GPIO.setup(STEPPER_DIR_PIN, GPIO.OUT, initial=DIR_DOWN_STATE)
-                    GPIO.setup(STEPPER_ENA_PIN, GPIO.OUT, initial=STEPPER_ENA_INACTIVE_STATE)
+                    try:
+                        GPIO.setup(STEPPER_PUL_PIN, GPIO.OUT, initial=GPIO_LOW)
+                        GPIO.setup(STEPPER_DIR_PIN, GPIO.OUT, initial=DIR_DOWN_STATE)
+                        GPIO.setup(STEPPER_ENA_PIN, GPIO.OUT, initial=STEPPER_ENA_INACTIVE_STATE)
+                    except Exception as gpio_exc:
+                        self._handle_stepper_gpio_error(gpio_exc)
+                        raise
 
             GPIO.output(STEPPER_ENA_PIN, STEPPER_ENA_ACTIVE_STATE)
             GPIO.output(STEPPER_DIR_PIN, direction_state)
@@ -4018,15 +4671,16 @@ class AllInOneTesterGUI:
             pulse_count = 0
             while time.perf_counter() < end_time and not self.stepper_stop_event.is_set():
                 GPIO.output(STEPPER_PUL_PIN, GPIO_HIGH)
-                time.sleep(STEPPER_PULSE_DELAY)
+                time.sleep(pulse_delay)
                 GPIO.output(STEPPER_PUL_PIN, GPIO_LOW)
-                time.sleep(STEPPER_PULSE_DELAY)
+                time.sleep(pulse_delay)
                 pulse_count += 1
 
             self._apply_stepper_motion(direction_name, pulses=pulse_count)
 
             if self.stepper_stop_event.is_set():
-                self.log("Stepper movement stopped by user.")
+                reason = self.stepper_stop_reason or "user"
+                self.log(f"Stepper movement stopped by {reason}.")
             else:
                 self.log(f"Stepper movement complete: {direction_name}.")
         except Exception as exc:
@@ -4038,16 +4692,28 @@ class AllInOneTesterGUI:
                     GPIO.output(STEPPER_ENA_PIN, STEPPER_ENA_INACTIVE_STATE)
                 except Exception:
                     pass
-            self._set_var(self.stepper_state_var, "Idle")
+            if self.stepper_stop_reason and self.stepper_stop_reason != "user":
+                self._set_var(self.stepper_state_var, f"Stopped by {self.stepper_stop_reason}")
+            else:
+                self._set_var(self.stepper_state_var, "Ready")
+            self.stepper_active_direction = None
+            self.stepper_limit_guard_disabled = False
             self._set_stepper_controls(False)
             self._refresh_system_status()
 
     def stop_stepper_move(self):
+        if self._is_thread_running(self.stepper_thread) and self.stepper_stop_reason is None:
+            self.stepper_stop_reason = "user"
         self.stepper_stop_event.set()
         if self.stepper_thread is not None and self.stepper_thread.is_alive():
             self.stepper_thread.join(timeout=1.0)
         self.stepper_thread = None
-        self.stepper_state_var.set("Idle")
+        if self.stepper_stop_reason and self.stepper_stop_reason != "user":
+            self.stepper_state_var.set(f"Stopped by {self.stepper_stop_reason}")
+        else:
+            self.stepper_state_var.set("Ready")
+        self.stepper_active_direction = None
+        self.stepper_limit_guard_disabled = False
         self._set_stepper_controls(False)
 
         if GPIO is not None:
@@ -4184,8 +4850,16 @@ class AllInOneTesterGUI:
             self.latest_pressure_hpa = None
             self.latest_loadcell_kg = None
             self.latest_loadcell_force_n = None
+            self.latest_loadcell_raw_kg = None
+            self.latest_loadcell_filtered_raw_kg = None
+            self.loadcell_live_zero_kg = 0.0
+            self.loadcell_filter_buffer = []
+            self.loadcell_noise_kg = 0.0
+            self.loadcell_filter_count = 0
             self.latest_pressure_force_n = None
             self.force_pressure_zero_hpa = FORCE_DEFAULT_PRESSURE_ZERO_HPA
+            self.force_pressure_zero_pending = False
+            self.force_pressure_zero_samples = []
             self.force_calibration_samples = []
             self.force_calibration_coeffs = None
             self.contact_pressure_zero_hpa = None
@@ -4201,10 +4875,25 @@ class AllInOneTesterGUI:
 
         if not hasattr(self, "latest_loadcell_force_n"):
             self.latest_loadcell_force_n = None
+        if not hasattr(self, "latest_loadcell_raw_kg"):
+            self.latest_loadcell_raw_kg = None
+        if not hasattr(self, "latest_loadcell_filtered_raw_kg"):
+            self.latest_loadcell_filtered_raw_kg = None
+        if not hasattr(self, "loadcell_live_zero_kg"):
+            self.loadcell_live_zero_kg = 0.0
+        if not hasattr(self, "loadcell_filter_buffer"):
+            self.loadcell_filter_buffer = []
+        if not hasattr(self, "loadcell_noise_kg"):
+            self.loadcell_noise_kg = 0.0
+        if not hasattr(self, "loadcell_filter_count"):
+            self.loadcell_filter_count = 0
         if not hasattr(self, "latest_pressure_force_n"):
             self.latest_pressure_force_n = None
         if not hasattr(self, "force_pressure_zero_hpa"):
             self.force_pressure_zero_hpa = FORCE_DEFAULT_PRESSURE_ZERO_HPA
+        if not hasattr(self, "force_pressure_zero_pending"):
+            self.force_pressure_zero_pending = False
+            self.force_pressure_zero_samples = []
         if not hasattr(self, "contact_pressure_zero_hpa"):
             self.contact_pressure_zero_hpa = None
             self.contact_pressure_noise_hpa = 0.0
@@ -4219,6 +4908,15 @@ class AllInOneTesterGUI:
         if not hasattr(self, "force_graph_history"):
             self.force_graph_history = []
             self.force_graph_redraw_pending = False
+        if not hasattr(self, "force_cycle_sample_history"):
+            self.force_cycle_sample_history = []
+            self.force_cycle_capture_active = False
+            self.force_cycle_capture_started_at = None
+            self.force_cycle_capture_last_time = None
+            self.force_cycle_phase = "idle"
+            self.force_cycle_phase_started_at = None
+            self.force_cycle_down_seconds = None
+            self.force_cycle_shape_name = "sample"
 
         if not hasattr(self, "force_estimate_var"):
             self.force_estimate_var = tk.StringVar(value="-")
@@ -4227,6 +4925,9 @@ class AllInOneTesterGUI:
             self.force_calibration_sample_count_var = tk.StringVar(value="0 samples")
             self.force_calibration_model_var = tk.StringVar(value="F = a*dP + b")
             self.force_calibration_live_pair_var = tk.StringVar(value="Pressure -, dP -, load -")
+            self.force_cycle_shape_var = tk.StringVar(value="sample")
+        elif not hasattr(self, "force_cycle_shape_var"):
+            self.force_cycle_shape_var = tk.StringVar(value="sample")
 
         if not hasattr(self, "_force_calibration_loaded"):
             self._force_calibration_loaded = True
@@ -4259,6 +4960,8 @@ class AllInOneTesterGUI:
         zero = float(pressure_hpa)
         with self.sensor_data_lock:
             self.force_pressure_zero_hpa = zero
+            self.force_pressure_zero_pending = False
+            self.force_pressure_zero_samples = []
             self.latest_pressure_force_n = None
             if hasattr(self, "force_graph_history"):
                 self.force_graph_history.clear()
@@ -4307,6 +5010,11 @@ class AllInOneTesterGUI:
                 samples.append((pressure_delta, float(sample["force_n"])))
             if len(samples) < 2:
                 raise ValueError("saved calibration needs at least 2 bubble samples")
+            if abs(intercept) > FORCE_CALIBRATION_MAX_ZERO_FORCE_N:
+                raise ValueError(f"saved calibration zero-force offset is too large ({intercept:.3f} N)")
+            fit_score = self._force_linear_fit_score(samples, slope, intercept)
+            if len(samples) >= 4 and fit_score is not None and fit_score < FORCE_CALIBRATION_MIN_R2:
+                raise ValueError(f"saved calibration fit is unstable (R^2={fit_score:.3f})")
         except Exception:
             self.force_calibration_status_var.set("Saved calibration ignored; set zero and recalibrate.")
             return
@@ -4414,53 +5122,154 @@ class AllInOneTesterGUI:
             row=5, column=1, sticky="ew", pady=(8, 0)
         )
 
+        ttk.Label(parent, text="Shape label:").grid(row=6, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(parent, textvariable=self.force_cycle_shape_var).grid(
+            row=6, column=1, sticky="ew", pady=(8, 0)
+        )
+
         actions = ttk.Frame(parent)
-        actions.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(12, 0))
-        for col in range(5):
+        actions.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        for col in range(3):
             actions.columnconfigure(col, weight=1)
-        ttk.Button(actions, text="Set Zero", command=self.set_force_pressure_zero).grid(
+        ttk.Button(actions, text="Set P Zero", command=self.set_force_pressure_zero).grid(
             row=0, column=0, sticky="ew", padx=(0, 8)
         )
-        ttk.Button(actions, text="Bubble Sample", command=self.add_force_calibration_sample).grid(
+        ttk.Button(actions, text="Zero Load", command=self.zero_loadcell_live).grid(
             row=0, column=1, sticky="ew", padx=(0, 8)
         )
-        ttk.Button(actions, text="Reset Samples", command=self.reset_force_bubble_samples).grid(
-            row=0, column=2, sticky="ew", padx=(0, 8)
+        ttk.Button(actions, text="Calibrate", command=self.add_force_calibration_sample).grid(
+            row=0, column=2, sticky="ew"
         )
         ttk.Button(actions, text="Fit Calibration", command=self.fit_force_calibration).grid(
-            row=0, column=3, sticky="ew", padx=(0, 8)
+            row=1, column=0, sticky="ew", padx=(0, 8), pady=(8, 0)
+        )
+        ttk.Button(actions, text="Show Linear Graph", command=self.show_force_linear_equation_graph).grid(
+            row=1, column=1, sticky="ew", padx=(0, 8), pady=(8, 0)
+        )
+        ttk.Button(actions, text="Reset Samples", command=self.reset_force_bubble_samples).grid(
+            row=1, column=2, sticky="ew", pady=(8, 0)
         )
         ttk.Button(actions, text="Clear", command=self.clear_force_calibration).grid(
-            row=0, column=4, sticky="ew"
+            row=3, column=0, columnspan=3, sticky="ew", pady=(8, 0)
         )
+        self.force_cycle_start_btn = ttk.Button(
+            actions, text="Run Force Cycle", command=self.start_force_cycle
+        )
+        self.force_cycle_start_btn.grid(
+            row=2, column=0, columnspan=2, sticky="ew", padx=(0, 8), pady=(8, 0)
+        )
+        self.force_cycle_stop_btn = ttk.Button(
+            actions, text="Stop Cycle", command=self.stop_force_cycle
+        )
+        self.force_cycle_stop_btn.grid(row=2, column=2, sticky="ew", pady=(8, 0))
+        self._set_force_cycle_controls(False)
 
     def _record_pressure_reading(self, pressure_hpa):
         pressure = float(pressure_hpa)
         zero_captured = False
+        zero_pending_count = None
+        zero_required_count = max(1, PRESSURE_CONTACT_BASELINE_SAMPLES)
+        zero_value = None
         with self.sensor_data_lock:
             self.latest_pressure_hpa = pressure
-            if self.force_pressure_zero_hpa is None:
+            if self.force_pressure_zero_pending:
+                self.force_pressure_zero_samples.append(pressure)
+                zero_pending_count = len(self.force_pressure_zero_samples)
+                if zero_pending_count >= zero_required_count:
+                    recent = self.force_pressure_zero_samples[-zero_required_count:]
+                    zero_value = float(np.median(np.asarray(recent, dtype=np.float32)))
+                    self.force_pressure_zero_hpa = zero_value
+                    self.force_pressure_zero_pending = False
+                    self.force_pressure_zero_samples = []
+                    self.latest_pressure_force_n = None
+                    zero_captured = True
+            elif self.force_pressure_zero_hpa is None:
                 self.force_pressure_zero_hpa = pressure
+                zero_value = pressure
                 zero_captured = True
+        if zero_pending_count is not None and not zero_captured:
+            self._set_var(
+                self.force_calibration_status_var,
+                f"Collecting pressure zero {zero_pending_count}/{zero_required_count}.",
+            )
         if zero_captured:
             self._refresh_force_pressure_zero()
             self._set_var(
                 self.force_calibration_status_var,
                 "Pressure zero captured. Press bubble into load cell.",
             )
-            self.log(f"Force pressure zero auto-captured at {pressure:.2f} hPa.")
+            self.log(f"Force pressure zero auto-captured at {float(zero_value):.2f} hPa.")
         self._update_pressure_contact_gate(pressure)
         self._refresh_force_live_pair()
         self._update_force_estimate()
         self._append_force_graph_sample()
 
-    def _record_loadcell_reading(self, weight_kg):
+    def _reset_loadcell_filter(self, reset_live_zero=False):
         with self.sensor_data_lock:
-            self.latest_loadcell_kg = float(weight_kg)
-            self.latest_loadcell_force_n = float(weight_kg) * FORCE_GRAVITY_MPS2
+            self.latest_loadcell_kg = None
+            self.latest_loadcell_force_n = None
+            self.latest_loadcell_raw_kg = None
+            self.latest_loadcell_filtered_raw_kg = None
+            if reset_live_zero:
+                self.loadcell_live_zero_kg = 0.0
+            self.loadcell_filter_buffer = []
+            self.loadcell_noise_kg = 0.0
+            self.loadcell_filter_count = 0
+
+    def zero_loadcell_live(self):
+        with self.sensor_data_lock:
+            current_kg = self.latest_loadcell_kg
+            if current_kg is None:
+                current_kg = self.latest_loadcell_filtered_raw_kg
+            if current_kg is None:
+                messagebox.showwarning(
+                    "Zero Load",
+                    "Start load-cell reading and wait for a stable value first.",
+                )
+                return False
+            self.loadcell_live_zero_kg += float(current_kg)
+            self.latest_loadcell_kg = 0.0
+            self.latest_loadcell_force_n = 0.0
+            if hasattr(self, "force_graph_history"):
+                self.force_graph_history.clear()
+        self._set_var(self.loadcell_weight_var, "0.0000 kg (zeroed)")
+        self._refresh_force_live_pair()
+        self._update_force_estimate()
+        self._request_force_graph_redraw()
+        self.log(f"Load-cell live zero adjusted by {float(current_kg):+.4f} kg.")
+        return True
+
+    def _record_loadcell_reading(self, weight_kg):
+        raw_kg = float(weight_kg)
+        with self.sensor_data_lock:
+            buffer = list(getattr(self, "loadcell_filter_buffer", []))
+            buffer.append(raw_kg)
+            window = max(1, int(LOADCELL_FILTER_WINDOW))
+            if len(buffer) > window:
+                buffer = buffer[-window:]
+
+            values = np.asarray(buffer, dtype=np.float64)
+            filtered_kg = float(np.median(values))
+            mad = float(np.median(np.abs(values - filtered_kg))) if values.size else 0.0
+            noise_kg = float(1.4826 * mad)
+            if values.size >= 3:
+                outlier_limit = max(LOADCELL_STABLE_NOISE_KG * 3.0, noise_kg * 6.0, 0.03)
+                if abs(raw_kg - filtered_kg) > outlier_limit:
+                    filtered_kg = float(np.median(values[:-1])) if values.size > 1 else filtered_kg
+
+            live_zero_kg = float(getattr(self, "loadcell_live_zero_kg", 0.0))
+            corrected_kg = filtered_kg - live_zero_kg
+            self.loadcell_filter_buffer = buffer
+            self.loadcell_filter_count = len(buffer)
+            self.loadcell_noise_kg = noise_kg
+            self.latest_loadcell_raw_kg = raw_kg
+            self.latest_loadcell_filtered_raw_kg = filtered_kg
+            self.latest_loadcell_kg = corrected_kg
+            self.latest_loadcell_force_n = corrected_kg * FORCE_GRAVITY_MPS2
         self._refresh_force_live_pair()
         self._update_force_estimate()
         self._append_force_graph_sample()
+        return corrected_kg
 
     def _refresh_force_live_pair(self):
         if not hasattr(self, "force_calibration_live_pair_var"):
@@ -4528,14 +5337,517 @@ class AllInOneTesterGUI:
             if len(self.force_graph_history) > FORCE_GRAPH_MAX_POINTS:
                 del self.force_graph_history[:-FORCE_GRAPH_MAX_POINTS]
 
+        self._append_force_cycle_sample(now=now)
         self._request_force_graph_redraw()
+
+    @staticmethod
+    def _clean_force_cycle_shape_name(value):
+        text = str(value or "").strip()
+        return text if text else "sample"
+
+    @staticmethod
+    def _safe_filename_token(value, default="sample"):
+        token = []
+        for char in str(value or "").strip().lower():
+            if char.isalnum():
+                token.append(char)
+            elif char in {" ", "-", "_", "."}:
+                token.append("_")
+        safe = "".join(token).strip("_")
+        return (safe or default)[:48]
+
+    def _force_cycle_depth_mm_locked(self, now):
+        if not getattr(self, "force_cycle_capture_active", False):
+            return None
+
+        phase = getattr(self, "force_cycle_phase", "idle")
+        phase_started_at = getattr(self, "force_cycle_phase_started_at", None)
+        down_seconds = getattr(self, "force_cycle_down_seconds", None)
+        mm_per_second = float(FORCE_CYCLE_STEPPER_FREQUENCY_HZ) * float(STEPPER_MM_PER_PULSE)
+
+        if phase == "down":
+            if phase_started_at is None:
+                return 0.0
+            elapsed = max(0.0, float(now) - float(phase_started_at))
+            return elapsed * mm_per_second
+
+        if phase == "up":
+            if down_seconds is None:
+                return None
+            down_depth = max(0.0, float(down_seconds) * mm_per_second)
+            if phase_started_at is None:
+                return down_depth
+            elapsed = max(0.0, float(now) - float(phase_started_at))
+            return max(0.0, down_depth - (elapsed * mm_per_second))
+
+        if phase == "settle" and down_seconds is not None:
+            return max(0.0, float(down_seconds) * mm_per_second)
+
+        if phase == "complete":
+            return 0.0
+
+        return 0.0
+
+    def _start_force_cycle_capture(self, started_at, shape_name):
+        clean_shape = self._clean_force_cycle_shape_name(shape_name)
+        with self.sensor_data_lock:
+            self.force_cycle_sample_history = []
+            self.force_cycle_capture_active = True
+            self.force_cycle_capture_started_at = float(started_at)
+            self.force_cycle_capture_last_time = None
+            self.force_cycle_phase = "idle"
+            self.force_cycle_phase_started_at = float(started_at)
+            self.force_cycle_down_seconds = None
+            self.force_cycle_shape_name = clean_shape
+        self.log(f"Force cycle capture armed for shape: {clean_shape}.")
+
+    def _set_force_cycle_phase(self, phase, phase_started_at=None, down_seconds=None):
+        now = time.monotonic() if phase_started_at is None else float(phase_started_at)
+        with self.sensor_data_lock:
+            self.force_cycle_phase = str(phase)
+            self.force_cycle_phase_started_at = now
+            if down_seconds is not None:
+                self.force_cycle_down_seconds = max(0.0, float(down_seconds))
+        self._append_force_cycle_sample(now=now, force=True)
+
+    def _stop_force_cycle_capture(self):
+        with self.sensor_data_lock:
+            self.force_cycle_capture_active = False
+            self.force_cycle_phase = "idle"
+            self.force_cycle_phase_started_at = None
+
+    def _append_force_cycle_sample(self, now=None, force=False):
+        now = time.monotonic() if now is None else float(now)
+        with self.sensor_data_lock:
+            if not getattr(self, "force_cycle_capture_active", False):
+                return
+            last_time = getattr(self, "force_cycle_capture_last_time", None)
+            if (
+                not force
+                and last_time is not None
+                and now - float(last_time) < FORCE_CYCLE_SAMPLE_MIN_INTERVAL_SECONDS
+            ):
+                return
+
+            started_at = self.force_cycle_capture_started_at
+            if started_at is None:
+                return
+
+            load_force = self.latest_loadcell_force_n
+            pressure_force = self.latest_pressure_force_n
+            pressure_hpa = self.latest_pressure_hpa
+            zero_hpa = self.force_pressure_zero_hpa
+            features = (
+                dict(self.camera_deform_latest_features)
+                if self.camera_deform_latest_features is not None
+                else {}
+            )
+            pressure_delta = self._pressure_delta_from_zero(pressure_hpa, zero_hpa)
+            indentation_depth_mm = self._force_cycle_depth_mm_locked(now)
+            load_kg = None if load_force is None else float(load_force) / FORCE_GRAVITY_MPS2
+            pressure_kg = None if pressure_force is None else float(pressure_force) / FORCE_GRAVITY_MPS2
+            error_kg = (
+                None
+                if load_force is None or pressure_force is None
+                else (float(pressure_force) - float(load_force)) / FORCE_GRAVITY_MPS2
+            )
+
+            self.force_cycle_sample_history.append(
+                {
+                    "elapsed_s": max(0.0, now - float(started_at)),
+                    "phase": getattr(self, "force_cycle_phase", "idle"),
+                    "shape_name": getattr(self, "force_cycle_shape_name", "sample"),
+                    "indentation_depth_mm": indentation_depth_mm,
+                    "load_force_n": None if load_force is None else float(load_force),
+                    "load_kg": load_kg,
+                    "pressure_force_n": None if pressure_force is None else float(pressure_force),
+                    "pressure_kg_eq": pressure_kg,
+                    "pressure_hpa": None if pressure_hpa is None else float(pressure_hpa),
+                    "pressure_delta_hpa": pressure_delta,
+                    "error_kg": error_kg,
+                    "dot_mean_px": features.get("dot_mean_px"),
+                    "dot_max_px": features.get("dot_max_px"),
+                    "missing_ratio": features.get("missing_ratio"),
+                    "contact_peak": features.get("contact_peak"),
+                    "contact_area_ratio": features.get("contact_area_ratio"),
+                    "residual_mean_px": features.get("residual_mean_px"),
+                    "residual_peak_px": features.get("residual_peak_px"),
+                    "surface_scale_px": features.get("surface_scale_px"),
+                }
+            )
+            self.force_cycle_capture_last_time = now
+
+    @staticmethod
+    def _csv_number(value, digits=6):
+        if value is None:
+            return ""
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return ""
+        if not np.isfinite(value):
+            return ""
+        return f"{value:.{digits}f}"
+
+    def _save_force_cycle_graphs(self, output_dir, timestamp, shape_name, history):
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg", force=True)
+            import matplotlib.pyplot as plt
+        except Exception as exc:
+            self.log(f"Force cycle graph export skipped: {exc}")
+            return []
+
+        saved_paths = []
+
+        def finite_series(key):
+            points = []
+            for sample in history:
+                value = sample.get(key)
+                elapsed = sample.get("elapsed_s")
+                if self._finite_number(value) and self._finite_number(elapsed):
+                    points.append((float(elapsed), float(value)))
+            return points
+
+        load_points = finite_series("load_kg")
+        pressure_points = finite_series("pressure_kg_eq")
+        error_points = finite_series("error_kg")
+        if load_points or pressure_points or error_points:
+            fig, axes = plt.subplots(2, 1, figsize=(8.5, 6.0), sharex=True)
+            fig.suptitle(f"Force cycle: {shape_name}")
+            if load_points:
+                axes[0].plot(
+                    [point[0] for point in load_points],
+                    [point[1] for point in load_points],
+                    label="load cell kg",
+                    color="#139a74",
+                    linewidth=1.6,
+                )
+            if pressure_points:
+                axes[0].plot(
+                    [point[0] for point in pressure_points],
+                    [point[1] for point in pressure_points],
+                    label="pressure kg-eq",
+                    color="#f0a000",
+                    linewidth=1.4,
+                    linestyle="--",
+                )
+            axes[0].set_ylabel("kg")
+            axes[0].grid(True, alpha=0.28)
+            if load_points or pressure_points:
+                axes[0].legend(loc="best")
+
+            if error_points:
+                axes[1].plot(
+                    [point[0] for point in error_points],
+                    [point[1] for point in error_points],
+                    label="pressure kg-eq - load kg",
+                    color="#a34b2a",
+                    linewidth=1.5,
+                )
+            axes[1].axhline(0.0, color="#4f9da6", linewidth=1.0, linestyle=":")
+            axes[1].set_xlabel("elapsed (s)")
+            axes[1].set_ylabel("error kg")
+            axes[1].grid(True, alpha=0.28)
+            if error_points:
+                axes[1].legend(loc="best")
+            fig.tight_layout()
+            path = output_dir / f"force_cycle_{timestamp}_force.png"
+            fig.savefig(path, dpi=160)
+            plt.close(fig)
+            saved_paths.append(path)
+
+        indent_points = []
+        for sample in history:
+            depth = sample.get("indentation_depth_mm")
+            dot_mean = sample.get("dot_mean_px")
+            if self._finite_number(depth) and self._finite_number(dot_mean):
+                indent_points.append((float(depth), float(dot_mean), str(sample.get("phase", ""))))
+        if indent_points:
+            fig, ax = plt.subplots(figsize=(7.2, 4.8))
+            colors = [
+                "#139a74" if point[2] == "down" else "#d17800" if point[2] == "up" else "#6b879a"
+                for point in indent_points
+            ]
+            ax.plot(
+                [point[0] for point in indent_points],
+                [point[1] for point in indent_points],
+                color="#2f6178",
+                linewidth=1.0,
+                alpha=0.45,
+            )
+            ax.scatter(
+                [point[0] for point in indent_points],
+                [point[1] for point in indent_points],
+                c=colors,
+                s=18,
+                alpha=0.85,
+            )
+            ax.set_title(f"Indentation vs mean dot displacement: {shape_name}")
+            ax.set_xlabel("indentation depth (mm)")
+            ax.set_ylabel("mean dot displacement (px)")
+            ax.grid(True, alpha=0.28)
+            fig.tight_layout()
+            path = output_dir / f"force_cycle_{timestamp}_indentation_dot.png"
+            fig.savefig(path, dpi=160)
+            plt.close(fig)
+            saved_paths.append(path)
+
+        return saved_paths
+
+    def _save_force_cycle_data(self, started_at):
+        with self.sensor_data_lock:
+            history = list(getattr(self, "force_cycle_sample_history", []))
+            shape_name = getattr(self, "force_cycle_shape_name", "sample")
+
+        if not history:
+            self.log("Force cycle finished without force samples to save.")
+            return None
+
+        output_dir = Path(__file__).resolve().parent / "logs" / "force_cycles"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        shape_token = self._safe_filename_token(shape_name)
+        output_path = output_dir / f"force_cycle_{timestamp}_{shape_token}.csv"
+
+        with output_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(
+                [
+                    "elapsed_s",
+                    "phase",
+                    "shape_name",
+                    "indentation_depth_mm",
+                    "load_force_n",
+                    "load_kg",
+                    "pressure_force_n",
+                    "pressure_kg_eq",
+                    "pressure_hpa",
+                    "pressure_delta_hpa",
+                    "error_kg",
+                    "dot_mean_px",
+                    "dot_max_px",
+                    "missing_ratio",
+                    "contact_peak",
+                    "contact_area_ratio",
+                    "residual_mean_px",
+                    "residual_peak_px",
+                    "surface_scale_px",
+                ]
+            )
+            for sample in history:
+                writer.writerow(
+                    [
+                        self._csv_number(sample.get("elapsed_s"), digits=3),
+                        sample.get("phase", ""),
+                        sample.get("shape_name", shape_name),
+                        self._csv_number(sample.get("indentation_depth_mm"), digits=6),
+                        self._csv_number(sample.get("load_force_n"), digits=6),
+                        self._csv_number(sample.get("load_kg"), digits=6),
+                        self._csv_number(sample.get("pressure_force_n"), digits=6),
+                        self._csv_number(sample.get("pressure_kg_eq"), digits=6),
+                        self._csv_number(sample.get("pressure_hpa"), digits=4),
+                        self._csv_number(sample.get("pressure_delta_hpa"), digits=4),
+                        self._csv_number(sample.get("error_kg"), digits=6),
+                        self._csv_number(sample.get("dot_mean_px"), digits=6),
+                        self._csv_number(sample.get("dot_max_px"), digits=6),
+                        self._csv_number(sample.get("missing_ratio"), digits=6),
+                        self._csv_number(sample.get("contact_peak"), digits=6),
+                        self._csv_number(sample.get("contact_area_ratio"), digits=6),
+                        self._csv_number(sample.get("residual_mean_px"), digits=6),
+                        self._csv_number(sample.get("residual_peak_px"), digits=6),
+                        self._csv_number(sample.get("surface_scale_px"), digits=6),
+                    ]
+                )
+
+        graph_paths = self._save_force_cycle_graphs(output_dir, timestamp, shape_name, history)
+        graph_text = ", ".join(path.name for path in graph_paths)
+        if graph_text:
+            self.log(
+                f"Force cycle data saved: {output_path.name}, {graph_text} ({len(history)} samples)."
+            )
+        else:
+            self.log(f"Force cycle data saved: {output_path.name} ({len(history)} samples).")
+        return output_path
+
+    def start_force_cycle(self):
+        if self._is_thread_running(self.force_cycle_thread):
+            self.log("Force cycle is already running.")
+            return
+        if self._is_thread_running(self.stepper_thread):
+            messagebox.showwarning("Force Cycle", "Stop the current stepper move before starting a force cycle.")
+            return
+        if not self._ensure_limit_monitor_for_stepper(show_dialog=True):
+            return
+        if self._get_limit_trigger_state()[1]:
+            messagebox.showwarning(
+                "Force Cycle",
+                "Limit 2 / GPIO27 is already triggered. Move up and set the start height first.",
+            )
+            self.log("Force cycle blocked because Limit 2 is already triggered at the start height.")
+            return
+        if self._load_loadcell_calibration() is None:
+            messagebox.showwarning("Force Cycle", "Cal Load once before running a force data cycle.")
+            return
+        if not self._is_thread_running(self.pressure_thread):
+            self.start_pressure_read()
+        if not self._is_thread_running(self.loadcell_thread):
+            self._reset_loadcell_filter(reset_live_zero=True)
+            self.start_loadcell_read()
+
+        self.force_cycle_requested_shape_name = self._clean_force_cycle_shape_name(
+            self.force_cycle_shape_var.get()
+        )
+        if not self._is_blob_running():
+            self.log("Force cycle will save force data only; Start Detection first to include shape displacement.")
+        self.force_cycle_stop_event.clear()
+        self.force_cycle_thread = threading.Thread(target=self._force_cycle_worker, daemon=True)
+        self.force_cycle_thread.start()
+        self._set_force_cycle_controls(True)
+        self._set_var(self.force_calibration_status_var, "Force cycle running.")
+        self.log(f"Force cycle started for shape: {self.force_cycle_requested_shape_name}.")
+
+    def stop_force_cycle(self):
+        self.force_cycle_stop_event.set()
+        if self._is_thread_running(self.stepper_thread):
+            self.stop_stepper_move()
+        if self.force_cycle_thread is not None and self.force_cycle_thread.is_alive():
+            self.force_cycle_thread.join(timeout=1.0)
+        self.force_cycle_thread = None
+        self._set_force_cycle_controls(False)
+
+    def _force_cycle_wait_stepper_done(self, target_limit_index=None):
+        while self._is_thread_running(self.stepper_thread):
+            if self.force_cycle_stop_event.is_set():
+                self.stop_stepper_move()
+                return False
+            if target_limit_index is not None and self._get_limit_trigger_state()[target_limit_index]:
+                self.stepper_stop_reason = f"Force cycle reached Limit {target_limit_index + 1}"
+                self.stepper_stop_event.set()
+            time.sleep(0.05)
+        return not self.force_cycle_stop_event.is_set()
+
+    def _force_cycle_move_until_limit_timed(self, direction, target_limit_index, label):
+        if self._get_limit_trigger_state()[target_limit_index]:
+            self.log(f"Force cycle aborted: {label} is already triggered before motion.")
+            return None
+
+        self.log(f"Force cycle: moving {direction} toward {label}.")
+        started_at = time.monotonic()
+        self._set_force_cycle_phase(direction, phase_started_at=started_at)
+        if not self._start_stepper_move_command(
+            direction,
+            FORCE_CYCLE_LIMIT_MAX_SECONDS,
+            show_dialog=False,
+            frequency_hz=FORCE_CYCLE_STEPPER_FREQUENCY_HZ,
+        ):
+            return None
+        if not self._force_cycle_wait_stepper_done(target_limit_index=target_limit_index):
+            return None
+
+        elapsed_seconds = time.monotonic() - started_at
+        if not self._get_limit_trigger_state()[target_limit_index]:
+            self.log(f"Force cycle stopped before reaching {label}.")
+            return None
+        self.log(f"Force cycle reached {label} after {elapsed_seconds:.2f}s.")
+        if direction == "down":
+            self._set_force_cycle_phase("settle", down_seconds=elapsed_seconds)
+        return max(0.0, elapsed_seconds)
+
+    def _force_cycle_move_for_seconds(self, direction, seconds, label):
+        self.log(f"Force cycle: {label}.")
+        phase_started_at = time.monotonic()
+        self._set_force_cycle_phase(
+            direction,
+            phase_started_at=phase_started_at,
+            down_seconds=seconds if direction == "up" else None,
+        )
+        if not self._start_stepper_move_command(
+            direction,
+            seconds,
+            show_dialog=False,
+            frequency_hz=FORCE_CYCLE_STEPPER_FREQUENCY_HZ,
+        ):
+            return False
+        return self._force_cycle_wait_stepper_done(target_limit_index=None)
+
+    def _force_cycle_sleep(self):
+        if FORCE_CYCLE_SETTLE_SECONDS <= 0:
+            return not self.force_cycle_stop_event.is_set()
+        deadline = time.monotonic() + FORCE_CYCLE_SETTLE_SECONDS
+        while time.monotonic() < deadline:
+            if self.force_cycle_stop_event.is_set():
+                return False
+            time.sleep(0.02)
+        return True
+
+    def _force_cycle_wait_sensor_ready(self, timeout=8.0):
+        self.log("Force cycle: waiting for pressure/load-cell samples.")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.force_cycle_stop_event.is_set():
+                return False
+            with self.sensor_data_lock:
+                pressure_ready = self.latest_pressure_hpa is not None
+                load_ready = self.latest_loadcell_kg is not None
+            if pressure_ready and load_ready:
+                return True
+            time.sleep(0.05)
+        self.log("Force cycle aborted: pressure/load-cell samples were not ready.")
+        return False
+
+    def _force_cycle_worker(self):
+        started_at = None
+        completed = False
+        try:
+            if not self._force_cycle_wait_sensor_ready():
+                return
+            started_at = time.monotonic()
+            shape_name = getattr(self, "force_cycle_requested_shape_name", "sample")
+            self._start_force_cycle_capture(started_at, shape_name)
+            self._append_force_cycle_sample(now=started_at, force=True)
+            down_seconds = self._force_cycle_move_until_limit_timed("down", 1, "Limit 2")
+            if down_seconds is None:
+                return
+            if down_seconds <= 0.05:
+                self.log("Force cycle aborted: down stroke time was too short to return safely.")
+                return
+            self._set_force_cycle_phase("settle", down_seconds=down_seconds)
+            if not self._force_cycle_sleep():
+                return
+            if not self._force_cycle_move_for_seconds(
+                "up",
+                down_seconds,
+                f"return up for {down_seconds:.2f}s",
+            ):
+                return
+            self._set_force_cycle_phase("complete", down_seconds=down_seconds)
+            completed = True
+            output_path = self._save_force_cycle_data(started_at or time.monotonic())
+            status = f"Force cycle complete. Down/up time {down_seconds:.2f}s."
+            if output_path is not None:
+                status += f" Saved {output_path.name}."
+            self._set_var(self.force_calibration_status_var, status)
+        except Exception as exc:
+            self.log(f"Force cycle error: {exc}")
+            self._set_var(self.force_calibration_status_var, f"Force cycle error: {exc}")
+        finally:
+            if not completed and self.force_cycle_stop_event.is_set():
+                self.log("Force cycle stopped by user.")
+                self._set_var(self.force_calibration_status_var, "Force cycle stopped.")
+            elif not completed:
+                self._set_var(self.force_calibration_status_var, "Force cycle aborted.")
+            self._stop_force_cycle_capture()
+            self.force_cycle_stop_event.clear()
+            self.force_cycle_thread = None
+            self._set_force_cycle_controls(False)
 
     def _request_force_graph_redraw(self):
         if not self.root.winfo_exists():
             return
-        if not hasattr(self, "force_compare_canvas"):
-            return
-        if not hasattr(self, "force_error_canvas"):
+        compare_canvases, error_canvases = self._force_graph_canvases()
+        if not compare_canvases and not error_canvases:
             return
         if getattr(self, "force_graph_redraw_pending", False):
             return
@@ -4547,6 +5859,28 @@ class AllInOneTesterGUI:
             self._draw_force_graphs()
 
         self.root.after(80, redraw)
+
+    def _force_graph_canvases(self):
+        compare_canvases = []
+        error_canvases = []
+        seen = set()
+        for name, target in (
+            ("force_compare_canvas", compare_canvases),
+            ("force_error_canvas", error_canvases),
+        ):
+            canvas = getattr(self, name, None)
+            if canvas is None:
+                continue
+            if id(canvas) in seen:
+                continue
+            try:
+                if not canvas.winfo_exists():
+                    continue
+            except tk.TclError:
+                continue
+            seen.add(id(canvas))
+            target.append(canvas)
+        return compare_canvases, error_canvases
 
     @staticmethod
     def _finite_number(value):
@@ -4572,13 +5906,15 @@ class AllInOneTesterGUI:
     def _draw_force_graphs(self):
         if not self.root.winfo_exists():
             return
-        if not hasattr(self, "force_compare_canvas"):
-            return
-        if not hasattr(self, "force_error_canvas"):
+
+        compare_canvases, error_canvases = self._force_graph_canvases()
+        if not compare_canvases and not error_canvases:
             return
 
-        self._draw_force_time_graph(self.force_compare_canvas)
-        self._draw_force_error_graph(self.force_error_canvas)
+        for canvas in compare_canvases:
+            self._draw_force_time_graph(canvas)
+        for canvas in error_canvases:
+            self._draw_force_error_graph(canvas)
 
     def _prepare_graph_canvas(self, canvas, title, x_label, y_label):
         width = max(1, int(canvas.winfo_width()))
@@ -4889,11 +6225,259 @@ class AllInOneTesterGUI:
             font=("Segoe UI", 7),
         )
 
+    @staticmethod
+    def _force_linear_fit_score(samples, slope, intercept):
+        if len(samples) < 2:
+            return None
+        forces = [float(force_n) for _pressure_delta, force_n in samples]
+        mean_force = sum(forces) / len(forces)
+        total = sum((force_n - mean_force) ** 2 for force_n in forces)
+        if total <= 1e-12:
+            return None
+        residual = sum(
+            (float(force_n) - ((float(pressure_delta) * slope) + intercept)) ** 2
+            for pressure_delta, force_n in samples
+        )
+        return 1.0 - (residual / total)
+
+    def show_force_linear_equation_graph(self):
+        with self.sensor_data_lock:
+            samples = list(self.force_calibration_samples)
+            coeffs = self.force_calibration_coeffs
+
+        if len(samples) >= 2 and coeffs is None:
+            self._fit_force_calibration(show_warning=False)
+
+        window = getattr(self, "force_linear_graph_window", None)
+        if window is not None and window.winfo_exists():
+            window.lift()
+            window.focus_force()
+            self._refresh_force_linear_equation_graph()
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title("Force Linear Equation")
+        window.geometry("760x520")
+        window.minsize(520, 360)
+        window.transient(self.root)
+        try:
+            window.configure(bg=COLOR_BG)
+        except tk.TclError:
+            pass
+
+        self.force_linear_graph_window = window
+        self.force_linear_graph_summary_var = tk.StringVar(value="")
+
+        container = ttk.Frame(window, padding=12, style="App.TFrame")
+        container.grid(row=0, column=0, sticky="nsew")
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(1, weight=1)
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(0, weight=1)
+
+        ttk.Label(
+            container,
+            text="Linear equation from captured force samples",
+            style="SectionTitle.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            container,
+            textvariable=self.force_linear_graph_summary_var,
+            style="SectionHint.TLabel",
+            wraplength=700,
+            justify="left",
+        ).grid(row=0, column=1, sticky="e", padx=(12, 0))
+
+        canvas = tk.Canvas(
+            container,
+            height=380,
+            background="#f9fbfc",
+            highlightthickness=1,
+            highlightbackground=COLOR_BORDER,
+        )
+        canvas.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(10, 0))
+        self.force_linear_graph_canvas = canvas
+
+        footer = ttk.Frame(container, style="App.TFrame")
+        footer.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        footer.columnconfigure(0, weight=1)
+        ttk.Button(footer, text="Refresh", command=self._refresh_force_linear_equation_graph).grid(
+            row=0, column=1, sticky="e", padx=(0, 8)
+        )
+        close_btn = ttk.Button(footer, text="Close", command=window.destroy)
+        close_btn.grid(row=0, column=2, sticky="e")
+
+        def on_close():
+            self.force_linear_graph_window = None
+            self.force_linear_graph_canvas = None
+            window.destroy()
+
+        close_btn.configure(command=on_close)
+        window.protocol("WM_DELETE_WINDOW", on_close)
+        canvas.bind("<Configure>", lambda _event: self._refresh_force_linear_equation_graph())
+        window.after(80, self._refresh_force_linear_equation_graph)
+
+    def _refresh_force_linear_equation_graph(self):
+        canvas = getattr(self, "force_linear_graph_canvas", None)
+        if canvas is None or not canvas.winfo_exists():
+            return
+        self._draw_force_linear_equation_graph(canvas)
+
+    def _draw_force_linear_equation_graph(self, canvas):
+        with self.sensor_data_lock:
+            samples = list(self.force_calibration_samples)
+            coeffs = self.force_calibration_coeffs
+
+        if len(samples) >= 2 and coeffs is None:
+            coeffs = None
+
+        summary_var = getattr(self, "force_linear_graph_summary_var", None)
+        if not samples:
+            if summary_var is not None:
+                summary_var.set("Capture bubble samples to build the linear equation.")
+            self._draw_empty_graph(
+                canvas,
+                "Force calibration samples",
+                "No bubble samples captured yet",
+            )
+            return
+
+        pressure_deltas = [float(pressure_delta) for pressure_delta, _force_n in samples]
+        forces = [float(force_n) for _pressure_delta, force_n in samples]
+        x_min, x_max = self._graph_bounds(pressure_deltas, include_zero=True)
+
+        line_points = []
+        if coeffs is not None:
+            slope, intercept = coeffs
+            line_points = [
+                (x_min, (slope * x_min) + intercept),
+                (x_max, (slope * x_max) + intercept),
+            ]
+            fit_score = self._force_linear_fit_score(samples, slope, intercept)
+            fit_text = "" if fit_score is None else f" | R^2 {fit_score:.3f}"
+            if summary_var is not None:
+                summary_var.set(
+                    f"F(N) = {slope:.6f} * dP(hPa) + {intercept:.3f} | "
+                    f"{len(samples)} samples{fit_text}"
+                )
+            y_values = forces + [point[1] for point in line_points]
+        else:
+            if summary_var is not None:
+                summary_var.set("Need at least 2 samples with distinct dP values to fit a line.")
+            y_values = forces
+
+        y_min, y_max = self._graph_bounds(y_values, include_zero=True)
+
+        (
+            _width,
+            _height,
+            left,
+            top,
+            right,
+            bottom,
+            plot_width,
+            plot_height,
+        ) = self._prepare_graph_canvas(
+            canvas,
+            "Force sample linear fit",
+            "pressure delta dP (hPa)",
+            "force (N)",
+        )
+
+        def x_for(value):
+            ratio = (float(value) - x_min) / max(1e-9, x_max - x_min)
+            return left + (np.clip(ratio, 0.0, 1.0) * plot_width)
+
+        def y_for(value):
+            ratio = (float(value) - y_min) / max(1e-9, y_max - y_min)
+            return bottom - (np.clip(ratio, 0.0, 1.0) * plot_height)
+
+        for idx in range(5):
+            ratio = idx / 4.0
+            y = top + (ratio * plot_height)
+            value = y_max - (ratio * (y_max - y_min))
+            canvas.create_line(left, y, right, y, fill="#e1e8ea")
+            canvas.create_text(
+                left - 5,
+                y,
+                text=f"{value:.2f}",
+                anchor="e",
+                fill=COLOR_MUTED,
+                font=("Segoe UI", 7),
+            )
+
+        for idx in range(5):
+            ratio = idx / 4.0
+            x = left + (ratio * plot_width)
+            value = x_min + (ratio * (x_max - x_min))
+            canvas.create_line(x, top, x, bottom, fill="#edf2f3")
+            canvas.create_text(
+                x,
+                bottom + 4,
+                text=f"{value:.2f}",
+                anchor="n",
+                fill=COLOR_MUTED,
+                font=("Segoe UI", 7),
+            )
+
+        if x_min <= 0.0 <= x_max:
+            zero_x = x_for(0.0)
+            canvas.create_line(zero_x, top, zero_x, bottom, fill=COLOR_BORDER, dash=(3, 2))
+        if y_min <= 0.0 <= y_max:
+            zero_y = y_for(0.0)
+            canvas.create_line(left, zero_y, right, zero_y, fill=COLOR_BORDER, dash=(3, 2))
+
+        if line_points:
+            line_color = COLOR_WARN
+            canvas.create_line(
+                x_for(line_points[0][0]),
+                y_for(line_points[0][1]),
+                x_for(line_points[1][0]),
+                y_for(line_points[1][1]),
+                fill=line_color,
+                width=2,
+            )
+            legend_y = top - 9
+            canvas.create_line(right - 118, legend_y, right - 98, legend_y, fill=line_color, width=2)
+            canvas.create_text(
+                right - 94,
+                legend_y,
+                text="linear fit",
+                anchor="w",
+                fill=COLOR_MUTED,
+                font=("Segoe UI", 7),
+            )
+
+        point_color = COLOR_ACCENT
+        for idx, (pressure_delta, force_n) in enumerate(samples, start=1):
+            x = x_for(pressure_delta)
+            y = y_for(force_n)
+            canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill=point_color, outline="#ffffff", width=1)
+            if len(samples) <= 12:
+                canvas.create_text(
+                    x + 6,
+                    y - 6,
+                    text=str(idx),
+                    anchor="sw",
+                    fill=COLOR_TEXT,
+                    font=("Segoe UI", 7, "bold"),
+                )
+
     def add_force_calibration_sample(self):
+        if self._is_thread_running(self.stepper_thread):
+            messagebox.showwarning(
+                "Calibration Sample",
+                "Wait for the stepper to stop and the load-cell reading to settle before capturing.",
+            )
+            self.force_calibration_status_var.set("Sample blocked: stepper is moving.")
+            return
         with self.sensor_data_lock:
             pressure = self.latest_pressure_hpa
             zero = self.force_pressure_zero_hpa
             weight_kg = self.latest_loadcell_kg
+            raw_weight_kg = self.latest_loadcell_raw_kg
+            loadcell_noise_kg = self.loadcell_noise_kg
+            filter_count = self.loadcell_filter_count
 
         if pressure is None or weight_kg is None:
             messagebox.showwarning(
@@ -4901,6 +6485,26 @@ class AllInOneTesterGUI:
                 "Start both pressure and load-cell readings before capturing a sample.",
             )
             return
+        if filter_count < max(3, min(LOADCELL_FILTER_WINDOW, 3)):
+            messagebox.showwarning(
+                "Calibration Sample",
+                "Wait for a few load-cell samples before capturing.",
+            )
+            self.force_calibration_status_var.set("Sample blocked: load cell not settled yet.")
+            return
+        if loadcell_noise_kg > LOADCELL_STABLE_NOISE_KG:
+            messagebox.showwarning(
+                "Calibration Sample",
+                (
+                    "Load-cell reading is still noisy. Hold the rig still and capture again "
+                    f"when noise is below {LOADCELL_STABLE_NOISE_KG:.3f} kg."
+                ),
+            )
+            self.force_calibration_status_var.set(
+                f"Sample blocked: load noise {loadcell_noise_kg:.3f} kg."
+            )
+            return
+        raw_weight_kg = weight_kg if raw_weight_kg is None else raw_weight_kg
         pressure_delta = self._pressure_delta_from_zero(pressure, zero)
         if pressure_delta is None:
             messagebox.showwarning(
@@ -4917,6 +6521,15 @@ class AllInOneTesterGUI:
             return
 
         force_n = weight_kg * FORCE_GRAVITY_MPS2
+        if force_n < FORCE_CALIBRATION_MIN_SAMPLE_FORCE_N:
+            messagebox.showwarning(
+                "Calibration Sample",
+                "Load force is negative. Press Zero Load with no contact, then capture again.",
+            )
+            self.force_calibration_status_var.set(
+                f"Sample blocked: negative load force {force_n:.2f} N."
+            )
+            return
         with self.sensor_data_lock:
             self.force_calibration_samples.append((float(pressure_delta), float(force_n)))
             count = len(self.force_calibration_samples)
@@ -4929,11 +6542,14 @@ class AllInOneTesterGUI:
         )
         self.log(
             f"Force calibration sample {count}: pressure={pressure:.2f} hPa, "
-            f"dP={pressure_delta:+.2f} hPa, force={force_n:.3f} N."
+            f"dP={pressure_delta:+.2f} hPa, force={force_n:.3f} N, "
+            f"raw={raw_weight_kg:.4f} kg, noise={loadcell_noise_kg:.3f} kg."
         )
 
         if count >= 2:
             self._fit_force_calibration(show_warning=False)
+        else:
+            self._refresh_force_linear_equation_graph()
 
     def fit_force_calibration(self):
         self._fit_force_calibration(show_warning=True)
@@ -4965,6 +6581,35 @@ class AllInOneTesterGUI:
 
         slope = ((n * sum_xy) - (sum_x * sum_y)) / denominator
         intercept = (sum_y - (slope * sum_x)) / n
+        if abs(intercept) > FORCE_CALIBRATION_MAX_ZERO_FORCE_N:
+            if show_warning:
+                messagebox.showwarning(
+                    "Force Calibration",
+                    (
+                        "Calibration zero offset is too large. Press Zero Load, "
+                        "Reset Samples, then capture stable samples again."
+                    ),
+                )
+            self.force_calibration_status_var.set(
+                f"Calibration rejected: zero offset {intercept:.2f} N."
+            )
+            self.log(f"Force calibration rejected: intercept {intercept:.3f} N.")
+            return False
+        fit_score = self._force_linear_fit_score(samples, slope, intercept)
+        if len(samples) >= 4 and fit_score is not None and fit_score < FORCE_CALIBRATION_MIN_R2:
+            if show_warning:
+                messagebox.showwarning(
+                    "Force Calibration",
+                    (
+                        "Force samples are too scattered for a reliable linear fit. "
+                        "Reset samples and capture only after the load cell settles."
+                    ),
+                )
+            self.force_calibration_status_var.set(
+                f"Calibration rejected: unstable fit R^2 {fit_score:.3f}."
+            )
+            self.log(f"Force calibration rejected: R^2 {fit_score:.3f}.")
+            return False
         with self.sensor_data_lock:
             self.force_calibration_coeffs = (slope, intercept)
 
@@ -4975,6 +6620,7 @@ class AllInOneTesterGUI:
         self._save_force_calibration()
         self._update_force_estimate()
         self._request_force_graph_redraw()
+        self._refresh_force_linear_equation_graph()
         return True
 
     def reset_force_bubble_samples(self):
@@ -4982,6 +6628,8 @@ class AllInOneTesterGUI:
             self.force_calibration_samples.clear()
             self.force_calibration_coeffs = None
             self.latest_pressure_force_n = None
+            self.force_pressure_zero_pending = False
+            self.force_pressure_zero_samples = []
             if hasattr(self, "force_graph_history"):
                 self.force_graph_history.clear()
             zero = self.force_pressure_zero_hpa
@@ -5001,6 +6649,7 @@ class AllInOneTesterGUI:
             self.log(f"Could not remove saved force calibration: {exc}")
         self.log("Bubble force calibration samples reset.")
         self._request_force_graph_redraw()
+        self._refresh_force_linear_equation_graph()
 
     def clear_force_calibration(self):
         with self.sensor_data_lock:
@@ -5008,6 +6657,8 @@ class AllInOneTesterGUI:
             self.force_calibration_coeffs = None
             self.latest_pressure_force_n = None
             self.force_pressure_zero_hpa = FORCE_DEFAULT_PRESSURE_ZERO_HPA
+            self.force_pressure_zero_pending = False
+            self.force_pressure_zero_samples = []
             if hasattr(self, "force_graph_history"):
                 self.force_graph_history.clear()
         self.force_calibration_sample_count_var.set("0 samples")
@@ -5024,6 +6675,7 @@ class AllInOneTesterGUI:
             self.log(f"Could not remove saved force calibration: {exc}")
         self.log("Force calibration cleared.")
         self._request_force_graph_redraw()
+        self._refresh_force_linear_equation_graph()
 
     def _load_hx711_class(self):
         base_path = Path(__file__).resolve().parent
@@ -5063,6 +6715,31 @@ class AllInOneTesterGUI:
         except Exception as exc:
             self.log(f"Could not save load-cell calibration: {exc}")
 
+    def reset_loadcell_calibration(self):
+        if self.loadcell_thread is not None and self.loadcell_thread.is_alive():
+            messagebox.showwarning(
+                "Load Cell Calibration",
+                "Stop load-cell reading before resetting the saved calibration.",
+            )
+            return
+
+        try:
+            self._loadcell_calibration_path().unlink(missing_ok=True)
+        except Exception as exc:
+            self.log(f"Could not remove saved load-cell calibration: {exc}")
+            messagebox.showerror("Load Cell Calibration", str(exc))
+            return
+
+        self._reset_loadcell_filter(reset_live_zero=True)
+        self._set_var(self.loadcell_weight_var, "-")
+        self._refresh_force_live_pair()
+        self._request_force_graph_redraw()
+        self.log("Saved load-cell calibration reset.")
+        messagebox.showinfo(
+            "Load Cell Calibration",
+            "Saved load-cell calibration was reset. Press Cal Load to save a new one.",
+        )
+
     @staticmethod
     def _read_average_raw(hx, samples=12, delay=0.025, channel="A", timeout=1.5):
         readings = []
@@ -5092,29 +6769,55 @@ class AllInOneTesterGUI:
             self.log("Load cell read is already running.")
             return
 
+        self._start_loadcell_worker(
+            known_weight_grams=None,
+            force_calibrate=False,
+            state_text="Running",
+            log_message="Load cell read started with saved calibration.",
+        )
+
+    def calibrate_loadcell(self):
+        if self.loadcell_thread is not None and self.loadcell_thread.is_alive():
+            self.log("Load cell read is already running.")
+            return
+
+        known_weight_grams = self._parse_loadcell_known_weight()
+        if known_weight_grams is None:
+            return
+
+        self._start_loadcell_worker(
+            known_weight_grams=known_weight_grams,
+            force_calibrate=True,
+            state_text="Calibrating",
+            log_message="Load cell calibration started.",
+        )
+
+    def _parse_loadcell_known_weight(self):
         try:
             known_weight_grams = float(self.loadcell_known_weight_var.get().strip())
         except ValueError:
             messagebox.showerror("Invalid Weight", "Known weight must be a number.")
-            return
+            return None
 
         if known_weight_grams <= 0:
             messagebox.showerror("Invalid Weight", "Known weight must be > 0 grams.")
-            return
+            return None
+        return known_weight_grams
 
+    def _start_loadcell_worker(self, known_weight_grams, force_calibrate, state_text, log_message):
         self.loadcell_stop_event.clear()
         self.loadcell_thread = threading.Thread(
             target=self._loadcell_worker,
-            args=(known_weight_grams,),
+            args=(known_weight_grams, force_calibrate),
             daemon=True,
         )
         self.loadcell_thread.start()
-        self.loadcell_state_var.set("Running")
+        self.loadcell_state_var.set(state_text)
         self._set_loadcell_controls(True)
         self._refresh_system_status()
-        self.log("Load cell read started.")
+        self.log(log_message)
 
-    def _loadcell_worker(self, known_weight_grams):
+    def _loadcell_worker(self, known_weight_grams, force_calibrate=False):
         hx = None
         try:
             HX711 = self._load_hx711_class()
@@ -5134,14 +6837,13 @@ class AllInOneTesterGUI:
             self.log(f"Load cell tare offset: {offset:.2f}")
 
             saved_counts_per_gram = self._load_loadcell_calibration()
-            self.log(
-                f"Load cell: place {known_weight_grams:.2f} g now; "
-                f"calibrating in {LOADCELL_CALIBRATION_DELAY_S:.0f}s."
-            )
-            if not self._wait_with_cancel(LOADCELL_CALIBRATION_DELAY_S, self.loadcell_stop_event):
-                return
-
-            try:
+            if force_calibrate:
+                self.log(
+                    f"Load cell: place {known_weight_grams:.2f} g now; "
+                    f"calibrating in {LOADCELL_CALIBRATION_DELAY_S:.0f}s."
+                )
+                if not self._wait_with_cancel(LOADCELL_CALIBRATION_DELAY_S, self.loadcell_stop_event):
+                    return
                 loaded_raw = self._read_average_raw(hx, channel="A")
                 delta = loaded_raw - offset
                 if abs(delta) < 50.0:
@@ -5149,24 +6851,32 @@ class AllInOneTesterGUI:
                 counts_per_gram = delta / known_weight_grams
                 self._save_loadcell_calibration(counts_per_gram, known_weight_grams)
                 self.log(f"Load cell calibrated. counts_per_gram={counts_per_gram:.6f}")
-            except Exception as calibration_exc:
+            else:
                 if saved_counts_per_gram is None:
-                    raise RuntimeError(f"Calibration failed: {calibration_exc}") from calibration_exc
+                    raise RuntimeError(
+                        "No saved load-cell calibration. Enter a known weight and press Calibrate once."
+                    )
                 counts_per_gram = saved_counts_per_gram
                 self.log(
-                    "Load cell calibration failed; using saved calibration "
-                    f"counts_per_gram={counts_per_gram:.6f}. Reason: {calibration_exc}"
+                    "Load cell using saved calibration "
+                    f"counts_per_gram={counts_per_gram:.6f}."
                 )
             hx.setReferenceUnit(counts_per_gram, "A")
+            self._reset_loadcell_filter(reset_live_zero=True)
 
             read_failures = 0
             while not self.loadcell_stop_event.is_set():
                 try:
-                    weight_grams = self._read_weight_grams(hx, samples=5)
+                    weight_grams = self._read_weight_grams(hx, samples=LOADCELL_READ_SAMPLES)
                     read_failures = 0
                     weight_kg = float(weight_grams) / 1000.0
-                    self._record_loadcell_reading(weight_kg)
-                    self._set_var(self.loadcell_weight_var, f"{weight_kg:.4f} kg")
+                    filtered_kg = self._record_loadcell_reading(weight_kg)
+                    with self.sensor_data_lock:
+                        noise_kg = self.loadcell_noise_kg
+                    self._set_var(
+                        self.loadcell_weight_var,
+                        f"{filtered_kg:.4f} kg (noise {noise_kg:.3f})",
+                    )
                 except Exception as read_exc:
                     read_failures += 1
                     if read_failures == 1 or read_failures % 5 == 0:
@@ -5254,9 +6964,7 @@ class AllInOneTesterGUI:
         self.blob_preview_label.configure(image="", text="Starting preview...")
         self.blob_reset_reference_event.clear()
         self._reset_contact_deform_zero_state("Contact deform zero pending. Press Reset Zero.")
-        self._reset_pressure_contact_gate("live detection start")
-        if PRESSURE_CONTACT_GATE_ENABLED and not self._is_thread_running(self.pressure_thread):
-            self.start_pressure_read()
+        self._request_pressure_zero_from_camera_open()
 
         self.blob_thread = threading.Thread(target=self._blob_worker, daemon=True)
         self.blob_thread.start()
@@ -6039,6 +7747,7 @@ class AllInOneTesterGUI:
         self.log(f"Blob snapshot saved: {raw_path.name}, {bin_path.name}")
 
     def on_close(self):
+        self.stop_force_cycle()
         self.stop_optical_flow()
         self.stop_blob_test()
         self.stop_camera()
