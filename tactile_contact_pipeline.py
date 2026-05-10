@@ -234,6 +234,7 @@ def build_tactile_contact_frame(
     config: TactileContactConfig,
     cv2=None,
     previous_scale_px: Optional[float] = None,
+    compute_surface: bool = True,
 ) -> Optional[TactileContactFrame]:
     points_arr, vectors_arr = _valid_pairs(reference_centroids, displacements)
     if points_arr is None:
@@ -268,8 +269,12 @@ def build_tactile_contact_frame(
         config,
         cv2,
     )
-    height_map = surface_from_contact_map(contact_map, base_map, ellipse_mask, config, cv2=cv2)
-    stats = summarize_contact_map(contact_map, ellipse_mask, config.contact_area_threshold) or {}
+    if compute_surface:
+        height_map = surface_from_contact_map(contact_map, base_map, ellipse_mask, config, cv2=cv2)
+        stats = summarize_contact_map(contact_map, ellipse_mask, config.contact_area_threshold) or {}
+    else:
+        height_map = base_map
+        stats = {}
     return TactileContactFrame(
         height_map=height_map,
         base_map=base_map,

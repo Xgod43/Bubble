@@ -30,7 +30,7 @@ from tactile_contact_pipeline import (
 SERVICE_BACKEND = "remote-cuda-opencv"
 CUDA_PREPROCESS_ENABLED = os.environ.get(
     "BUBBLE_REMOTE_VISION_CUDA_PREPROCESS",
-    "1",
+    "0",
 ).strip().lower() in {"1", "true", "yes", "on"}
 REMOTE_RENDER_JPEG_QUALITY = int(os.environ.get("BUBBLE_REMOTE_VISION_RENDER_JPEG_QUALITY", "62"))
 REMOTE_SURFACE_RENDER_MODE = os.environ.get("BUBBLE_REMOTE_SURFACE_RENDER_MODE", "fast").strip().lower()
@@ -449,13 +449,40 @@ def _process_surface_preview(frame_bgr, reference, displacements, query):
     reset_zero = _query_bool(query, "surface_reset", False)
     config = _surface_config(query)
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    surface_reference = reference
+    surface_displacements = displacements
+    surface_shape = frame_bgr.shape
+    render_gray = gray
+    surface_scale = 1.0
+    surface_proc_width = _query_int(query, "surface_proc_width", 0)
+    if surface_proc_width > 0 and frame_bgr.shape[1] > surface_proc_width:
+        surface_scale = float(surface_proc_width) / float(frame_bgr.shape[1])
+        surface_proc_height = max(1, int(round(frame_bgr.shape[0] * surface_scale)))
+        render_gray = cv2.resize(
+            gray,
+            (int(surface_proc_width), surface_proc_height),
+            interpolation=cv2.INTER_AREA,
+        )
+        surface_shape = (surface_proc_height, int(surface_proc_width), frame_bgr.shape[2])
+        surface_reference = [
+            (float(x) * surface_scale, float(y) * surface_scale)
+            for x, y in reference
+        ]
+        surface_displacements = [
+            None
+            if disp is None
+            else (float(disp[0]) * surface_scale, float(disp[1]) * surface_scale)
+            for disp in displacements
+        ]
+
     frame = build_tactile_contact_frame(
-        reference,
-        displacements,
-        frame_bgr.shape,
+        surface_reference,
+        surface_displacements,
+        surface_shape,
         config,
         cv2=cv2,
         previous_scale_px=STATE.surface_scale_ema,
+        compute_surface=False,
     )
 
     if reset_zero:
@@ -467,7 +494,7 @@ def _process_surface_preview(frame_bgr, reference, displacements, query):
         STATE.surface_history = []
 
     if frame is None:
-        preview = _build_surface_render(gray, None, history=STATE.surface_history)
+        preview = _build_surface_render(render_gray, None, history=STATE.surface_history)
         return {
             "preview": preview,
             "payload": {
@@ -548,7 +575,7 @@ def _process_surface_preview(frame_bgr, reference, displacements, query):
     if len(STATE.surface_history) > 180:
         del STATE.surface_history[:-180]
 
-    preview = _build_surface_render(gray, deformation_map, roi_mask=ellipse_mask, history=STATE.surface_history)
+    preview = _build_surface_render(render_gray, deformation_map, roi_mask=ellipse_mask, history=STATE.surface_history)
     if STATE.surface_zero_pending:
         status = f"Remote contact zeroing {len(STATE.surface_zero_samples)}/{CONTACT_ZERO_SAMPLE_COUNT}..."
     elif STATE.surface_zero_ready:
@@ -556,6 +583,13 @@ def _process_surface_preview(frame_bgr, reference, displacements, query):
     else:
         status = "Press Reset Zero to set contact deform zero."
 
+    stats_payload = _surface_payload_from_stats(stats)
+    if surface_scale > 0 and surface_scale != 1.0 and stats_payload.get("contact_center") is not None:
+        stats_payload["contact_center"] = [
+            float(stats_payload["contact_center"][0]) / surface_scale,
+            float(stats_payload["contact_center"][1]) / surface_scale,
+        ]
+    scale_to_input_px = 1.0 / max(surface_scale, 1e-6)
     payload = {
         "surface_rendered": True,
         "surface_status": status,
@@ -563,11 +597,13 @@ def _process_surface_preview(frame_bgr, reference, displacements, query):
         "surface_zero_pending": bool(STATE.surface_zero_pending),
         "surface_zero_ready": bool(STATE.surface_zero_ready),
         "surface_zero_count": len(STATE.surface_zero_samples),
-        "surface_scale_px": float(frame.scale_px),
-        "residual_floor_px": float(frame.residual_floor_px),
-        "residual_peak_px": float(frame.residual_peak_px),
-        "residual_mean_px": float(frame.residual_mean_px),
-        **_surface_payload_from_stats(stats),
+        "surface_scale_px": float(frame.scale_px) * scale_to_input_px,
+        "surface_proc_width": int(surface_shape[1]),
+        "surface_proc_height": int(surface_shape[0]),
+        "residual_floor_px": float(frame.residual_floor_px) * scale_to_input_px,
+        "residual_peak_px": float(frame.residual_peak_px) * scale_to_input_px,
+        "residual_mean_px": float(frame.residual_mean_px) * scale_to_input_px,
+        **stats_payload,
     }
 
     overlay_lines = ["Remote CUDA surface", status]
@@ -633,7 +669,9 @@ def _process_frame(frame_bgr, query):
     view_type = str(query.get("view", ["overlay"])[0]).strip().lower()
 
     started_at = time.perf_counter()
+    detect_started_at = time.perf_counter()
     binary, centroids, match_dist, process_backend = _detect_centroids(frame_bgr, query)
+    detect_ms = (time.perf_counter() - detect_started_at) * 1000.0
 
     if reset_reference or not STATE.reference_centroids:
         STATE.reference_centroids = list(centroids)
@@ -641,7 +679,9 @@ def _process_frame(frame_bgr, query):
         STATE.started_at = time.perf_counter()
 
     reference = STATE.reference_centroids or []
+    displacement_started_at = time.perf_counter()
     displacements, missing = pipe.compute_displacements(reference, centroids, match_dist)
+    displacement_ms = (time.perf_counter() - displacement_started_at) * 1000.0
     mags = [
         float(np.hypot(dx, dy))
         for disp in displacements
@@ -666,6 +706,8 @@ def _process_frame(frame_bgr, query):
         "processor_backend": pipe.get_detection_backend_name(),
         "process_backend": process_backend,
         "process_ms": STATE.last_process_ms,
+        "detect_ms": detect_ms,
+        "displacement_ms": displacement_ms,
         "cuda_device_count": _cuda_device_count(),
         "cuda_preprocess_enabled": CUDA_PREPROCESS_ENABLED,
         "frame_count": STATE.frame_count,
@@ -691,8 +733,11 @@ def _process_frame(frame_bgr, query):
         ]
 
     if include_preview:
+        preview_started_at = time.perf_counter()
         if view_type in {"surface_3d", "optical_flow_3d"}:
+            surface_started_at = time.perf_counter()
             surface_result = _process_surface_preview(frame_bgr, reference, displacements, query)
+            payload["surface_ms"] = (time.perf_counter() - surface_started_at) * 1000.0
             payload.update(surface_result["payload"])
             preview_bgr = surface_result["preview"]
         elif view_type == "pointcloud":
@@ -703,19 +748,78 @@ def _process_frame(frame_bgr, query):
         else:
             blob_vis = pipe.build_blob_view(binary, frame_bgr)
             preview_bgr = pipe.draw_displacement_vectors(blob_vis, reference, displacements)
+        payload["preview_build_ms"] = (time.perf_counter() - preview_started_at) * 1000.0
 
+        preview_max_width = _query_int(query, "preview_max_width", 0)
+        if preview_max_width > 0 and preview_bgr.shape[1] > preview_max_width:
+            scale = float(preview_max_width) / float(preview_bgr.shape[1])
+            preview_bgr = cv2.resize(
+                preview_bgr,
+                (
+                    int(preview_max_width),
+                    max(1, int(round(preview_bgr.shape[0] * scale))),
+                ),
+                interpolation=cv2.INTER_AREA,
+            )
+
+        encode_started_at = time.perf_counter()
         ok, encoded = cv2.imencode(
             ".jpg",
             preview_bgr,
             [int(cv2.IMWRITE_JPEG_QUALITY), int(np.clip(REMOTE_RENDER_JPEG_QUALITY, 35, 92))],
         )
+        payload["preview_encode_ms"] = (time.perf_counter() - encode_started_at) * 1000.0
+        payload["preview_width"] = int(preview_bgr.shape[1])
+        payload["preview_height"] = int(preview_bgr.shape[0])
         if ok:
-            payload["preview_jpeg_b64"] = base64.b64encode(encoded.tobytes()).decode("ascii")
+            encoded_bytes = encoded.tobytes()
+            payload["preview_jpeg_bytes"] = int(len(encoded_bytes))
+            payload["preview_jpeg_b64"] = base64.b64encode(encoded_bytes).decode("ascii")
 
     total_ms = (time.perf_counter() - started_at) * 1000.0
     payload["total_ms"] = total_ms
     STATE.last_process_ms = total_ms
     return payload
+
+
+def _decode_raw_frame(raw, query):
+    width = _query_int(query, "width", 0)
+    height = _query_int(query, "height", 0)
+    fmt = str(query.get("format", ["bgr24"])[0]).strip().lower()
+    if width <= 0 or height <= 0:
+        raise ValueError("raw frame requires width and height query parameters")
+
+    data = np.frombuffer(raw, dtype=np.uint8)
+    if fmt in {"bgr24", "bgr", "bgr888"}:
+        expected = width * height * 3
+        if data.size != expected:
+            raise ValueError(f"bgr24 raw size mismatch: got {data.size}, expected {expected}")
+        return data.reshape((height, width, 3)).copy(), fmt
+    if fmt in {"rgb24", "rgb", "rgb888"}:
+        expected = width * height * 3
+        if data.size != expected:
+            raise ValueError(f"rgb24 raw size mismatch: got {data.size}, expected {expected}")
+        rgb = data.reshape((height, width, 3))
+        return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), fmt
+    if fmt in {"gray8", "grey8", "mono8"}:
+        expected = width * height
+        if data.size != expected:
+            raise ValueError(f"gray8 raw size mismatch: got {data.size}, expected {expected}")
+        gray = data.reshape((height, width))
+        return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR), fmt
+    if fmt in {"i420", "yuv420", "yuv420p"}:
+        expected = width * height * 3 // 2
+        if data.size != expected:
+            raise ValueError(f"i420 raw size mismatch: got {data.size}, expected {expected}")
+        yuv = data.reshape((height * 3 // 2, width))
+        return cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420), fmt
+    if fmt == "nv12":
+        expected = width * height * 3 // 2
+        if data.size != expected:
+            raise ValueError(f"nv12 raw size mismatch: got {data.size}, expected {expected}")
+        yuv = data.reshape((height * 3 // 2, width))
+        return cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_NV12), fmt
+    raise ValueError(f"unsupported raw frame format: {fmt}")
 
 
 class RemoteVisionHandler(BaseHTTPRequestHandler):
@@ -759,13 +863,14 @@ class RemoteVisionHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
+        request_started_at = time.perf_counter()
 
         if parsed.path == "/reset":
             STATE.reset()
             self._send_json(200, {"ok": True, "reset": True})
             return
 
-        if parsed.path != "/process":
+        if parsed.path not in {"/process", "/process_raw"}:
             self._send_json(404, {"ok": False, "error": "unknown endpoint"})
             return
 
@@ -774,11 +879,24 @@ class RemoteVisionHandler(BaseHTTPRequestHandler):
             if content_length <= 0:
                 raise ValueError("empty request body")
             raw = self.rfile.read(content_length)
-            image_data = np.frombuffer(raw, dtype=np.uint8)
-            frame_bgr = cv2.imdecode(image_data, cv2.IMREAD_COLOR)
-            if frame_bgr is None:
-                raise ValueError("request body is not a valid JPEG/PNG image")
+            read_ms = (time.perf_counter() - request_started_at) * 1000.0
+            decode_started_at = time.perf_counter()
+            if parsed.path == "/process_raw":
+                frame_bgr, raw_format = _decode_raw_frame(raw, query)
+            else:
+                raw_format = "jpeg"
+                image_data = np.frombuffer(raw, dtype=np.uint8)
+                frame_bgr = cv2.imdecode(image_data, cv2.IMREAD_COLOR)
+                if frame_bgr is None:
+                    raise ValueError("request body is not a valid JPEG/PNG image")
+            decode_ms = (time.perf_counter() - decode_started_at) * 1000.0
             payload = _process_frame(frame_bgr, query)
+            payload["input_transport"] = "raw" if parsed.path == "/process_raw" else "jpeg"
+            payload["input_format"] = raw_format
+            payload["input_bytes"] = int(len(raw))
+            payload["request_read_ms"] = read_ms
+            payload["input_decode_ms"] = decode_ms
+            payload["handler_ms"] = (time.perf_counter() - request_started_at) * 1000.0
             self._send_json(200, payload)
         except Exception as exc:
             self._send_json(500, {"ok": False, "error": str(exc)})
@@ -796,7 +914,7 @@ def main():
     server = ThreadingHTTPServer((args.host, args.port), RemoteVisionHandler)
     print(f"Remote vision server listening on http://{args.host}:{args.port}")
     print("Health check: GET /health")
-    print("Process frame: POST JPEG bytes to /process")
+    print("Process frame: POST JPEG bytes to /process or raw frame bytes to /process_raw")
     _warm_cuda_preprocess()
     try:
         server.serve_forever()

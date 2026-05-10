@@ -1,0 +1,9 @@
+series,unit,shape_name,target_depth_mm,report_sample_target,trial,sample_count,min_value,min_elapsed_s,max_value,max_elapsed_s
+load cell,kg,systemtest_star,-7.500,30,1,30,-0.000285,8.330,0.232278,4.130
+pressure estimate,kg,systemtest_star,-7.500,30,1,30,0.001500,0.000,0.233717,4.130
+force error,kg,systemtest_star,-7.500,30,1,30,-0.002500,7.560,0.005500,3.430
+distance estimate,mm,systemtest_star,-7.500,30,1,30,0.000000,0.000,7.436975,4.130
+mean dot deformation,px,systemtest_star,-7.500,30,1,30,0.000000,0.000,13.692056,4.130
+max dot deformation,px,systemtest_star,-7.500,30,1,30,-0.049457,8.330,19.884828,4.130
+contact peak,ratio,systemtest_star,-7.500,30,1,30,0.000000,0.000,0.971765,4.130
+contact area,percent,systemtest_star,-7.500,30,1,30,0.000000,0.000,27.368067,4.130

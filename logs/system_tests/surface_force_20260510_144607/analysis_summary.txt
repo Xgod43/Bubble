@@ -1,0 +1,20 @@
+circle: corr(depth,dot_mean_px)=1.0000, first=0.0000, last=1.7356
+circle: corr(depth,residual_peak_px)=1.0000, first=0.0000, last=9.9952
+circle: corr(depth,surface_scale_px)=0.9712, first=0.4500, last=2.8016
+circle: corr(depth,force_load_kg)=1.0000, first=0.0000, last=0.3400
+square: corr(depth,dot_mean_px)=1.0000, first=0.0000, last=1.2774
+square: corr(depth,residual_peak_px)=1.0000, first=0.0000, last=11.9821
+square: corr(depth,surface_scale_px)=0.9746, first=0.4500, last=3.5959
+square: corr(depth,force_load_kg)=1.0000, first=0.0040, last=0.3440
+star: corr(depth,dot_mean_px)=1.0000, first=0.0000, last=0.5949
+star: corr(depth,residual_peak_px)=1.0000, first=0.0000, last=5.8610
+star: corr(depth,surface_scale_px)=0.9638, first=0.4500, last=1.9384
+star: corr(depth,force_load_kg)=1.0000, first=0.0010, last=0.3410
+contact_peak_range_nonzero=0.5801..0.8410
+downsample_peak_retention_min=100.00% max=100.00%
+outputs:
+- logs/system_tests/surface_force_20260510_144607/surface_3d_contact_sheet.png
+- logs/system_tests/surface_force_20260510_144607/surface_force_consistency.png
+- logs/system_tests/surface_force_20260510_144607/surface_metrics.csv
+- logs/system_tests/surface_force_20260510_144607/force_export_manifest.csv
+- logs/system_tests/surface_force_20260510_144607/downsample_matrix.csv

@@ -1129,15 +1129,23 @@ class MissionControlGUI(AllInOneTesterGUI):
             pady=(8, 0),
         )
 
-        ttk.Label(sensor, text="Report samples").grid(row=8, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(sensor, text="Target depth").grid(row=8, column=0, sticky="w", pady=(8, 0))
+        ttk.Combobox(
+            sensor,
+            textvariable=self.force_cycle_depth_target_var,
+            values=("-2.5", "-5.0", "-7.5", "-10.0", "limit"),
+            width=8,
+        ).grid(row=8, column=1, sticky="ew", pady=(8, 0))
+
+        ttk.Label(sensor, text="Report samples").grid(row=9, column=0, sticky="w", pady=(8, 0))
         report_controls = ttk.Frame(sensor, style="Surface.TFrame")
-        report_controls.grid(row=8, column=1, sticky="ew", pady=(8, 0))
+        report_controls.grid(row=9, column=1, sticky="ew", pady=(8, 0))
         report_controls.columnconfigure(0, weight=1)
         report_controls.columnconfigure(1, weight=1)
         ttk.Combobox(
             report_controls,
             textvariable=self.force_cycle_report_sample_count_var,
-            values=("all", "10", "25", "50"),
+            values=("all", "10", "25", "30"),
             state="readonly",
             width=7,
         ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
@@ -1150,7 +1158,7 @@ class MissionControlGUI(AllInOneTesterGUI):
         ).grid(row=0, column=1, sticky="ew")
 
         both = ttk.Frame(sensor, style="Surface.TFrame")
-        both.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        both.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         both.columnconfigure(0, weight=1)
         both.columnconfigure(1, weight=1)
         ttk.Button(both, text="Start Both", style="Accent.TButton", command=self.start_force_measurement).grid(
@@ -1166,7 +1174,7 @@ class MissionControlGUI(AllInOneTesterGUI):
         )
 
         cycle = ttk.Frame(sensor, style="Surface.TFrame")
-        cycle.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        cycle.grid(row=11, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         cycle.columnconfigure(0, weight=1)
         cycle.columnconfigure(1, weight=1)
         self.force_cycle_sensor_start_btn = ttk.Button(

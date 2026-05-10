@@ -91,6 +91,16 @@ REMOTE_VISION_TARGET_FPS = float(os.environ.get("BUBBLE_REMOTE_VISION_TARGET_FPS
 REMOTE_VISION_CAPTURE_WIDTH = int(os.environ.get("BUBBLE_REMOTE_VISION_CAPTURE_WIDTH", "640"))
 REMOTE_VISION_CAPTURE_HEIGHT = int(os.environ.get("BUBBLE_REMOTE_VISION_CAPTURE_HEIGHT", "480"))
 REMOTE_VISION_JPEG_QUALITY = int(os.environ.get("BUBBLE_REMOTE_VISION_JPEG_QUALITY", "62"))
+REMOTE_VISION_TRANSPORT = os.environ.get("BUBBLE_REMOTE_VISION_TRANSPORT", "raw").strip().lower()
+REMOTE_VISION_RAW_FORMAT = os.environ.get("BUBBLE_REMOTE_VISION_RAW_FORMAT", "bgr24").strip().lower()
+REMOTE_VISION_PREVIEW_MAX_WIDTH = int(os.environ.get("BUBBLE_REMOTE_VISION_PREVIEW_MAX_WIDTH", "480"))
+REMOTE_VISION_SURFACE_PROCESS_WIDTH = int(os.environ.get("BUBBLE_REMOTE_SURFACE_PROCESS_WIDTH", "320"))
+REMOTE_VISION_POINTS_ENABLED = os.environ.get("BUBBLE_REMOTE_VISION_POINTS", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 REMOTE_VISION_PREVIEW_ENABLED = os.environ.get("BUBBLE_REMOTE_VISION_PREVIEW", "0").strip().lower() in {
     "1",
     "true",
@@ -5016,6 +5026,7 @@ class AllInOneTesterGUI:
             self.force_cycle_shape_name = "sample"
             self.force_cycle_report_sample_target = None
             self.force_cycle_trial = 1
+            self.force_cycle_target_depth_mm = None
 
         if not hasattr(self, "force_estimate_var"):
             self.force_estimate_var = tk.StringVar(value="-")
@@ -5025,12 +5036,15 @@ class AllInOneTesterGUI:
             self.force_calibration_model_var = tk.StringVar(value="F = a*dP + b")
             self.force_calibration_live_pair_var = tk.StringVar(value="Pressure -, dP -, load -")
             self.force_cycle_shape_var = tk.StringVar(value="sample")
-            self.force_cycle_report_sample_count_var = tk.StringVar(value="all")
+            self.force_cycle_depth_target_var = tk.StringVar(value="-2.5")
+            self.force_cycle_report_sample_count_var = tk.StringVar(value="10")
             self.force_cycle_trial_var = tk.StringVar(value="1")
         elif not hasattr(self, "force_cycle_shape_var"):
             self.force_cycle_shape_var = tk.StringVar(value="sample")
+        if not hasattr(self, "force_cycle_depth_target_var"):
+            self.force_cycle_depth_target_var = tk.StringVar(value="-2.5")
         if not hasattr(self, "force_cycle_report_sample_count_var"):
-            self.force_cycle_report_sample_count_var = tk.StringVar(value="all")
+            self.force_cycle_report_sample_count_var = tk.StringVar(value="10")
         if not hasattr(self, "force_cycle_trial_var"):
             self.force_cycle_trial_var = tk.StringVar(value="1")
 
@@ -5204,15 +5218,23 @@ class AllInOneTesterGUI:
             row=6, column=1, sticky="ew", pady=(8, 0)
         )
 
+        ttk.Label(parent, text="Target depth (mm):").grid(row=7, column=0, sticky="w", pady=(8, 0))
+        ttk.Combobox(
+            parent,
+            textvariable=self.force_cycle_depth_target_var,
+            values=("-2.5", "-5.0", "-7.5", "-10.0", "limit"),
+            width=10,
+        ).grid(row=7, column=1, sticky="ew", pady=(8, 0))
+
         report = ttk.Frame(parent)
-        report.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        report.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         report.columnconfigure(1, weight=1)
         report.columnconfigure(3, weight=1)
         ttk.Label(report, text="Report samples:").grid(row=0, column=0, sticky="w", padx=(0, 6))
         ttk.Combobox(
             report,
             textvariable=self.force_cycle_report_sample_count_var,
-            values=("all", "10", "25", "50"),
+            values=("all", "10", "25", "30"),
             state="readonly",
             width=8,
         ).grid(row=0, column=1, sticky="ew", padx=(0, 10))
@@ -5226,7 +5248,7 @@ class AllInOneTesterGUI:
         ).grid(row=0, column=3, sticky="ew")
 
         actions = ttk.Frame(parent)
-        actions.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        actions.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(12, 0))
         for col in range(3):
             actions.columnconfigure(col, weight=1)
         ttk.Button(actions, text="Set P Zero", command=self.set_force_pressure_zero).grid(
@@ -5462,7 +5484,21 @@ class AllInOneTesterGUI:
             value = int(float(text))
         except (TypeError, ValueError):
             return None
-        return value if value in {10, 25, 50} else None
+        return value if value in {10, 25, 30} else None
+
+    def _force_cycle_target_depth_mm(self):
+        text = str(self.force_cycle_depth_target_var.get() or "").strip().lower()
+        if text in {"", "limit", "lim", "max"}:
+            return None
+        text = text.replace("mm", "").strip()
+        try:
+            value = float(text)
+        except (TypeError, ValueError):
+            return -2.5
+        value = -abs(float(value))
+        if abs(value) < 0.05:
+            return -2.5
+        return float(np.clip(value, -25.0, -0.05))
 
     def _force_cycle_report_trial(self):
         text = str(self.force_cycle_trial_var.get() or "1").strip()
@@ -5477,21 +5513,64 @@ class AllInOneTesterGUI:
         samples = list(history or [])
         if not target_count or target_count <= 0 or len(samples) <= target_count:
             return samples
-        indexes = np.linspace(0, len(samples) - 1, int(target_count))
-        selected_indexes = []
-        used = set()
-        for index in indexes:
-            rounded = int(round(float(index)))
-            rounded = int(np.clip(rounded, 0, len(samples) - 1))
-            while rounded in used and rounded + 1 < len(samples):
-                rounded += 1
-            while rounded in used and rounded - 1 >= 0:
-                rounded -= 1
-            if rounded not in used:
-                used.add(rounded)
-                selected_indexes.append(rounded)
-        selected_indexes = sorted(selected_indexes)
-        return [samples[index] for index in selected_indexes[: int(target_count)]]
+        target_count = int(target_count)
+        anchor_scores = {}
+
+        def add_anchor(index, score):
+            if 0 <= index < len(samples):
+                previous = anchor_scores.get(index)
+                anchor_scores[index] = score if previous is None else min(previous, score)
+
+        add_anchor(0, 0)
+        add_anchor(len(samples) - 1, 0)
+
+        extrema_keys = (
+            ("indentation_depth_mm", 1),
+            ("load_kg", 2),
+            ("pressure_kg_eq", 2),
+            ("dot_mean_px", 2),
+            ("dot_max_px", 2),
+            ("error_kg", 3),
+            ("contact_peak", 3),
+            ("contact_area_ratio", 3),
+        )
+        for key, score in extrema_keys:
+            points = [
+                (idx, float(sample.get(key)))
+                for idx, sample in enumerate(samples)
+                if AllInOneTesterGUI._finite_number(sample.get(key))
+            ]
+            if not points:
+                continue
+            add_anchor(min(points, key=lambda item: item[1])[0], score)
+            add_anchor(max(points, key=lambda item: item[1])[0], score)
+
+        selected = set(anchor_scores)
+        if len(selected) > target_count:
+            priority = sorted(selected, key=lambda idx: (anchor_scores[idx], idx))
+            selected = set(priority[:target_count])
+
+        for index in np.linspace(0, len(samples) - 1, target_count):
+            if len(selected) >= target_count:
+                break
+            rounded = int(np.clip(round(float(index)), 0, len(samples) - 1))
+            candidates = [rounded]
+            for offset in range(1, len(samples)):
+                left = rounded - offset
+                right = rounded + offset
+                if left >= 0:
+                    candidates.append(left)
+                if right < len(samples):
+                    candidates.append(right)
+                if left < 0 and right >= len(samples):
+                    break
+            for candidate in candidates:
+                if candidate not in selected:
+                    selected.add(candidate)
+                    break
+
+        selected_indexes = sorted(selected)[:target_count]
+        return [samples[index] for index in selected_indexes]
 
     @staticmethod
     def _force_cycle_series_min_max(history, key):
@@ -5513,8 +5592,18 @@ class AllInOneTesterGUI:
         }
 
     @staticmethod
-    def _force_cycle_report_token(report_sample_target, trial):
+    @staticmethod
+    def _force_cycle_depth_token(target_depth_mm):
+        if target_depth_mm is None:
+            return "limit"
+        depth = abs(float(target_depth_mm))
+        return f"d{depth:.1f}mm".replace(".", "p")
+
+    @staticmethod
+    def _force_cycle_report_token(report_sample_target, trial, target_depth_mm=None):
         pieces = []
+        if target_depth_mm is not None:
+            pieces.append(AllInOneTesterGUI._force_cycle_depth_token(target_depth_mm))
         if report_sample_target:
             pieces.append(f"n{int(report_sample_target)}")
         if trial is not None:
@@ -5553,7 +5642,14 @@ class AllInOneTesterGUI:
 
         return 0.0
 
-    def _start_force_cycle_capture(self, started_at, shape_name, report_sample_target=None, trial=1):
+    def _start_force_cycle_capture(
+        self,
+        started_at,
+        shape_name,
+        report_sample_target=None,
+        trial=1,
+        target_depth_mm=None,
+    ):
         clean_shape = self._clean_force_cycle_shape_name(shape_name)
         with self.sensor_data_lock:
             self.force_cycle_sample_history = []
@@ -5566,8 +5662,13 @@ class AllInOneTesterGUI:
             self.force_cycle_shape_name = clean_shape
             self.force_cycle_report_sample_target = report_sample_target
             self.force_cycle_trial = int(trial)
+            self.force_cycle_target_depth_mm = target_depth_mm
         target_text = "all" if report_sample_target is None else str(report_sample_target)
-        self.log(f"Force cycle capture armed for shape: {clean_shape}, n={target_text}, trial={trial}.")
+        depth_text = "limit" if target_depth_mm is None else f"{target_depth_mm:.1f} mm"
+        self.log(
+            f"Force cycle capture armed for shape: {clean_shape}, depth={depth_text}, "
+            f"n={target_text}, trial={trial}."
+        )
 
     def _set_force_cycle_phase(self, phase, phase_started_at=None, down_seconds=None):
         now = time.monotonic() if phase_started_at is None else float(phase_started_at)
@@ -5626,6 +5727,7 @@ class AllInOneTesterGUI:
                     "elapsed_s": max(0.0, now - float(started_at)),
                     "phase": getattr(self, "force_cycle_phase", "idle"),
                     "shape_name": getattr(self, "force_cycle_shape_name", "sample"),
+                    "target_depth_mm": getattr(self, "force_cycle_target_depth_mm", None),
                     "report_sample_target": getattr(self, "force_cycle_report_sample_target", None),
                     "trial": getattr(self, "force_cycle_trial", 1),
                     "indentation_depth_mm": indentation_depth_mm,
@@ -5684,7 +5786,13 @@ class AllInOneTesterGUI:
 
         saved_paths = []
         report_text = "all samples" if report_sample_target is None else f"{report_sample_target} samples"
-        title_suffix = f"{shape_name} | report {report_text} | trial {trial}"
+        target_depth = None
+        for sample in history:
+            target_depth = sample.get("target_depth_mm")
+            if self._finite_number(target_depth):
+                break
+        depth_text = "limit" if target_depth is None else f"{float(target_depth):.1f} mm"
+        title_suffix = f"{shape_name} | depth {depth_text} | report {report_text} | trial {trial}"
         if raw_sample_count is not None and raw_sample_count != len(history):
             title_suffix += f" | selected {len(history)}/{raw_sample_count}"
 
@@ -5828,6 +5936,7 @@ class AllInOneTesterGUI:
                 indent_points.append((float(depth), float(dot_mean), str(sample.get("phase", ""))))
         if indent_points:
             fig, ax = plt.subplots(figsize=(7.2, 4.8))
+            indent_summary_lines = []
             colors = [
                 "#139a74" if point[2] == "down" else "#d17800" if point[2] == "up" else "#6b879a"
                 for point in indent_points
@@ -5850,6 +5959,16 @@ class AllInOneTesterGUI:
             ax.set_xlabel("indentation depth (mm)")
             ax.set_ylabel("mean dot displacement (px)")
             ax.grid(True, alpha=0.28)
+            summary = mark_min_max(
+                ax,
+                [(point[0], point[1]) for point in indent_points],
+                "dot displacement",
+                "#2f6178",
+                "px",
+            )
+            if summary:
+                indent_summary_lines.append(summary)
+            add_min_max_summary(ax, indent_summary_lines)
             fig.tight_layout()
             path = output_dir / f"{file_stem}_indentation_dot.png"
             fig.savefig(path, dpi=160)
@@ -5862,6 +5981,8 @@ class AllInOneTesterGUI:
         if dot_mean_points or dot_max_points or depth_points:
             fig, axes = plt.subplots(2, 1, figsize=(8.5, 6.0), sharex=True)
             fig.suptitle(f"Deformation and distance estimate: {title_suffix}")
+            deform_summary_lines = []
+            distance_summary_lines = []
             if dot_mean_points:
                 axes[0].plot(
                     [point[0] for point in dot_mean_points],
@@ -5870,6 +5991,9 @@ class AllInOneTesterGUI:
                     color="#2f6178",
                     linewidth=1.5,
                 )
+                summary = mark_min_max(axes[0], dot_mean_points, "mean dot", "#2f6178", "px")
+                if summary:
+                    deform_summary_lines.append(summary)
             if dot_max_points:
                 axes[0].plot(
                     [point[0] for point in dot_max_points],
@@ -5879,10 +6003,14 @@ class AllInOneTesterGUI:
                     linewidth=1.2,
                     linestyle="--",
                 )
+                summary = mark_min_max(axes[0], dot_max_points, "max dot", "#f0a000", "px")
+                if summary:
+                    deform_summary_lines.append(summary)
             axes[0].set_ylabel("deformation (px)")
             axes[0].grid(True, alpha=0.28)
             if dot_mean_points or dot_max_points:
                 axes[0].legend(loc="best")
+            add_min_max_summary(axes[0], deform_summary_lines)
 
             if depth_points:
                 axes[1].plot(
@@ -5892,11 +6020,15 @@ class AllInOneTesterGUI:
                     color="#139a74",
                     linewidth=1.5,
                 )
+                summary = mark_min_max(axes[1], depth_points, "depth", "#139a74", "mm")
+                if summary:
+                    distance_summary_lines.append(summary)
             axes[1].set_xlabel("elapsed (s)")
             axes[1].set_ylabel("distance estimate (mm)")
             axes[1].grid(True, alpha=0.28)
             if depth_points:
                 axes[1].legend(loc="best")
+            add_min_max_summary(axes[1], distance_summary_lines)
             fig.tight_layout()
             path = output_dir / f"{file_stem}_deformation_distance.png"
             fig.savefig(path, dpi=160)
@@ -5911,6 +6043,7 @@ class AllInOneTesterGUI:
             shape_name = getattr(self, "force_cycle_shape_name", "sample")
             report_sample_target = getattr(self, "force_cycle_report_sample_target", None)
             trial = getattr(self, "force_cycle_trial", 1)
+            target_depth_mm = getattr(self, "force_cycle_target_depth_mm", None)
 
         if not history:
             self.log("Force cycle finished without force samples to save.")
@@ -5921,7 +6054,7 @@ class AllInOneTesterGUI:
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         shape_token = self._safe_filename_token(shape_name)
         report_history = self._downsample_force_cycle_history(history, report_sample_target)
-        report_token = self._force_cycle_report_token(report_sample_target, trial)
+        report_token = self._force_cycle_report_token(report_sample_target, trial, target_depth_mm)
         file_stem = f"force_cycle_{timestamp}_{shape_token}{report_token}"
         output_path = output_dir / f"{file_stem}.csv"
 
@@ -5933,6 +6066,7 @@ class AllInOneTesterGUI:
                         "elapsed_s",
                         "phase",
                         "shape_name",
+                        "target_depth_mm",
                         "report_sample_target",
                         "trial",
                         "indentation_depth_mm",
@@ -5959,6 +6093,7 @@ class AllInOneTesterGUI:
                             self._csv_number(sample.get("elapsed_s"), digits=3),
                             sample.get("phase", ""),
                             sample.get("shape_name", shape_name),
+                            self._csv_number(sample.get("target_depth_mm"), digits=3),
                             "" if report_sample_target is None else str(report_sample_target),
                             str(trial),
                             self._csv_number(sample.get("indentation_depth_mm"), digits=6),
@@ -5994,6 +6129,7 @@ class AllInOneTesterGUI:
                     "series",
                     "unit",
                     "shape_name",
+                    "target_depth_mm",
                     "report_sample_target",
                     "trial",
                     "sample_count",
@@ -6007,6 +6143,11 @@ class AllInOneTesterGUI:
                 ("load_kg", "load cell", "kg"),
                 ("pressure_kg_eq", "pressure estimate", "kg"),
                 ("error_kg", "force error", "kg"),
+                ("indentation_depth_mm", "distance estimate", "mm"),
+                ("dot_mean_px", "mean dot deformation", "px"),
+                ("dot_max_px", "max dot deformation", "px"),
+                ("contact_peak", "contact peak", "ratio"),
+                ("contact_area_ratio", "contact area", "percent"),
             ):
                 stats = self._force_cycle_series_min_max(report_history, series_key)
                 if stats is None:
@@ -6016,6 +6157,7 @@ class AllInOneTesterGUI:
                         label,
                         unit,
                         shape_name,
+                        self._csv_number(target_depth_mm, digits=3),
                         "" if report_sample_target is None else str(report_sample_target),
                         str(trial),
                         str(len(report_history)),
@@ -6094,6 +6236,7 @@ class AllInOneTesterGUI:
         self.force_cycle_requested_shape_name = self._clean_force_cycle_shape_name(
             self.force_cycle_shape_var.get()
         )
+        self.force_cycle_requested_target_depth_mm = self._force_cycle_target_depth_mm()
         self.force_cycle_requested_report_sample_target = self._force_cycle_report_sample_target()
         self.force_cycle_requested_trial = self._force_cycle_report_trial()
         if not self._is_blob_running():
@@ -6108,9 +6251,14 @@ class AllInOneTesterGUI:
             if self.force_cycle_requested_report_sample_target is None
             else str(self.force_cycle_requested_report_sample_target)
         )
+        depth_text = (
+            "limit"
+            if self.force_cycle_requested_target_depth_mm is None
+            else f"{self.force_cycle_requested_target_depth_mm:.1f} mm"
+        )
         self.log(
             f"Force cycle started for shape: {self.force_cycle_requested_shape_name}, "
-            f"report n={target_text}, trial={self.force_cycle_requested_trial}."
+            f"depth={depth_text}, report n={target_text}, trial={self.force_cycle_requested_trial}."
         )
 
     def stop_force_cycle(self):
@@ -6177,6 +6325,26 @@ class AllInOneTesterGUI:
             return False
         return self._force_cycle_wait_stepper_done(target_limit_index=None)
 
+    def _force_cycle_move_for_seconds_timed(self, direction, seconds, label):
+        self.log(f"Force cycle: {label}.")
+        phase_started_at = time.monotonic()
+        self._set_force_cycle_phase(
+            direction,
+            phase_started_at=phase_started_at,
+            down_seconds=seconds if direction == "up" else None,
+        )
+        if not self._start_stepper_move_command(
+            direction,
+            seconds,
+            show_dialog=False,
+            frequency_hz=FORCE_CYCLE_STEPPER_FREQUENCY_HZ,
+        ):
+            return None
+        if not self._force_cycle_wait_stepper_done(target_limit_index=None):
+            return None
+        elapsed = max(0.0, time.monotonic() - phase_started_at)
+        return elapsed
+
     def _force_cycle_sleep(self):
         if FORCE_CYCLE_SETTLE_SECONDS <= 0:
             return not self.force_cycle_stop_event.is_set()
@@ -6212,9 +6380,36 @@ class AllInOneTesterGUI:
             shape_name = getattr(self, "force_cycle_requested_shape_name", "sample")
             report_sample_target = getattr(self, "force_cycle_requested_report_sample_target", None)
             trial = getattr(self, "force_cycle_requested_trial", 1)
-            self._start_force_cycle_capture(started_at, shape_name, report_sample_target, trial)
+            target_depth_mm = getattr(self, "force_cycle_requested_target_depth_mm", None)
+            self._start_force_cycle_capture(
+                started_at,
+                shape_name,
+                report_sample_target,
+                trial,
+                target_depth_mm=target_depth_mm,
+            )
             self._append_force_cycle_sample(now=started_at, force=True)
-            down_seconds = self._force_cycle_move_until_limit_timed("down", 1, "Limit 2")
+
+            if target_depth_mm is None:
+                down_seconds = self._force_cycle_move_until_limit_timed("down", 1, "Limit 2")
+            else:
+                mm_per_second = float(FORCE_CYCLE_STEPPER_FREQUENCY_HZ) * float(STEPPER_MM_PER_PULSE)
+                if mm_per_second <= 0:
+                    self.log("Force cycle aborted: stepper mm/s is invalid.")
+                    return
+                requested_depth_mm = abs(float(target_depth_mm))
+                requested_seconds = requested_depth_mm / mm_per_second
+                if requested_seconds > FORCE_CYCLE_LIMIT_MAX_SECONDS:
+                    self.log(
+                        f"Force cycle target {requested_depth_mm:.1f} mm exceeds max cycle time; "
+                        f"clipping to {FORCE_CYCLE_LIMIT_MAX_SECONDS:.1f}s."
+                    )
+                    requested_seconds = FORCE_CYCLE_LIMIT_MAX_SECONDS
+                down_seconds = self._force_cycle_move_for_seconds_timed(
+                    "down",
+                    requested_seconds,
+                    f"down to {target_depth_mm:.1f} mm target",
+                )
             if down_seconds is None:
                 return
             if down_seconds <= 0.05:
@@ -7497,14 +7692,6 @@ class AllInOneTesterGUI:
         reset_reference=False,
         surface_reset=False,
     ):
-        ok, encoded = cv2.imencode(
-            ".jpg",
-            frame_bgr,
-            [int(cv2.IMWRITE_JPEG_QUALITY), int(np.clip(REMOTE_VISION_JPEG_QUALITY, 35, 92))],
-        )
-        if not ok:
-            raise RuntimeError("Could not encode camera frame for remote vision.")
-
         view_type = str(params.get("view_type", "overlay")).strip().lower()
         remote_preview = REMOTE_VISION_PREVIEW_ENABLED or view_type in {
             "surface_3d",
@@ -7512,30 +7699,70 @@ class AllInOneTesterGUI:
             "pointcloud",
             "heatmap",
         }
-        query = urlencode(
-            {
-                "reset": "1" if reset_reference else "0",
-                "preview": "1" if remote_preview else "0",
-                "points": "1",
-                "view": view_type,
-                "surface_reset": "1" if surface_reset else "0",
-                "mode": params.get("mode", "auto"),
-                "use_roi": "1" if params.get("use_roi", True) else "0",
-                "roi_scale": f"{float(params.get('roi_scale', 0.68)):.4f}",
-                "min_area": int(float(params.get("min_area", 20))),
-                "max_area": int(float(params.get("max_area", 8000))),
-                "min_circularity": f"{float(params.get('min_circularity', 0.35)):.4f}",
-                "match_dist": f"{float(params.get('match_dist', 9.0)):.4f}",
-                "surface_grid": self._parse_surface_int(self.surface_grid_var, 52, 24, 140),
-                "surface_gain": f"{self._parse_surface_float(self.surface_gain_var, 1.0, 0.2, 3.0):.4f}",
-                "surface_smooth": f"{self._parse_surface_float(self.surface_smooth_var, 1.4, 0.0, 4.0):.4f}",
-            }
-        )
-        url = f"{params['remote_vision_url']}/process?{query}"
+        include_points = bool(REMOTE_VISION_POINTS_ENABLED or not remote_preview)
+        query_params = {
+            "reset": "1" if reset_reference else "0",
+            "preview": "1" if remote_preview else "0",
+            "points": "1" if include_points else "0",
+            "view": view_type,
+            "surface_reset": "1" if surface_reset else "0",
+            "mode": params.get("mode", "auto"),
+            "use_roi": "1" if params.get("use_roi", True) else "0",
+            "roi_scale": f"{float(params.get('roi_scale', 0.68)):.4f}",
+            "min_area": int(float(params.get("min_area", 20))),
+            "max_area": int(float(params.get("max_area", 8000))),
+            "min_circularity": f"{float(params.get('min_circularity', 0.35)):.4f}",
+            "match_dist": f"{float(params.get('match_dist', 9.0)):.4f}",
+            "surface_grid": self._parse_surface_int(self.surface_grid_var, 52, 24, 140),
+            "surface_gain": f"{self._parse_surface_float(self.surface_gain_var, 1.0, 0.2, 3.0):.4f}",
+            "surface_smooth": f"{self._parse_surface_float(self.surface_smooth_var, 1.4, 0.0, 4.0):.4f}",
+            "preview_max_width": max(0, int(REMOTE_VISION_PREVIEW_MAX_WIDTH)),
+            "surface_proc_width": max(0, int(REMOTE_VISION_SURFACE_PROCESS_WIDTH)),
+        }
+        transport = REMOTE_VISION_TRANSPORT if REMOTE_VISION_TRANSPORT in {"raw", "jpeg"} else "raw"
+        if transport == "raw":
+            raw_format = REMOTE_VISION_RAW_FORMAT
+            height, width = frame_bgr.shape[:2]
+            query_params.update(
+                {
+                    "width": int(width),
+                    "height": int(height),
+                    "format": raw_format,
+                }
+            )
+            if raw_format in {"bgr24", "bgr", "bgr888"}:
+                body = np.ascontiguousarray(frame_bgr).tobytes()
+            elif raw_format in {"rgb24", "rgb", "rgb888"}:
+                rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                body = np.ascontiguousarray(rgb).tobytes()
+            elif raw_format in {"gray8", "grey8", "mono8"}:
+                gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+                body = np.ascontiguousarray(gray).tobytes()
+            elif raw_format in {"i420", "yuv420", "yuv420p"}:
+                yuv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2YUV_I420)
+                body = np.ascontiguousarray(yuv).tobytes()
+            else:
+                raise RuntimeError(f"Unsupported remote raw format: {raw_format}")
+            endpoint = "process_raw"
+            content_type = "application/octet-stream"
+        else:
+            ok, encoded = cv2.imencode(
+                ".jpg",
+                frame_bgr,
+                [int(cv2.IMWRITE_JPEG_QUALITY), int(np.clip(REMOTE_VISION_JPEG_QUALITY, 35, 92))],
+            )
+            if not ok:
+                raise RuntimeError("Could not encode camera frame for remote vision.")
+            body = encoded.tobytes()
+            endpoint = "process"
+            content_type = "image/jpeg"
+
+        query = urlencode(query_params)
+        url = f"{params['remote_vision_url']}/{endpoint}?{query}"
         request = Request(
             url,
-            data=encoded.tobytes(),
-            headers={"Content-Type": "image/jpeg"},
+            data=body,
+            headers={"Content-Type": content_type},
             method="POST",
         )
         started_at = time.perf_counter()
@@ -7766,6 +7993,7 @@ class AllInOneTesterGUI:
                         self.surface_reset_zero_event.clear()
 
                     centroids = self._remote_points_from_payload(remote_payload, "centroids")
+                    remote_dot_count = int(remote_payload.get("dot_count", len(centroids)) or 0)
                     reference_centroids = self._remote_points_from_payload(
                         remote_payload,
                         "reference_centroids",
@@ -7828,7 +8056,7 @@ class AllInOneTesterGUI:
 
                     distance_text = (
                         f"Remote CUDA: mean {mean_disp:.3f}px | "
-                        f"max {max_disp:.3f}px | dots {len(centroids)}"
+                        f"max {max_disp:.3f}px | dots {remote_dot_count}"
                     )
                     display_bgr = None
                     flow_distance_mean = mean_disp
@@ -8156,14 +8384,16 @@ class AllInOneTesterGUI:
                         (
                             f"Remote CUDA running "
                             f"({remote_payload.get('roundtrip_ms', 0.0):.1f} ms network, "
-                            f"{remote_payload.get('process_backend', 'remote')})."
+                            f"{remote_payload.get('process_backend', 'remote')}, "
+                            f"{remote_payload.get('input_transport', REMOTE_VISION_TRANSPORT)}:"
+                            f"{remote_payload.get('input_format', REMOTE_VISION_RAW_FORMAT)})."
                         ),
                     )
 
                     self._enqueue_blob_frame(
                         {
                             "frame_rgb": frame_rgb_preview,
-                            "dot_count": len(centroids),
+                            "dot_count": remote_dot_count,
                             "picked_mode": f"remote CUDA | {display_mode}",
                             "fps": fps,
                             "frame_ms": frame_ms,

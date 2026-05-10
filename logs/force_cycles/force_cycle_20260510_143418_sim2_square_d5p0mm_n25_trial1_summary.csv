@@ -1,0 +1,9 @@
+series,unit,shape_name,target_depth_mm,report_sample_target,trial,sample_count,min_value,min_elapsed_s,max_value,max_elapsed_s
+load cell,kg,sim2_square,-5.000,25,1,25,-0.002677,7.120,0.171133,3.520
+pressure estimate,kg,sim2_square,-5.000,25,1,25,-0.006274,7.120,0.178381,3.520
+force error,kg,sim2_square,-5.000,25,1,25,-0.003998,4.640,0.007992,0.640
+distance estimate,mm,sim2_square,-5.000,25,1,25,0.000000,0.000,4.943820,3.520
+mean dot deformation,px,sim2_square,-5.000,25,1,25,0.000000,0.000,10.707816,3.600
+max dot deformation,px,sim2_square,-5.000,25,1,25,-0.100509,7.120,15.122491,3.520
+contact peak,ratio,sim2_square,-5.000,25,1,25,0.000000,0.000,0.988764,3.520
+contact area,percent,sim2_square,-5.000,25,1,25,0.000000,0.000,22.247191,3.520

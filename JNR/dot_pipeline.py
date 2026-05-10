@@ -312,23 +312,27 @@ def match_centroids(pred: List[Tuple[int, int]], gt: List[Tuple[int, int]], max_
     if not pred or not gt:
         return [], set(range(len(gt)))
 
-    candidates = []
-    for i, p in enumerate(pred):
-        for j, g in enumerate(gt):
-            d = np.hypot(p[0] - g[0], p[1] - g[1])
-            if d <= max_dist:
-                candidates.append((d, i, j))
+    pred_arr = np.asarray(pred, dtype=np.float32)
+    gt_arr = np.asarray(gt, dtype=np.float32)
+    deltas = pred_arr[:, None, :] - gt_arr[None, :, :]
+    dist2 = np.sum(deltas * deltas, axis=2)
+    pred_idx, gt_idx = np.nonzero(dist2 <= float(max_dist) * float(max_dist))
+    if pred_idx.size == 0:
+        return [], set(range(len(gt)))
 
-    candidates.sort(key=lambda x: x[0])
+    candidate_dist2 = dist2[pred_idx, gt_idx]
+    order = np.argsort(candidate_dist2, kind="stable")
     matched_pred = set()
     matched_gt = set()
     matches = []
-    for d, i, j in candidates:
+    for candidate_index in order:
+        i = int(pred_idx[candidate_index])
+        j = int(gt_idx[candidate_index])
         if i in matched_pred or j in matched_gt:
             continue
         matched_pred.add(i)
         matched_gt.add(j)
-        matches.append((i, j, d))
+        matches.append((i, j, float(np.sqrt(candidate_dist2[candidate_index]))))
 
     unmatched_gt = set(range(len(gt))) - matched_gt
     return matches, unmatched_gt
