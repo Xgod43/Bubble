@@ -540,6 +540,7 @@ def open_camera_stream(
     analogue_gain=None,
     awb_mode: str = "auto",
     colour_gains=None,
+    frame_rate=None,
 ):
     backend = backend.lower()
     if backend == "picamera3":
@@ -583,6 +584,18 @@ def open_camera_stream(
                         controls_payload["ColourGains"] = tuple(float(value) for value in colour_gains)
                 elif awb_mode == "auto":
                     controls_payload["AwbEnable"] = True
+
+                if frame_rate is not None:
+                    try:
+                        frame_rate_value = float(frame_rate)
+                    except (TypeError, ValueError):
+                        frame_rate_value = 0.0
+                    if frame_rate_value > 0:
+                        frame_duration_us = int(round(1_000_000.0 / frame_rate_value))
+                        controls_payload["FrameDurationLimits"] = (
+                            frame_duration_us,
+                            frame_duration_us,
+                        )
 
                 scaler_crop = picam.camera_properties.get("ScalerCropMaximum")
                 if scaler_crop:

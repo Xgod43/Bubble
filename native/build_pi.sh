@@ -29,3 +29,18 @@ else
   echo "Stepper native runner was not built. Install libgpiod-dev to enable it."
   cat /tmp/pi_bubble_stepper_build.log
 fi
+
+LIMIT_OUT="$BUILD_DIR/limit_reader"
+if pkg-config --exists libgpiod; then
+  gcc \
+    -O3 \
+    "$ROOT_DIR/limit_reader.c" \
+    -o "$LIMIT_OUT" \
+    $(pkg-config --cflags --libs libgpiod)
+  echo "Built $LIMIT_OUT"
+elif gcc -O3 "$ROOT_DIR/limit_reader.c" -o "$LIMIT_OUT" -lgpiod >/tmp/pi_bubble_limit_build.log 2>&1; then
+  echo "Built $LIMIT_OUT"
+else
+  echo "Limit native reader was not built. Install libgpiod-dev to enable it."
+  cat /tmp/pi_bubble_limit_build.log
+fi

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import time
 import tkinter as tk
 from tkinter import ttk
@@ -9,11 +8,11 @@ from all_in_one_gui import (
     AllInOneTesterGUI,
     COLOR_ACCENT,
     COLOR_ACCENT_SOFT,
-    FORCE_GRAVITY_MPS2,
     COLOR_OK,
     COLOR_WARN,
     LIMIT_1_PIN,
     LIMIT_2_PIN,
+    REMOTE_VISION_DEFAULT_URL,
 )
 
 
@@ -25,8 +24,6 @@ COLOR_BORDER_DARK = "#22384d"
 COLOR_TEXT_BRIGHT = "#eef5fb"
 COLOR_TEXT_MUTED = "#93a9bc"
 COLOR_DANGER = "#c25b5b"
-FORCE_GRAPH_HISTORY_SECONDS = 120.0
-FORCE_GRAPH_MAX_POINTS = 600
 
 
 class MissionControlGUI(AllInOneTesterGUI):
@@ -373,8 +370,10 @@ class MissionControlGUI(AllInOneTesterGUI):
 
         graph_area = ttk.Frame(pane, style="App.TFrame", padding=(0, 0, 8, 0))
         graph_area.columnconfigure(0, weight=1)
-        graph_area.rowconfigure(0, weight=1)
-        graph_area.rowconfigure(1, weight=1)
+        graph_area.rowconfigure(0, weight=2)
+        graph_area.rowconfigure(1, weight=2)
+        graph_area.rowconfigure(2, weight=1)
+        graph_area.rowconfigure(3, weight=1)
 
         side_shell, side_content = self._build_scrollable_tab(pane, padding=8)
 
@@ -409,213 +408,36 @@ class MissionControlGUI(AllInOneTesterGUI):
         self.force_error_canvas.grid(row=0, column=0, sticky="nsew")
         self.force_error_canvas.bind("<Configure>", lambda _event: self._draw_force_graphs())
 
+        deform = ttk.LabelFrame(graph_area, text="Deformation monitor", padding=8)
+        deform.grid(row=2, column=0, sticky="nsew", pady=(6, 0))
+        deform.columnconfigure(0, weight=1)
+        deform.rowconfigure(0, weight=1)
+        self.force_deform_canvas = tk.Canvas(
+            deform,
+            height=160,
+            background="#0a131b",
+            highlightthickness=1,
+            highlightbackground=COLOR_BORDER_DARK,
+        )
+        self.force_deform_canvas.grid(row=0, column=0, sticky="nsew")
+        self.force_deform_canvas.bind("<Configure>", lambda _event: self._draw_force_graphs())
+
+        distance = ttk.LabelFrame(graph_area, text="Distance estimate", padding=8)
+        distance.grid(row=3, column=0, sticky="nsew", pady=(6, 0))
+        distance.columnconfigure(0, weight=1)
+        distance.rowconfigure(0, weight=1)
+        self.force_distance_canvas = tk.Canvas(
+            distance,
+            height=150,
+            background="#0a131b",
+            highlightthickness=1,
+            highlightbackground=COLOR_BORDER_DARK,
+        )
+        self.force_distance_canvas.grid(row=0, column=0, sticky="nsew")
+        self.force_distance_canvas.bind("<Configure>", lambda _event: self._draw_force_graphs())
+
         self._build_force_measurement_tab(side_content)
         self.root.after(120, self._draw_force_graphs)
-
-    def _record_pressure_reading(self, pressure_hpa):
-        pressure = float(pressure_hpa)
-        zero_captured = False
-        with self.sensor_data_lock:
-            self.latest_pressure_hpa = pressure
-            if self.force_pressure_zero_hpa is None:
-                self.force_pressure_zero_hpa = pressure
-                zero_captured = True
-        if zero_captured:
-            self._refresh_force_pressure_zero()
-            self._set_var(
-                self.force_calibration_status_var,
-                "Pressure zero captured. Press bubble into load cell.",
-            )
-            self.log(f"Force pressure zero auto-captured at {pressure:.2f} hPa.")
-        self._refresh_force_live_pair()
-        self._update_force_estimate()
-        self._append_force_graph_sample()
-
-    def _record_loadcell_reading(self, weight_kg):
-        with self.sensor_data_lock:
-            self.latest_loadcell_kg = float(weight_kg)
-            self.latest_loadcell_force_n = float(weight_kg) * FORCE_GRAVITY_MPS2
-        self._refresh_force_live_pair()
-        self._update_force_estimate()
-        self._append_force_graph_sample()
-
-    def _update_force_estimate(self):
-        if not hasattr(self, "force_estimate_var"):
-            return
-        with self.sensor_data_lock:
-            pressure = self.latest_pressure_hpa
-            zero = self.force_pressure_zero_hpa
-            coeffs = self.force_calibration_coeffs
-
-        pressure_delta = self._pressure_delta_from_zero(pressure, zero)
-
-        if pressure_delta is None or coeffs is None:
-            with self.sensor_data_lock:
-                self.latest_pressure_force_n = None
-            self._set_var(self.force_estimate_var, "-")
-            return
-
-        slope, intercept = coeffs
-        estimated_force = (slope * pressure_delta) + intercept
-        with self.sensor_data_lock:
-            self.latest_pressure_force_n = float(estimated_force)
-        estimated_load_kg = float(estimated_force) / FORCE_GRAVITY_MPS2
-        self._set_var(self.force_estimate_var, f"{estimated_load_kg:.4f} kg")
-
-    def _append_force_graph_sample(self):
-        now = time.monotonic()
-        with self.sensor_data_lock:
-            if not hasattr(self, "force_graph_history"):
-                self.force_graph_history = []
-            load_force = getattr(self, "latest_loadcell_force_n", None)
-            pressure_force = getattr(self, "latest_pressure_force_n", None)
-            pressure_hpa = self.latest_pressure_hpa
-            if load_force is None and pressure_force is None and pressure_hpa is None:
-                return
-            self.force_graph_history.append((now, load_force, pressure_force, pressure_hpa))
-            cutoff = now - FORCE_GRAPH_HISTORY_SECONDS
-            self.force_graph_history = [
-                point for point in self.force_graph_history if point[0] >= cutoff
-            ]
-            if len(self.force_graph_history) > FORCE_GRAPH_MAX_POINTS:
-                del self.force_graph_history[:-FORCE_GRAPH_MAX_POINTS]
-        self._request_force_graph_redraw()
-
-    def _request_force_graph_redraw(self):
-        if not self.root.winfo_exists():
-            return
-        if not hasattr(self, "force_compare_canvas") or not hasattr(self, "force_error_canvas"):
-            return
-        if getattr(self, "force_graph_redraw_pending", False):
-            return
-        self.force_graph_redraw_pending = True
-
-        def redraw():
-            self.force_graph_redraw_pending = False
-            self._draw_force_graphs()
-
-        self.root.after(80, redraw)
-
-    @staticmethod
-    def _finite_number(value):
-        return isinstance(value, (int, float)) and math.isfinite(float(value))
-
-    @staticmethod
-    def _graph_bounds(values):
-        finite_values = [float(value) for value in values if MissionControlGUI._finite_number(value)]
-        if not finite_values:
-            return -1.0, 1.0
-        low = min(0.0, min(finite_values))
-        high = max(0.0, max(finite_values))
-        pad = max(0.5, (high - low) * 0.12)
-        return low - pad, high + pad
-
-    def _draw_force_graphs(self):
-        if not hasattr(self, "force_compare_canvas") or not hasattr(self, "force_error_canvas"):
-            return
-        self._draw_force_compare_graph(self.force_compare_canvas)
-        self._draw_force_error_graph(self.force_error_canvas)
-
-    def _prepare_force_graph(self, canvas, title, y_label):
-        width = max(1, int(canvas.winfo_width()))
-        height = max(1, int(canvas.winfo_height()))
-        canvas.delete("all")
-        canvas.create_rectangle(0, 0, width, height, fill="#0a131b", outline="")
-        left, top = 48, 28
-        right, bottom = max(68, width - 12), max(48, height - 28)
-        canvas.create_text(10, 8, text=title, anchor="nw", fill=COLOR_TEXT_BRIGHT, font=("Segoe UI", 9, "bold"))
-        canvas.create_text(8, (top + bottom) / 2, text=y_label, anchor="w", fill=COLOR_TEXT_MUTED, font=("Segoe UI", 8))
-        canvas.create_text((left + right) / 2, height - 5, text=f"last {int(FORCE_GRAPH_HISTORY_SECONDS)} s", anchor="s", fill=COLOR_TEXT_MUTED, font=("Segoe UI", 8))
-        canvas.create_rectangle(left, top, right, bottom, outline=COLOR_BORDER_DARK)
-        return left, top, right, bottom
-
-    def _draw_empty_force_graph(self, canvas, title, message):
-        left, top, right, bottom = self._prepare_force_graph(canvas, title, "")
-        canvas.create_text((left + right) / 2, (top + bottom) / 2, text=message, fill=COLOR_TEXT_MUTED, font=("Segoe UI", 9))
-
-    def _draw_force_compare_graph(self, canvas):
-        with self.sensor_data_lock:
-            history = list(getattr(self, "force_graph_history", []))
-        if not history:
-            self._draw_empty_force_graph(canvas, "Load comparison", "Waiting for load cell / pressure data")
-            return
-        left, top, right, bottom = self._prepare_force_graph(canvas, "Load comparison", "kg")
-        now = max(point[0] for point in history)
-        x_min = now - FORCE_GRAPH_HISTORY_SECONDS
-        values = []
-        for _ts, load_force, pressure_force, _pressure in history:
-            if self._finite_number(load_force):
-                values.append(float(load_force) / FORCE_GRAVITY_MPS2)
-            if self._finite_number(pressure_force):
-                values.append(float(pressure_force) / FORCE_GRAVITY_MPS2)
-        if not values:
-            canvas.create_text((left + right) / 2, (top + bottom) / 2, text="Waiting for force calibration", fill=COLOR_TEXT_MUTED, font=("Segoe UI", 9))
-            return
-        y_min, y_max = self._graph_bounds(values)
-
-        def x_for(timestamp):
-            return left + ((float(timestamp) - x_min) / FORCE_GRAPH_HISTORY_SECONDS) * (right - left)
-
-        def y_for(value):
-            return bottom - ((float(value) - y_min) / max(1e-9, y_max - y_min)) * (bottom - top)
-
-        for idx in range(4):
-            y = top + (idx / 3.0) * (bottom - top)
-            canvas.create_line(left, y, right, y, fill="#1d3347")
-        for idx in range(3):
-            x = left + (idx / 2.0) * (right - left)
-            canvas.create_line(x, top, x, bottom, fill="#15283a")
-
-        def draw_series(value_index, color, dash=None):
-            coords = []
-            for point in history:
-                value = point[value_index]
-                if not self._finite_number(value):
-                    if len(coords) >= 4:
-                        canvas.create_line(*coords, fill=color, width=2, smooth=True, dash=dash)
-                    coords = []
-                    continue
-                value = float(value) / FORCE_GRAVITY_MPS2
-                coords.extend((x_for(point[0]), y_for(value)))
-            if len(coords) >= 4:
-                canvas.create_line(*coords, fill=color, width=2, smooth=True, dash=dash)
-
-        draw_series(1, COLOR_OK)
-        draw_series(2, COLOR_WARN, dash=(4, 2))
-        canvas.create_text(right - 8, top + 6, text="green load kg | orange pressure kg-eq", anchor="ne", fill=COLOR_TEXT_MUTED, font=("Segoe UI", 7))
-
-    def _draw_force_error_graph(self, canvas):
-        with self.sensor_data_lock:
-            history = list(getattr(self, "force_graph_history", []))
-        error_points = [
-            (ts, (float(pressure_force) - float(load_force)) / FORCE_GRAVITY_MPS2)
-            for ts, load_force, pressure_force, _pressure in history
-            if self._finite_number(load_force) and self._finite_number(pressure_force)
-        ]
-        if not error_points:
-            self._draw_empty_force_graph(canvas, "Force error", "Waiting for both force lines")
-            return
-        left, top, right, bottom = self._prepare_force_graph(canvas, "Load error (pressure kg-eq - load cell kg)", "kg")
-        now = max(point[0] for point in history)
-        x_min = now - FORCE_GRAPH_HISTORY_SECONDS
-        y_min, y_max = self._graph_bounds([point[1] for point in error_points])
-
-        def x_for(timestamp):
-            return left + ((float(timestamp) - x_min) / FORCE_GRAPH_HISTORY_SECONDS) * (right - left)
-
-        def y_for(value):
-            return bottom - ((float(value) - y_min) / max(1e-9, y_max - y_min)) * (bottom - top)
-
-        zero_y = y_for(0.0)
-        canvas.create_line(left, zero_y, right, zero_y, fill=COLOR_ACCENT, dash=(3, 2))
-        coords = []
-        latest_error = 0.0
-        for timestamp, error_n in error_points:
-            coords.extend((x_for(timestamp), y_for(error_n)))
-            latest_error = error_n
-        if len(coords) >= 4:
-            canvas.create_line(*coords, fill=COLOR_DANGER, width=2, smooth=True)
-        canvas.create_text(right - 8, top + 6, text=f"latest {latest_error:+.3f} kg | abs {abs(latest_error):.3f} kg", anchor="ne", fill=COLOR_TEXT_MUTED, font=("Segoe UI", 7))
 
     def _init_blob_defaults(self):
         self.blob_state_var = tk.StringVar(value="Stopped")
@@ -628,6 +450,17 @@ class MissionControlGUI(AllInOneTesterGUI):
         self.blob_missing_ratio_var = tk.StringVar(value="-")
         self.blob_new_tracks_var = tk.StringVar(value="-")
         self.blob_lost_tracks_var = tk.StringVar(value="-")
+        self.stepper_position_var = tk.StringVar(value="0.000 mm")
+        self.contact_depth_stepper_var = tk.StringVar(value="unavailable (manual)")
+        self.contact_depth_camera_var = tk.StringVar(value="-")
+        self.contact_gate_var = tk.StringVar(value="Pressure gate waiting")
+        self.surface_measurement_mode = "flat_deform"
+        self.surface_measurement_mode_var = tk.StringVar(value="Flat Deform")
+        self.contact_peak_var = tk.StringVar(value="-")
+        self.contact_area_var = tk.StringVar(value="-")
+        self.contact_center_var = tk.StringVar(value="-")
+        self.contact_residual_var = tk.StringVar(value="-")
+        self.contact_force_var = tk.StringVar(value="-")
         self.blob_message_var = tk.StringVar(value="Tune the live detection profile and press Start Detection.")
 
         self.blob_camera_backend_var = tk.StringVar(value="auto")
@@ -660,15 +493,19 @@ class MissionControlGUI(AllInOneTesterGUI):
         self.blob_illum_method_var = tk.StringVar(value="clahe")
         self.blob_distance_scale_var = tk.StringVar(value="1.0")
         self.blob_distance_unit_var = tk.StringVar(value="px")
+        self.vision_backend_var = tk.StringVar(value="local")
+        self.remote_vision_url_var = tk.StringVar(value=REMOTE_VISION_DEFAULT_URL)
 
     def _init_hardware_defaults(self):
         self.camera_status_var = tk.StringVar(value="Stopped")
         self.limit1_status_var = tk.StringVar(value="not triggered")
         self.limit2_status_var = tk.StringVar(value="not triggered")
+        self.limit1_detail_var = tk.StringVar(value="Limit 1: not triggered")
+        self.limit2_detail_var = tk.StringVar(value="Limit 2: not triggered")
         self.limit_monitor_state_var = tk.StringVar(value="Stopped")
         self.stepper_direction_var = tk.StringVar(value="up")
         self.stepper_seconds_var = tk.StringVar(value="1.0")
-        self.stepper_state_var = tk.StringVar(value="Idle")
+        self.stepper_state_var = tk.StringVar(value="Ready")
         self.pressure_value_var = tk.StringVar(value="-")
         self.pressure_state_var = tk.StringVar(value="Stopped")
         self.loadcell_known_weight_var = tk.StringVar(value="500")
@@ -733,7 +570,7 @@ class MissionControlGUI(AllInOneTesterGUI):
         card = ttk.LabelFrame(content, text="Live Detection", padding=8)
         card.grid(row=0, column=0, sticky="nsew")
         card.columnconfigure(0, weight=1)
-        card.rowconfigure(2, weight=1, minsize=180)
+        card.rowconfigure(1, weight=1, minsize=500)
 
         ttk.Label(
             card,
@@ -741,9 +578,37 @@ class MissionControlGUI(AllInOneTesterGUI):
             style="SectionHint.TLabel",
         ).grid(row=0, column=0, sticky="w", pady=(0, 6))
 
-        command_bar = ttk.Frame(card, style="Surface.TFrame")
-        command_bar.grid(row=1, column=0, sticky="ew", pady=(0, 6))
-        for col in range(7):
+        pane = ttk.Panedwindow(card, orient="horizontal", style="Split.TPanedwindow")
+        pane.grid(row=1, column=0, sticky="nsew")
+
+        preview_area = ttk.Frame(pane, style="App.TFrame", padding=(0, 0, 8, 0))
+        preview_area.columnconfigure(0, weight=1)
+        preview_area.rowconfigure(0, weight=1)
+
+        side_shell, side_panel = self._build_scrollable_tab(pane, padding=8)
+        side_panel.columnconfigure(0, weight=1)
+
+        pane.add(preview_area, weight=4)
+        pane.add(side_shell, weight=2)
+
+        preview_shell = ttk.Frame(preview_area, style="Surface.TFrame")
+        preview_shell.grid(row=0, column=0, sticky="nsew")
+        preview_shell.columnconfigure(0, weight=1)
+        preview_shell.rowconfigure(0, weight=1)
+
+        self.blob_preview_label = ttk.Label(
+            preview_shell,
+            text="Detection output stopped",
+            anchor="center",
+            background="#0a131b",
+            foreground=COLOR_TEXT_MUTED,
+            font=("Segoe UI", 11),
+        )
+        self.blob_preview_label.grid(row=0, column=0, sticky="nsew")
+
+        command_bar = ttk.Frame(side_panel, style="Surface.TFrame")
+        command_bar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        for col in range(6):
             command_bar.columnconfigure(col, weight=1)
 
         ttk.Button(command_bar, text="Reset", command=self._apply_blob_preset).grid(
@@ -770,36 +635,62 @@ class MissionControlGUI(AllInOneTesterGUI):
             command=self.request_blob_reference_reset,
         )
         self.blob_reset_ref_btn.grid(row=0, column=4, sticky="ew", padx=(0, 6))
-        self.surface_reset_btn = ttk.Button(
-            command_bar,
-            text="Reset Zero",
-            command=self.reset_surface_baseline,
-        )
-        self.surface_reset_btn.grid(row=0, column=5, sticky="ew", padx=(0, 6))
         self.blob_settings_btn = ttk.Button(
             command_bar,
             text="Settings",
             command=self.open_blob_settings_dialog,
         )
-        self.blob_settings_btn.grid(row=0, column=6, sticky="ew")
+        self.blob_settings_btn.grid(row=0, column=5, sticky="ew")
 
-        preview_shell = ttk.Frame(card, style="Surface.TFrame")
-        preview_shell.grid(row=2, column=0, sticky="nsew")
-        preview_shell.columnconfigure(0, weight=1)
-        preview_shell.rowconfigure(0, weight=1)
-
-        self.blob_preview_label = ttk.Label(
-            preview_shell,
-            text="Detection output stopped",
-            anchor="center",
-            background="#0a131b",
-            foreground=COLOR_TEXT_MUTED,
-            font=("Segoe UI", 11),
+        mode_frame = ttk.Frame(command_bar, style="Surface.TFrame")
+        mode_frame.grid(row=1, column=0, sticky="ew", padx=(0, 6), pady=(6, 0))
+        mode_frame.columnconfigure(1, weight=1)
+        ttk.Label(mode_frame, text="Mode", style="SectionHint.TLabel").grid(
+            row=0, column=0, sticky="w", padx=(0, 4)
         )
-        self.blob_preview_label.grid(row=0, column=0, sticky="nsew")
+        self.deform_mode_combo = ttk.Combobox(
+            mode_frame,
+            textvariable=self.surface_measurement_mode_var,
+            values=("Flat Deform", "3D Object"),
+            state="readonly",
+            width=12,
+        )
+        self.deform_mode_combo.grid(row=0, column=1, sticky="ew")
+        self.deform_mode_combo.bind("<<ComboboxSelected>>", self._apply_surface_measurement_mode)
 
-        metrics = ttk.Frame(card, style="App.TFrame")
-        metrics.grid(row=3, column=0, sticky="ew", pady=(8, 6))
+        deform_frame = ttk.Frame(command_bar, style="Surface.TFrame")
+        deform_frame.grid(row=1, column=1, sticky="ew", padx=(0, 6), pady=(6, 0))
+        deform_frame.columnconfigure(1, weight=1)
+        ttk.Label(deform_frame, text="mm", style="SectionHint.TLabel").grid(
+            row=0, column=0, sticky="w", padx=(0, 4)
+        )
+        self.deform_known_mm_entry = ttk.Entry(
+            deform_frame,
+            textvariable=self.camera_deform_known_mm_var,
+            width=7,
+        )
+        self.deform_known_mm_entry.grid(row=0, column=1, sticky="ew")
+        self.deform_calibrate_btn = ttk.Button(
+            command_bar,
+            text="Cal Deform",
+            command=self.capture_camera_deform_sample,
+        )
+        self.deform_calibrate_btn.grid(row=1, column=2, sticky="ew", padx=(0, 6), pady=(6, 0))
+        self.deform_reset_cal_btn = ttk.Button(
+            command_bar,
+            text="Reset Deform",
+            command=self.reset_camera_deform_calibration,
+        )
+        self.deform_reset_cal_btn.grid(row=1, column=3, sticky="ew", padx=(0, 6), pady=(6, 0))
+        self.surface_reset_btn = ttk.Button(
+            command_bar,
+            text="Reset Zero",
+            command=self.reset_surface_baseline,
+        )
+        self.surface_reset_btn.grid(row=1, column=4, sticky="ew", padx=(0, 6), pady=(6, 0))
+
+        metrics = ttk.Frame(side_panel, style="App.TFrame")
+        metrics.grid(row=1, column=0, sticky="ew", pady=(8, 6))
         for col in range(4):
             metrics.columnconfigure(col, weight=1)
 
@@ -811,9 +702,19 @@ class MissionControlGUI(AllInOneTesterGUI):
         self._metric_cell(metrics, 1, 1, "Mean disp", self.blob_mean_disp_var)
         self._metric_cell(metrics, 1, 2, "Max disp", self.blob_max_disp_var)
         self._metric_cell(metrics, 1, 3, "Missing", self.blob_missing_ratio_var, pad_right=0)
+        self._metric_cell(metrics, 2, 0, "Stepper depth", self.contact_depth_stepper_var)
+        self._metric_cell(metrics, 2, 1, "Camera depth", self.contact_depth_camera_var)
+        self._metric_cell(metrics, 2, 2, "Stepper pos", self.stepper_position_var)
+        self._metric_cell(metrics, 2, 3, "Contact gate", self.contact_gate_var, pad_right=0)
+        self._metric_cell(metrics, 3, 0, "Contact peak", self.contact_peak_var)
+        self._metric_cell(metrics, 3, 1, "Contact area", self.contact_area_var)
+        self._metric_cell(metrics, 3, 2, "Contact center", self.contact_center_var)
+        self._metric_cell(metrics, 3, 3, "Object force", self.contact_force_var, pad_right=0)
+        self._metric_cell(metrics, 4, 0, "Residual", self.contact_residual_var)
+        self._metric_cell(metrics, 4, 1, "Measure mode", self.surface_measurement_mode_var)
 
-        control_card = ttk.LabelFrame(card, text="Detection Command Deck", padding=8)
-        control_card.grid(row=4, column=0, sticky="ew")
+        control_card = ttk.LabelFrame(side_panel, text="Detection Command Deck", padding=8)
+        control_card.grid(row=2, column=0, sticky="ew")
         for col in range(4):
             control_card.columnconfigure(col, weight=1)
 
@@ -869,8 +770,21 @@ class MissionControlGUI(AllInOneTesterGUI):
             row=3, column=3, sticky="ew"
         )
 
+        ttk.Label(control_card, text="Vision backend").grid(row=4, column=0, sticky="w", pady=(4, 0))
+        ttk.Combobox(
+            control_card,
+            textvariable=self.vision_backend_var,
+            values=("local", "remote CUDA"),
+            state="readonly",
+        ).grid(row=5, column=0, sticky="ew", padx=(0, 6))
+
+        ttk.Label(control_card, text="Remote URL").grid(row=4, column=1, sticky="w", pady=(4, 0))
+        ttk.Entry(control_card, textvariable=self.remote_vision_url_var).grid(
+            row=5, column=1, columnspan=3, sticky="ew"
+        )
+
         toggles = ttk.Frame(control_card, style="Surface.TFrame")
-        toggles.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(4, 0))
+        toggles.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(4, 0))
         ttk.Checkbutton(toggles, text="Use ROI", variable=self.blob_use_roi_var).grid(row=0, column=0, sticky="w")
         ttk.Checkbutton(toggles, text="Point Cloud", variable=self.blob_use_pointcloud_var).grid(row=0, column=1, sticky="w", padx=(8, 0))
         ttk.Checkbutton(toggles, text="Mosaic", variable=self.blob_use_mosaic_var).grid(row=0, column=2, sticky="w", padx=(8, 0))
@@ -881,13 +795,13 @@ class MissionControlGUI(AllInOneTesterGUI):
         ).grid(row=0, column=3, sticky="w", padx=(8, 0))
 
         blob_message_label = ttk.Label(
-            card,
+            side_panel,
             textvariable=self.blob_message_var,
             style="SectionHint.TLabel",
             wraplength=920,
             justify="left",
         )
-        blob_message_label.grid(row=5, column=0, sticky="w", pady=(4, 0))
+        blob_message_label.grid(row=3, column=0, sticky="w", pady=(4, 0))
         self._bind_dynamic_wrap(blob_message_label, margin=18, min_wrap=320)
 
         self._set_blob_controls(False)
@@ -982,6 +896,9 @@ class MissionControlGUI(AllInOneTesterGUI):
         self._status_line(summary, 2, "Frame time", self.blob_latency_var)
         self._status_line(summary, 3, "Track health", self.blob_missing_ratio_var)
         self._status_line(summary, 4, "Estimated force", self.force_estimate_var)
+        self._status_line(summary, 5, "Stepper depth", self.contact_depth_stepper_var)
+        self._status_line(summary, 6, "Camera depth", self.contact_depth_camera_var)
+        self._status_line(summary, 7, "Contact gate", self.contact_gate_var)
 
         notes = ttk.LabelFrame(tab, text="Run Notes", padding=8)
         notes.grid(row=1, column=0, sticky="ew", pady=(4, 0))
@@ -1062,12 +979,21 @@ class MissionControlGUI(AllInOneTesterGUI):
         load.grid(row=2, column=0, columnspan=2, sticky="nsew")
         load.columnconfigure(1, weight=1)
         load.columnconfigure(3, weight=1)
+        load.columnconfigure(4, weight=1)
+        load.columnconfigure(5, weight=1)
+        load.columnconfigure(6, weight=1)
         ttk.Label(load, text="Known weight (g)").grid(row=0, column=0, sticky="w")
         ttk.Entry(load, textvariable=self.loadcell_known_weight_var).grid(row=0, column=1, sticky="ew", padx=(0, 6))
         self.loadcell_start_btn = ttk.Button(load, text="Start", command=self.start_loadcell_read)
         self.loadcell_start_btn.grid(row=0, column=2, sticky="ew", padx=(0, 6))
         self.loadcell_stop_btn = ttk.Button(load, text="Stop", command=self.stop_loadcell_read)
-        self.loadcell_stop_btn.grid(row=0, column=3, sticky="ew")
+        self.loadcell_stop_btn.grid(row=0, column=3, sticky="ew", padx=(0, 6))
+        self.loadcell_zero_btn = ttk.Button(load, text="Zero Load", command=self.zero_loadcell_live)
+        self.loadcell_zero_btn.grid(row=0, column=4, sticky="ew", padx=(0, 6))
+        self.loadcell_calibrate_btn = ttk.Button(load, text="Cal Load", command=self.calibrate_loadcell)
+        self.loadcell_calibrate_btn.grid(row=0, column=5, sticky="ew", padx=(0, 6))
+        self.loadcell_reset_btn = ttk.Button(load, text="Reset Load", command=self.reset_loadcell_calibration)
+        self.loadcell_reset_btn.grid(row=0, column=6, sticky="ew")
         self._status_line(load, 1, "State", self.loadcell_state_var)
         self._status_line(load, 2, "Weight", self.loadcell_weight_var)
 
@@ -1159,9 +1085,72 @@ class MissionControlGUI(AllInOneTesterGUI):
         self.force_loadcell_start_btn.grid(row=4, column=0, sticky="ew", pady=(4, 0), padx=(0, 6))
         self.force_loadcell_stop_btn = ttk.Button(sensor, text="Stop", command=self.stop_loadcell_read)
         self.force_loadcell_stop_btn.grid(row=4, column=1, sticky="ew", pady=(4, 0))
+        self.force_loadcell_zero_btn = ttk.Button(
+            sensor,
+            text="Zero Load",
+            command=self.zero_loadcell_live,
+        )
+        self.force_loadcell_zero_btn.grid(
+            row=5,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            pady=(4, 0),
+        )
+        self.force_loadcell_calibrate_btn = ttk.Button(
+            sensor,
+            text="Cal Load",
+            command=self.calibrate_loadcell,
+        )
+        self.force_loadcell_calibrate_btn.grid(
+            row=6,
+            column=0,
+            sticky="ew",
+            pady=(4, 0),
+            padx=(0, 6),
+        )
+        self.force_loadcell_reset_btn = ttk.Button(
+            sensor,
+            text="Reset Load",
+            command=self.reset_loadcell_calibration,
+        )
+        self.force_loadcell_reset_btn.grid(
+            row=6,
+            column=1,
+            sticky="ew",
+            pady=(4, 0),
+        )
+
+        ttk.Label(sensor, text="Shape label").grid(row=7, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(sensor, textvariable=self.force_cycle_shape_var).grid(
+            row=7,
+            column=1,
+            sticky="ew",
+            pady=(8, 0),
+        )
+
+        ttk.Label(sensor, text="Report samples").grid(row=8, column=0, sticky="w", pady=(8, 0))
+        report_controls = ttk.Frame(sensor, style="Surface.TFrame")
+        report_controls.grid(row=8, column=1, sticky="ew", pady=(8, 0))
+        report_controls.columnconfigure(0, weight=1)
+        report_controls.columnconfigure(1, weight=1)
+        ttk.Combobox(
+            report_controls,
+            textvariable=self.force_cycle_report_sample_count_var,
+            values=("all", "10", "25", "50"),
+            state="readonly",
+            width=7,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ttk.Combobox(
+            report_controls,
+            textvariable=self.force_cycle_trial_var,
+            values=("1", "2", "3"),
+            state="readonly",
+            width=5,
+        ).grid(row=0, column=1, sticky="ew")
 
         both = ttk.Frame(sensor, style="Surface.TFrame")
-        both.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        both.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         both.columnconfigure(0, weight=1)
         both.columnconfigure(1, weight=1)
         ttk.Button(both, text="Start Both", style="Accent.TButton", command=self.start_force_measurement).grid(
@@ -1175,6 +1164,24 @@ class MissionControlGUI(AllInOneTesterGUI):
             column=1,
             sticky="ew",
         )
+
+        cycle = ttk.Frame(sensor, style="Surface.TFrame")
+        cycle.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        cycle.columnconfigure(0, weight=1)
+        cycle.columnconfigure(1, weight=1)
+        self.force_cycle_sensor_start_btn = ttk.Button(
+            cycle,
+            text="Run Force Cycle",
+            style="Accent.TButton",
+            command=self.start_force_cycle,
+        )
+        self.force_cycle_sensor_start_btn.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self.force_cycle_sensor_stop_btn = ttk.Button(
+            cycle,
+            text="Stop Cycle",
+            command=self.stop_force_cycle,
+        )
+        self.force_cycle_sensor_stop_btn.grid(row=0, column=1, sticky="ew")
 
         calibration = ttk.LabelFrame(tab, text="Pressure To Force Calibration", padding=8)
         calibration.grid(row=2, column=0, sticky="ew", pady=(6, 0))
@@ -1216,6 +1223,21 @@ class MissionControlGUI(AllInOneTesterGUI):
                 self.force_loadcell_stop_btn,
                 running,
             )
+        if hasattr(self, "force_loadcell_calibrate_btn"):
+            self._set_button_enabled(self.force_loadcell_calibrate_btn, not running)
+        if hasattr(self, "force_loadcell_reset_btn"):
+            self._set_button_enabled(self.force_loadcell_reset_btn, not running)
+        if hasattr(self, "force_loadcell_zero_btn"):
+            self._set_button_enabled(self.force_loadcell_zero_btn, running)
+
+    def _set_force_cycle_controls(self, running):
+        super()._set_force_cycle_controls(running)
+        if hasattr(self, "force_cycle_sensor_start_btn"):
+            self._set_start_stop_controls(
+                self.force_cycle_sensor_start_btn,
+                self.force_cycle_sensor_stop_btn,
+                running,
+            )
 
     def _build_system_tests_tab(self, tab):
         tab.columnconfigure(0, weight=1)
@@ -1251,13 +1273,7 @@ class MissionControlGUI(AllInOneTesterGUI):
             self.limit_monitor_state_var,
             (("Start", self.start_limit_monitor), ("Stop", self.stop_limit_monitor)),
         )
-        self._test_row(
-            hardware,
-            1,
-            "Stepper",
-            self.stepper_state_var,
-            (("Move", self.start_stepper_move), ("Stop", self.stop_stepper_move)),
-        )
+        self._stepper_test_row(hardware, 1)
         self._test_row(
             hardware,
             2,
@@ -1282,6 +1298,8 @@ class MissionControlGUI(AllInOneTesterGUI):
         self._status_line(readout, 2, "Load cell", self.loadcell_weight_var)
         self._status_line(readout, 3, f"Limit GPIO{LIMIT_1_PIN}", self.limit1_status_var)
         self._status_line(readout, 4, f"Limit GPIO{LIMIT_2_PIN}", self.limit2_status_var)
+        self._status_line(readout, 5, "Stepper pos", self.stepper_position_var)
+        self._status_line(readout, 6, "Stepper depth", self.contact_depth_stepper_var)
 
         ttk.Button(
             tab,
@@ -1316,6 +1334,58 @@ class MissionControlGUI(AllInOneTesterGUI):
                 sticky="ew",
                 padx=(0 if idx == 0 else 5, 0),
             )
+
+    def _stepper_test_row(self, parent, row):
+        row_frame = ttk.Frame(parent, padding=6, style="Panel.TFrame")
+        row_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(0 if row == 0 else 5, 0))
+        row_frame.columnconfigure(0, weight=1)
+
+        header = ttk.Frame(row_frame, style="Panel.TFrame")
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(1, weight=1)
+        ttk.Label(header, text="Stepper", style="MetricLabel.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(header, textvariable=self.stepper_state_var, style="MetricValue.TLabel").grid(
+            row=0,
+            column=1,
+            sticky="e",
+            padx=(8, 0),
+        )
+
+        settings = ttk.Frame(row_frame, style="Panel.TFrame")
+        settings.grid(row=1, column=0, sticky="ew", pady=(5, 0))
+        settings.columnconfigure(1, weight=1)
+        settings.columnconfigure(3, weight=1)
+        ttk.Label(settings, text="Direction", style="MetricLabel.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(
+            settings,
+            textvariable=self.stepper_direction_var,
+            values=("up", "down"),
+            state="readonly",
+            width=8,
+        ).grid(row=0, column=1, sticky="ew", padx=(5, 10))
+        ttk.Label(settings, text="Seconds", style="MetricLabel.TLabel").grid(row=0, column=2, sticky="w")
+        ttk.Entry(settings, textvariable=self.stepper_seconds_var, width=8).grid(
+            row=0,
+            column=3,
+            sticky="ew",
+            padx=(5, 0),
+        )
+
+        buttons = ttk.Frame(row_frame, style="Panel.TFrame")
+        buttons.grid(row=2, column=0, sticky="ew", pady=(5, 0))
+        for idx in range(2):
+            buttons.columnconfigure(idx, weight=1)
+        self.stepper_test_start_btn = ttk.Button(buttons, text="Move", command=self.start_stepper_move)
+        self.stepper_test_start_btn.grid(row=0, column=0, sticky="ew")
+        self.stepper_test_stop_btn = ttk.Button(buttons, text="Stop", command=self.stop_stepper_move)
+        self.stepper_test_stop_btn.grid(row=0, column=1, sticky="ew", padx=(5, 0))
+
+        self._set_stepper_controls(self._is_thread_running(self.stepper_thread))
+
+    def _set_stepper_controls(self, running):
+        super()._set_stepper_controls(running)
+        self._set_button_enabled(getattr(self, "stepper_test_start_btn", None), not running)
+        self._set_button_enabled(getattr(self, "stepper_test_stop_btn", None), running)
 
     def _build_flow_tab(self, tab):
         tab.columnconfigure(0, weight=1)
