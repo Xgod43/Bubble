@@ -145,6 +145,30 @@ class MissionControlGUI(AllInOneTesterGUI):
         style.map("Accent.TButton", background=[("active", "#84e2ff")])
         style.configure("Danger.TButton", background=COLOR_DANGER, foreground="#ffffff")
         style.map("Danger.TButton", background=[("active", "#d47373")])
+        style.configure(
+            "StepperDir.TButton",
+            padding=(7, 4),
+            background=COLOR_PANEL,
+            foreground=COLOR_TEXT_BRIGHT,
+            bordercolor=COLOR_BORDER_DARK,
+        )
+        style.map(
+            "StepperDir.TButton",
+            background=[("active", "#193248"), ("disabled", "#1b2732")],
+            foreground=[("disabled", "#6d8191")],
+        )
+        style.configure(
+            "StepperDirActive.TButton",
+            padding=(7, 4),
+            background=COLOR_ACCENT,
+            foreground="#071018",
+            bordercolor=COLOR_ACCENT,
+        )
+        style.map(
+            "StepperDirActive.TButton",
+            background=[("active", "#84e2ff"), ("disabled", "#2f7d94")],
+            foreground=[("disabled", "#d9f6ff")],
+        )
 
         style.configure(
             "TLabelframe",
@@ -738,7 +762,18 @@ class MissionControlGUI(AllInOneTesterGUI):
         ttk.Combobox(
             control_card,
             textvariable=self.blob_view_type_var,
-            values=("overlay", "auto", "mosaic", "vector", "heatmap", "binary", "blob", "optical_flow_2d", "surface_3d"),
+            values=(
+                "overlay",
+                "auto",
+                "mosaic",
+                "vector",
+                "heatmap",
+                "binary",
+                "blob",
+                "optical_flow_2d",
+                "surface_2d",
+                "surface_3d",
+            ),
             state="readonly",
         ).grid(row=1, column=2, sticky="ew", padx=(0, 6))
 
@@ -954,8 +989,13 @@ class MissionControlGUI(AllInOneTesterGUI):
         stepper.columnconfigure(1, weight=1)
         stepper.columnconfigure(3, weight=1)
         ttk.Label(stepper, text="Direction").grid(row=0, column=0, sticky="w")
-        ttk.Combobox(stepper, textvariable=self.stepper_direction_var, values=("up", "down"), state="readonly").grid(
-            row=0, column=1, sticky="ew", padx=(0, 6)
+        self._build_stepper_direction_buttons(
+            stepper,
+            row=0,
+            column=1,
+            sticky="ew",
+            padx=(0, 6),
+            frame_style="Surface.TFrame",
         )
         ttk.Label(stepper, text="Seconds").grid(row=0, column=2, sticky="w")
         ttk.Entry(stepper, textvariable=self.stepper_seconds_var).grid(row=0, column=3, sticky="ew")
@@ -1129,17 +1169,9 @@ class MissionControlGUI(AllInOneTesterGUI):
             pady=(8, 0),
         )
 
-        ttk.Label(sensor, text="Target depth").grid(row=8, column=0, sticky="w", pady=(8, 0))
-        ttk.Combobox(
-            sensor,
-            textvariable=self.force_cycle_depth_target_var,
-            values=("-2.5", "-5.0", "-7.5", "-10.0", "limit"),
-            width=8,
-        ).grid(row=8, column=1, sticky="ew", pady=(8, 0))
-
-        ttk.Label(sensor, text="Report samples").grid(row=9, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(sensor, text="Report samples").grid(row=8, column=0, sticky="w", pady=(8, 0))
         report_controls = ttk.Frame(sensor, style="Surface.TFrame")
-        report_controls.grid(row=9, column=1, sticky="ew", pady=(8, 0))
+        report_controls.grid(row=8, column=1, sticky="ew", pady=(8, 0))
         report_controls.columnconfigure(0, weight=1)
         report_controls.columnconfigure(1, weight=1)
         ttk.Combobox(
@@ -1158,7 +1190,7 @@ class MissionControlGUI(AllInOneTesterGUI):
         ).grid(row=0, column=1, sticky="ew")
 
         both = ttk.Frame(sensor, style="Surface.TFrame")
-        both.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        both.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         both.columnconfigure(0, weight=1)
         both.columnconfigure(1, weight=1)
         ttk.Button(both, text="Start Both", style="Accent.TButton", command=self.start_force_measurement).grid(
@@ -1364,13 +1396,14 @@ class MissionControlGUI(AllInOneTesterGUI):
         settings.columnconfigure(1, weight=1)
         settings.columnconfigure(3, weight=1)
         ttk.Label(settings, text="Direction", style="MetricLabel.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Combobox(
+        self._build_stepper_direction_buttons(
             settings,
-            textvariable=self.stepper_direction_var,
-            values=("up", "down"),
-            state="readonly",
-            width=8,
-        ).grid(row=0, column=1, sticky="ew", padx=(5, 10))
+            row=0,
+            column=1,
+            sticky="ew",
+            padx=(5, 10),
+            frame_style="Panel.TFrame",
+        )
         ttk.Label(settings, text="Seconds", style="MetricLabel.TLabel").grid(row=0, column=2, sticky="w")
         ttk.Entry(settings, textvariable=self.stepper_seconds_var, width=8).grid(
             row=0,

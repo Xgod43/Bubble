@@ -26,14 +26,6 @@ SYNC_PAIRS = [
     ("native/build_pi.sh", "single_folder_runtime/native/build_pi.sh"),
     ("native/limit_reader.c", "single_folder_runtime/native/limit_reader.c"),
     ("native/stepper_runner.c", "single_folder_runtime/native/stepper_runner.c"),
-    ("nextjs-gui/lib/app-bridge.ts", "single_folder_runtime/nextjs-gui/lib/app-bridge.ts"),
-    ("nextjs-gui/lib/contracts.ts", "single_folder_runtime/nextjs-gui/lib/contracts.ts"),
-    ("nextjs-gui/lib/mock-data.ts", "single_folder_runtime/nextjs-gui/lib/mock-data.ts"),
-    ("nextjs-gui/components/dashboard-shell.tsx", "single_folder_runtime/nextjs-gui/components/dashboard-shell.tsx"),
-    ("nextjs-gui/components/status-pill.tsx", "single_folder_runtime/nextjs-gui/components/status-pill.tsx"),
-    ("nextjs-gui/app/page.tsx", "single_folder_runtime/nextjs-gui/app/page.tsx"),
-    ("nextjs-gui/app/layout.tsx", "single_folder_runtime/nextjs-gui/app/layout.tsx"),
-    ("nextjs-gui/app/globals.css", "single_folder_runtime/nextjs-gui/app/globals.css"),
 ]
 
 

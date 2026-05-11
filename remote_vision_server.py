@@ -21,7 +21,9 @@ if str(ROOT_DIR) not in sys.path:
 from JNR import dot_pipeline as pipe
 from tactile_contact_pipeline import (
     TactileContactConfig,
+    build_object_contact_map,
     build_tactile_contact_frame,
+    shape_from_contact_map,
     summarize_contact_map,
     surface_from_contact_map,
 )
@@ -52,9 +54,11 @@ class RemoteVisionState:
         self.surface_height_ema = None
         self.surface_contact_baseline = None
         self.surface_contact_display_ema = None
+        self.surface_gray_baseline = None
         self.surface_zero_ready = False
         self.surface_zero_pending = False
         self.surface_zero_samples = []
+        self.surface_zero_gray_samples = []
         self.surface_history = []
         self.frame_count = 0
         self.started_at = time.perf_counter()
@@ -75,9 +79,11 @@ class RemoteVisionState:
         self.surface_height_ema = None
         self.surface_contact_baseline = None
         self.surface_contact_display_ema = None
+        self.surface_gray_baseline = None
         self.surface_zero_ready = False
         self.surface_zero_pending = False
         self.surface_zero_samples = []
+        self.surface_zero_gray_samples = []
         self.surface_history = []
 
 
@@ -401,6 +407,125 @@ def _build_surface_render(gray_frame, height_map, roi_mask=None, history=None):
     return output
 
 
+def _build_surface_2d_render(gray_frame, contact_map, roi_mask=None, history=None, title="2D contact pressure map"):
+    out_h, out_w = gray_frame.shape[:2]
+    show_graph = history is not None
+    graph_h = max(72, min(128, int(out_h * 0.18))) if show_graph and out_h > 220 else 0
+    camera_h = max(96, int(out_h * (0.42 if show_graph else 0.58)))
+    min_plot_h = max(72, int(out_h * (0.26 if show_graph else 0.18)))
+    if camera_h + graph_h + min_plot_h > out_h:
+        camera_h = max(1, out_h - graph_h - min_plot_h)
+    camera_h = min(camera_h, max(1, out_h - graph_h - 1))
+    plot_h = max(1, out_h - camera_h - graph_h)
+
+    camera_canvas = cv2.cvtColor(gray_frame, cv2.COLOR_GRAY2BGR)
+    camera_canvas = cv2.convertScaleAbs(camera_canvas, alpha=0.78, beta=0)
+    camera_view = cv2.resize(camera_canvas, (out_w, camera_h), interpolation=cv2.INTER_AREA)
+
+    output = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+    output[:camera_h, :, :] = camera_view
+    cv2.line(output, (0, camera_h - 1), (out_w - 1, camera_h - 1), (45, 73, 96), 1)
+
+    plot_canvas = np.zeros((plot_h, out_w, 3), dtype=np.uint8)
+    plot_canvas[:, :, :] = (4, 8, 12)
+    graph_canvas = _draw_surface_history_graph(out_w, graph_h, history) if graph_h > 0 else None
+
+    if contact_map is None or contact_map.size == 0:
+        output[camera_h:camera_h + plot_h, :, :] = plot_canvas
+        if graph_canvas is not None:
+            output[camera_h + plot_h:, :, :] = graph_canvas
+        return output
+
+    contact_work = np.clip(contact_map.astype(np.float32), 0.0, 1.0)
+    if roi_mask is not None:
+        roi_binary = roi_mask.astype(bool)
+        contact_work = np.where(roi_binary, contact_work, 0.0)
+    else:
+        roi_binary = None
+
+    contact = cv2.resize(contact_work, (out_w, plot_h), interpolation=cv2.INTER_AREA).astype(np.float32)
+    plot_roi_binary = None
+    if roi_binary is not None:
+        plot_roi_binary = cv2.resize(
+            roi_binary.astype(np.uint8),
+            (out_w, plot_h),
+            interpolation=cv2.INTER_NEAREST,
+        ).astype(bool)
+
+    contact = cv2.GaussianBlur(contact, (0, 0), sigmaX=0.8, sigmaY=0.8)
+    contact = np.clip(contact, 0.0, 1.0)
+    contact_vis = np.power(np.clip(contact * 1.18, 0.0, 1.0), 0.72)
+    heatmap = cv2.applyColorMap((contact_vis * 255.0).astype(np.uint8), cv2.COLORMAP_JET)
+
+    if plot_roi_binary is not None:
+        soft_mask = cv2.GaussianBlur(plot_roi_binary.astype(np.float32), (0, 0), sigmaX=1.8, sigmaY=1.8)
+        alpha = np.clip(soft_mask, 0.0, 1.0)[..., None]
+        plot_canvas = np.clip(
+            (plot_canvas.astype(np.float32) * (1.0 - alpha)) + (heatmap.astype(np.float32) * alpha),
+            0,
+            255,
+        ).astype(np.uint8)
+        contour_mask = plot_roi_binary.astype(np.uint8) * 255
+        contours, _ = cv2.findContours(contour_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(plot_canvas, contours, -1, (170, 210, 220), 1, lineType=cv2.LINE_AA)
+    else:
+        plot_canvas = heatmap
+
+    active_mask = contact > 0.04
+    if plot_roi_binary is not None:
+        active_mask &= plot_roi_binary
+    for level, color in (
+        (0.20, (255, 255, 255)),
+        (0.45, (80, 255, 255)),
+        (0.70, (0, 190, 255)),
+    ):
+        level_mask = (contact >= level).astype(np.uint8) * 255
+        if plot_roi_binary is not None:
+            level_mask = cv2.bitwise_and(level_mask, plot_roi_binary.astype(np.uint8) * 255)
+        contours, _ = cv2.findContours(level_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(plot_canvas, contours, -1, color, 1, lineType=cv2.LINE_AA)
+
+    if np.any(active_mask):
+        _min_val, max_val, _min_loc, max_loc = cv2.minMaxLoc(contact)
+        if max_val > 0.04:
+            cv2.drawMarker(
+                plot_canvas,
+                max_loc,
+                (255, 255, 255),
+                markerType=cv2.MARKER_CROSS,
+                markerSize=14,
+                thickness=1,
+                line_type=cv2.LINE_AA,
+            )
+    else:
+        cv2.putText(
+            plot_canvas,
+            "waiting for contact map",
+            (12, 44),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            (130, 170, 186),
+            1,
+            cv2.LINE_AA,
+        )
+
+    cv2.putText(
+        plot_canvas,
+        title,
+        (12, 22),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.48,
+        (255, 230, 80),
+        1,
+        cv2.LINE_AA,
+    )
+    output[camera_h:camera_h + plot_h, :, :] = plot_canvas
+    if graph_canvas is not None:
+        cv2.line(output, (0, camera_h + plot_h - 1), (out_w - 1, camera_h + plot_h - 1), (45, 73, 96), 1)
+        output[camera_h + plot_h:, :, :] = graph_canvas
+    return output
+
+
 def _query_float(query, name, default):
     try:
         return float(query.get(name, [default])[0])
@@ -447,6 +572,9 @@ def _surface_payload_from_stats(stats):
 
 def _process_surface_preview(frame_bgr, reference, displacements, query):
     reset_zero = _query_bool(query, "surface_reset", False)
+    view_type = str(query.get("view", ["surface_3d"])[0]).strip().lower()
+    measurement_mode = str(query.get("measurement_mode", ["flat_deform"])[0]).strip().lower()
+    object_mode = measurement_mode == "3d_object"
     config = _surface_config(query)
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     frame = build_tactile_contact_frame(
@@ -462,12 +590,17 @@ def _process_surface_preview(frame_bgr, reference, displacements, query):
         STATE.surface_zero_pending = True
         STATE.surface_zero_ready = False
         STATE.surface_zero_samples = []
+        STATE.surface_zero_gray_samples = []
         STATE.surface_contact_baseline = None
         STATE.surface_contact_display_ema = None
+        STATE.surface_gray_baseline = None
         STATE.surface_history = []
 
     if frame is None:
-        preview = _build_surface_render(gray, None, history=STATE.surface_history)
+        if view_type == "surface_2d":
+            preview = _build_surface_2d_render(gray, None, history=STATE.surface_history)
+        else:
+            preview = _build_surface_render(gray, None, history=STATE.surface_history)
         return {
             "preview": preview,
             "payload": {
@@ -491,13 +624,19 @@ def _process_surface_preview(frame_bgr, reference, displacements, query):
 
     if STATE.surface_zero_pending:
         STATE.surface_zero_samples.append(raw_contact_map.copy())
+        STATE.surface_zero_gray_samples.append(gray.astype(np.float32).copy())
         if len(STATE.surface_zero_samples) >= CONTACT_ZERO_SAMPLE_COUNT:
             STATE.surface_contact_baseline = np.median(
                 np.stack(STATE.surface_zero_samples[-CONTACT_ZERO_SAMPLE_COUNT:], axis=0),
                 axis=0,
             ).astype(np.float32)
+            STATE.surface_gray_baseline = np.median(
+                np.stack(STATE.surface_zero_gray_samples[-CONTACT_ZERO_SAMPLE_COUNT:], axis=0),
+                axis=0,
+            ).astype(np.float32)
             STATE.surface_contact_display_ema = np.zeros_like(raw_contact_map, dtype=np.float32)
             STATE.surface_zero_samples = []
+            STATE.surface_zero_gray_samples = []
             STATE.surface_zero_pending = False
             STATE.surface_zero_ready = True
         contact_map_for_display = np.zeros_like(raw_contact_map, dtype=np.float32)
@@ -527,17 +666,42 @@ def _process_surface_preview(frame_bgr, reference, displacements, query):
     else:
         contact_map_for_display = np.zeros_like(raw_contact_map, dtype=np.float32)
 
-    height_map = surface_from_contact_map(
-        contact_map_for_display,
-        base_map,
-        ellipse_mask,
-        config,
-        cv2=cv2,
-    )
-    deformation_map = np.clip(base_map.astype(np.float32) - height_map.astype(np.float32), 0.0, 1.0)
-    deformation_map = np.where(ellipse_mask, deformation_map, 0.0).astype(np.float32)
+    render_contact_map = contact_map_for_display
+    stats_contact_map = contact_map_for_display
+    surface_title = "2D contact pressure map"
+    if object_mode:
+        footprint_map = build_object_contact_map(
+            contact_map_for_display,
+            gray,
+            STATE.surface_gray_baseline,
+            ellipse_mask=ellipse_mask,
+            cv2=cv2,
+        )
+        if footprint_map is None:
+            footprint_map = shape_from_contact_map(
+                contact_map_for_display,
+                ellipse_mask=ellipse_mask,
+                cv2=cv2,
+            )
+        if footprint_map is not None and footprint_map.shape == contact_map_for_display.shape:
+            render_contact_map = footprint_map.astype(np.float32)
+            stats_contact_map = render_contact_map
+            surface_title = "2D contact footprint map"
+
+    if view_type == "surface_2d":
+        deformation_map = None
+    else:
+        height_map = surface_from_contact_map(
+            render_contact_map,
+            base_map,
+            ellipse_mask,
+            config,
+            cv2=cv2,
+        )
+        deformation_map = np.clip(base_map.astype(np.float32) - height_map.astype(np.float32), 0.0, 1.0)
+        deformation_map = np.where(ellipse_mask, deformation_map, 0.0).astype(np.float32)
     stats = summarize_contact_map(
-        contact_map_for_display,
+        stats_contact_map,
         ellipse_mask,
         config.contact_area_threshold,
     )
@@ -548,7 +712,16 @@ def _process_surface_preview(frame_bgr, reference, displacements, query):
     if len(STATE.surface_history) > 180:
         del STATE.surface_history[:-180]
 
-    preview = _build_surface_render(gray, deformation_map, roi_mask=ellipse_mask, history=STATE.surface_history)
+    if view_type == "surface_2d":
+        preview = _build_surface_2d_render(
+            gray,
+            render_contact_map,
+            roi_mask=ellipse_mask,
+            history=STATE.surface_history,
+            title=surface_title,
+        )
+    else:
+        preview = _build_surface_render(gray, deformation_map, roi_mask=ellipse_mask, history=STATE.surface_history)
     if STATE.surface_zero_pending:
         status = f"Remote contact zeroing {len(STATE.surface_zero_samples)}/{CONTACT_ZERO_SAMPLE_COUNT}..."
     elif STATE.surface_zero_ready:
@@ -691,7 +864,7 @@ def _process_frame(frame_bgr, query):
         ]
 
     if include_preview:
-        if view_type in {"surface_3d", "optical_flow_3d"}:
+        if view_type in {"surface_2d", "surface_3d", "optical_flow_3d"}:
             surface_result = _process_surface_preview(frame_bgr, reference, displacements, query)
             payload.update(surface_result["payload"])
             preview_bgr = surface_result["preview"]

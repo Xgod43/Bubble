@@ -59,15 +59,6 @@ chmod +x build_pi.sh
 cd ..
 ```
 
-Static web UI export, only needed for the pywebview desktop shell path:
-
-```bash
-cd nextjs-gui
-npm install
-npm run build
-cd ..
-```
-
 ## Hardware Test Order
 
 1. Open GUI only.
@@ -84,5 +75,4 @@ cd ..
 - Stepper pulses are generated from Python timing. It is acceptable for a first functional test, but jitter should be measured before production use.
 - If `native/build/stepper_runner` exists, stepper pulse generation uses the native C runner through libgpiod. Without it, the GUI falls back to Python timing.
 - Pressure sensor support needs `adafruit-blinka` and `adafruit-circuitpython-mprls` from the pip requirements file.
-- The desktop/Next.js stack uses `backend` dataclasses that need Python 3.10 or newer; Bookworm's Python 3.11 is fine.
 - Re-calibrate if the gripper, tubing, sensor mounting, or load-cell setup changes.

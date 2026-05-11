@@ -1,9 +1,0 @@
-[Desktop Entry]
-Version=1.0
-Type=Application
-Name=Pi Bubble Mission Control
-Comment=Soft gripper bubble console
-Exec=python3 /home/pi/Pi-bubble/main.py
-Path=/home/pi/Pi-bubble
-Terminal=false
-Categories=Utility;Engineering;

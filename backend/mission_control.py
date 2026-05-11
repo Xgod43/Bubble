@@ -227,7 +227,7 @@ class MissionControlState:
             TimelineEvent(
                 time=self._format_time(now.timestamp() - 85),
                 title="Console synced",
-                detail="The local app shell is feeding the Next.js interface through a direct bridge.",
+                detail="The local Python console is feeding the mission-control state bridge.",
                 tone="positive",
             ),
             TimelineEvent(

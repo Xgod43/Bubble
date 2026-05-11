@@ -22,8 +22,10 @@ from surface_measurement import (
     measure_contact_deformation_mm,
 )
 from tactile_contact_pipeline import (
+    build_object_contact_map,
     TactileContactConfig,
     build_tactile_contact_frame,
+    shape_from_contact_map,
     summarize_contact_map,
     surface_from_contact_map,
 )
@@ -95,6 +97,15 @@ REMOTE_VISION_TRANSPORT = os.environ.get("BUBBLE_REMOTE_VISION_TRANSPORT", "raw"
 REMOTE_VISION_RAW_FORMAT = os.environ.get("BUBBLE_REMOTE_VISION_RAW_FORMAT", "bgr24").strip().lower()
 REMOTE_VISION_PREVIEW_MAX_WIDTH = int(os.environ.get("BUBBLE_REMOTE_VISION_PREVIEW_MAX_WIDTH", "480"))
 REMOTE_VISION_SURFACE_PROCESS_WIDTH = int(os.environ.get("BUBBLE_REMOTE_SURFACE_PROCESS_WIDTH", "320"))
+GUI_PREVIEW_MAX_WIDTH = int(os.environ.get("BUBBLE_GUI_PREVIEW_MAX_WIDTH", "720"))
+GUI_PREVIEW_MAX_HEIGHT = int(os.environ.get("BUBBLE_GUI_PREVIEW_MAX_HEIGHT", "540"))
+GUI_PREVIEW_TARGET_FPS = float(os.environ.get("BUBBLE_GUI_PREVIEW_TARGET_FPS", "12.0"))
+CPU_PARALLEL_WORKERS = int(
+    os.environ.get(
+        "BUBBLE_CPU_PARALLEL_WORKERS",
+        str(max(1, min(4, (os.cpu_count() or 2) - 1))),
+    )
+)
 REMOTE_VISION_POINTS_ENABLED = os.environ.get("BUBBLE_REMOTE_VISION_POINTS", "0").strip().lower() in {
     "1",
     "true",
@@ -254,6 +265,9 @@ class AllInOneTesterGUI:
         self._configure_styles()
 
         self.log_queue = queue.Queue()
+        self._tk_var_update_lock = threading.Lock()
+        self._tk_var_update_pending = {}
+        self._cv2_parallel_configured = False
         self.gpio_ready = GPIO is not None
 
         self.camera = None
@@ -355,9 +369,9 @@ class AllInOneTesterGUI:
         self.flow_reseed_var = tk.StringVar(value="90")
         self.flow_show_vectors_var = tk.BooleanVar(value=True)
 
-        self.surface_gain_var = tk.StringVar(value="1.0")
-        self.surface_smooth_var = tk.StringVar(value="1.4")
-        self.surface_grid_var = tk.StringVar(value="52")
+        self.surface_gain_var = tk.StringVar(value="1.4")
+        self.surface_smooth_var = tk.StringVar(value="0.8")
+        self.surface_grid_var = tk.StringVar(value="56")
         self.surface_status_var = tk.StringVar(
             value="Contact deform zero pending. Press Reset Zero."
         )
@@ -369,6 +383,7 @@ class AllInOneTesterGUI:
         self.surface_tactile_frame = None
         self.surface_contact_baseline = None
         self.surface_contact_display_ema = None
+        self.surface_gray_baseline = None
         self.surface_measurement_mode = "flat_deform"
         self.surface_measurement_mode_var = tk.StringVar(value="Flat Deform")
         self.contact_peak_var = tk.StringVar(value="-")
@@ -440,6 +455,30 @@ class AllInOneTesterGUI:
 
         style.configure("Danger.TButton", background="#a34b2a", foreground="#ffffff")
         style.map("Danger.TButton", background=[("active", "#8d3f23")])
+        style.configure(
+            "StepperDir.TButton",
+            padding=(8, 4),
+            background=COLOR_PANEL,
+            foreground=COLOR_TEXT,
+            bordercolor=COLOR_BORDER,
+        )
+        style.map(
+            "StepperDir.TButton",
+            background=[("active", COLOR_ACCENT_SOFT), ("disabled", "#edf1f2")],
+            foreground=[("disabled", "#7d8a8d")],
+        )
+        style.configure(
+            "StepperDirActive.TButton",
+            padding=(8, 4),
+            background=COLOR_ACCENT,
+            foreground="#ffffff",
+            bordercolor=COLOR_ACCENT,
+        )
+        style.map(
+            "StepperDirActive.TButton",
+            background=[("active", "#0a5f5a"), ("disabled", "#6aa89c")],
+            foreground=[("disabled", "#eef8f6")],
+        )
 
     def _build_ui(self):
         main = ttk.Frame(self.root, padding=12, style="App.TFrame")
@@ -793,14 +832,7 @@ class AllInOneTesterGUI:
         ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
 
         ttk.Label(tab, text="Direction:").grid(row=1, column=0, sticky="w")
-        direction_combo = ttk.Combobox(
-            tab,
-            textvariable=self.stepper_direction_var,
-            values=("up", "down"),
-            state="readonly",
-            width=10,
-        )
-        direction_combo.grid(row=1, column=1, sticky="w")
+        self._build_stepper_direction_buttons(tab, row=1, column=1, sticky="w")
 
         ttk.Label(tab, text="Seconds:").grid(row=1, column=2, sticky="w", padx=(16, 0))
         ttk.Entry(tab, textvariable=self.stepper_seconds_var, width=10).grid(
@@ -1176,6 +1208,7 @@ class AllInOneTesterGUI:
                 "binary",
                 "blob",
                 "optical_flow_2d",
+                "surface_2d",
                 "surface_3d",
             ),
             state="readonly",
@@ -1536,14 +1569,24 @@ class AllInOneTesterGUI:
         self.log(f"Dot pipeline preset applied: {preset}.")
 
     @staticmethod
-    def _apply_illumination_normalization(frame_bgr, cv2, method):
+    def _apply_illumination_normalization(frame_bgr, cv2, method, clahe_cache=None):
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
 
         if method == "clahe":
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            key = ("clahe", 2.0, (8, 8))
+            clahe = clahe_cache.get(key) if clahe_cache is not None else None
+            if clahe is None:
+                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                if clahe_cache is not None:
+                    clahe_cache[key] = clahe
             norm_gray = clahe.apply(gray)
         else:
-            clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+            key = ("clahe_bg", 2.5, (8, 8))
+            clahe = clahe_cache.get(key) if clahe_cache is not None else None
+            if clahe is None:
+                clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+                if clahe_cache is not None:
+                    clahe_cache[key] = clahe
             enhanced = clahe.apply(gray)
             background = cv2.GaussianBlur(enhanced, (0, 0), sigmaX=17, sigmaY=17)
             norm_float = (enhanced.astype(np.float32) / (background.astype(np.float32) + 1.0)) * 128.0
@@ -1585,6 +1628,7 @@ class AllInOneTesterGUI:
         self.surface_tactile_frame = None
         self.surface_contact_baseline = None
         self.surface_contact_display_ema = None
+        self.surface_gray_baseline = None
         if hasattr(self, "surface_reset_zero_event"):
             self.surface_reset_zero_event.clear()
         self._set_var(self.surface_status_var, status_text)
@@ -1654,7 +1698,9 @@ class AllInOneTesterGUI:
         object_mode = self._sync_surface_measurement_mode_from_var() == "3d_object"
         if object_mode:
             if hasattr(self, "blob_view_type_var") and not self._is_blob_running():
-                self.blob_view_type_var.set("surface_3d")
+                current_view = self.blob_view_type_var.get().strip().lower()
+                if current_view not in {"surface_2d", "surface_3d"}:
+                    self.blob_view_type_var.set("surface_3d")
             self._set_var(self.camera_deform_estimate_var, "3D contact mode")
             self._set_var(self.contact_depth_camera_var, "relative map")
             self._set_var(
@@ -1745,6 +1791,7 @@ class AllInOneTesterGUI:
             config,
             cv2=cv2,
             previous_scale_px=self.surface_scale_ema,
+            compute_surface=False,
         )
         if frame is None:
             self.surface_tactile_frame = None
@@ -1758,9 +1805,9 @@ class AllInOneTesterGUI:
         else:
             self.surface_height_ema = cv2.addWeighted(
                 self.surface_height_ema.astype(np.float32),
-                0.72,
+                0.55,
                 height_full,
-                0.28,
+                0.45,
                 0.0,
             )
         return (
@@ -1768,6 +1815,30 @@ class AllInOneTesterGUI:
             frame.ellipse_mask,
             frame.scale_px,
         )
+
+    def _interpret_surface_contact_map(self, contact_map, ellipse_mask, display_mode, cv2, current_gray=None):
+        title = "2D contact pressure map"
+        if contact_map is None:
+            return None, None, title
+
+        render_map = np.clip(np.asarray(contact_map, dtype=np.float32), 0.0, 1.0)
+        stats_map = render_map
+        if self._is_3d_object_mode():
+            footprint_map = build_object_contact_map(
+                render_map,
+                current_gray,
+                self.surface_gray_baseline,
+                ellipse_mask=ellipse_mask,
+                cv2=cv2,
+            )
+            if footprint_map is None:
+                footprint_map = shape_from_contact_map(render_map, ellipse_mask=ellipse_mask, cv2=cv2)
+            if footprint_map is not None and footprint_map.shape == render_map.shape:
+                stats_map = footprint_map.astype(np.float32)
+                if display_mode in {"surface_2d", "surface_3d"}:
+                    render_map = stats_map
+                title = "2D contact footprint map"
+        return render_map, stats_map, title
 
     @staticmethod
     def _measure_camera_to_surface_mm(height_map, ellipse_mask=None):
@@ -2063,6 +2134,147 @@ class AllInOneTesterGUI:
             output[camera_h + plot_h:, :, :] = graph_canvas
         return output
 
+    @staticmethod
+    def _build_surface_2d_plot(
+        gray_frame,
+        contact_map,
+        cv2,
+        roi_mask=None,
+        camera_gray_frame=None,
+        surface_history=None,
+        title="2D contact pressure map",
+    ):
+        camera_source = camera_gray_frame if camera_gray_frame is not None else gray_frame
+        out_h, out_w = camera_source.shape[:2]
+        show_graph = surface_history is not None
+        graph_h = max(72, min(128, int(out_h * 0.18))) if show_graph and out_h > 220 else 0
+        camera_h = max(96, int(out_h * (0.42 if show_graph else 0.58)))
+        min_plot_h = max(72, int(out_h * (0.26 if show_graph else 0.18)))
+        if camera_h + graph_h + min_plot_h > out_h:
+            camera_h = max(1, out_h - graph_h - min_plot_h)
+        camera_h = min(camera_h, max(1, out_h - graph_h - 1))
+        plot_h = max(1, out_h - camera_h - graph_h)
+
+        if len(camera_source.shape) == 2:
+            camera_canvas = cv2.cvtColor(camera_source, cv2.COLOR_GRAY2BGR)
+        else:
+            camera_canvas = camera_source.copy()
+        camera_canvas = cv2.convertScaleAbs(camera_canvas, alpha=0.78, beta=0)
+        camera_view = cv2.resize(camera_canvas, (out_w, camera_h), interpolation=cv2.INTER_AREA)
+
+        output = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+        output[:camera_h, :, :] = camera_view
+        cv2.line(output, (0, camera_h - 1), (out_w - 1, camera_h - 1), (45, 73, 96), 1)
+
+        plot_canvas = np.zeros((plot_h, out_w, 3), dtype=np.uint8)
+        plot_canvas[:, :, :] = (4, 8, 12)
+        graph_canvas = (
+            AllInOneTesterGUI._draw_surface_history_graph(out_w, graph_h, surface_history, cv2)
+            if graph_h > 0
+            else None
+        )
+
+        if contact_map is None or contact_map.size == 0:
+            output[camera_h:camera_h + plot_h, :, :] = plot_canvas
+            if graph_canvas is not None:
+                output[camera_h + plot_h:, :, :] = graph_canvas
+            return output
+
+        contact_work = np.clip(contact_map.astype(np.float32), 0.0, 1.0)
+        if roi_mask is not None:
+            roi_binary = roi_mask.astype(bool)
+            contact_work = np.where(roi_binary, contact_work, 0.0)
+        else:
+            roi_binary = None
+
+        contact = cv2.resize(contact_work, (out_w, plot_h), interpolation=cv2.INTER_AREA).astype(np.float32)
+        plot_roi_binary = None
+        if roi_binary is not None:
+            plot_roi_binary = cv2.resize(
+                roi_binary.astype(np.uint8),
+                (out_w, plot_h),
+                interpolation=cv2.INTER_NEAREST,
+            ).astype(bool)
+
+        contact = cv2.GaussianBlur(contact, (0, 0), sigmaX=0.8, sigmaY=0.8)
+        contact = np.clip(contact, 0.0, 1.0)
+        contact_vis = np.power(np.clip(contact * 1.18, 0.0, 1.0), 0.72)
+        heatmap = cv2.applyColorMap((contact_vis * 255.0).astype(np.uint8), cv2.COLORMAP_JET)
+
+        if plot_roi_binary is not None:
+            soft_mask = cv2.GaussianBlur(
+                plot_roi_binary.astype(np.float32),
+                (0, 0),
+                sigmaX=1.8,
+                sigmaY=1.8,
+            )
+            alpha = np.clip(soft_mask, 0.0, 1.0)[..., None]
+            plot_canvas = np.clip(
+                (plot_canvas.astype(np.float32) * (1.0 - alpha))
+                + (heatmap.astype(np.float32) * alpha),
+                0,
+                255,
+            ).astype(np.uint8)
+            contour_mask = plot_roi_binary.astype(np.uint8) * 255
+            contours, _ = cv2.findContours(contour_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(plot_canvas, contours, -1, (170, 210, 220), 1, lineType=cv2.LINE_AA)
+        else:
+            plot_canvas = heatmap
+
+        active_mask = contact > 0.04
+        if plot_roi_binary is not None:
+            active_mask &= plot_roi_binary
+        for level, color in (
+            (0.20, (255, 255, 255)),
+            (0.45, (80, 255, 255)),
+            (0.70, (0, 190, 255)),
+        ):
+            level_mask = (contact >= level).astype(np.uint8) * 255
+            if plot_roi_binary is not None:
+                level_mask = cv2.bitwise_and(level_mask, plot_roi_binary.astype(np.uint8) * 255)
+            contours, _ = cv2.findContours(level_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(plot_canvas, contours, -1, color, 1, lineType=cv2.LINE_AA)
+
+        if np.any(active_mask):
+            _min_val, max_val, _min_loc, max_loc = cv2.minMaxLoc(contact)
+            if max_val > 0.04:
+                cv2.drawMarker(
+                    plot_canvas,
+                    max_loc,
+                    (255, 255, 255),
+                    markerType=cv2.MARKER_CROSS,
+                    markerSize=14,
+                    thickness=1,
+                    line_type=cv2.LINE_AA,
+                )
+        else:
+            cv2.putText(
+                plot_canvas,
+                "waiting for contact map",
+                (12, 44),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.42,
+                (130, 170, 186),
+                1,
+                cv2.LINE_AA,
+            )
+
+        cv2.putText(
+            plot_canvas,
+            title,
+            (12, 22),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            (255, 230, 80),
+            1,
+            cv2.LINE_AA,
+        )
+        output[camera_h:camera_h + plot_h, :, :] = plot_canvas
+        if graph_canvas is not None:
+            cv2.line(output, (0, camera_h + plot_h - 1), (out_w - 1, camera_h + plot_h - 1), (45, 73, 96), 1)
+            output[camera_h + plot_h:, :, :] = graph_canvas
+        return output
+
     def _build_optical_flow_tab(self, notebook):
         tab = ttk.Frame(notebook, padding=12)
         notebook.add(tab, text="2) Optical Flow")
@@ -2176,8 +2388,52 @@ class AllInOneTesterGUI:
         return False
 
     def _set_var(self, variable, value):
-        if self.root.winfo_exists():
+        if not self.root.winfo_exists():
+            return
+
+        if not hasattr(self, "_tk_var_update_lock"):
             self.root.after(0, variable.set, value)
+            return
+
+        key = id(variable)
+        with self._tk_var_update_lock:
+            already_pending = key in self._tk_var_update_pending
+            self._tk_var_update_pending[key] = (variable, value)
+        if already_pending:
+            return
+
+        def apply_latest():
+            with self._tk_var_update_lock:
+                pending = self._tk_var_update_pending.pop(key, None)
+            if pending is None or not self.root.winfo_exists():
+                return
+            pending_variable, pending_value = pending
+            try:
+                if pending_variable.get() == pending_value:
+                    return
+                pending_variable.set(pending_value)
+            except tk.TclError:
+                pass
+
+        self.root.after(0, apply_latest)
+
+    def _configure_cv2_parallel(self, cv2):
+        if getattr(self, "_cv2_parallel_configured", False):
+            return
+        self._cv2_parallel_configured = True
+        try:
+            if hasattr(cv2, "setUseOptimized"):
+                cv2.setUseOptimized(True)
+            if CPU_PARALLEL_WORKERS > 0 and hasattr(cv2, "setNumThreads"):
+                cv2.setNumThreads(CPU_PARALLEL_WORKERS)
+            actual_threads = (
+                cv2.getNumThreads()
+                if hasattr(cv2, "getNumThreads")
+                else CPU_PARALLEL_WORKERS
+            )
+            self.log(f"OpenCV CPU parallel workers: {actual_threads}.")
+        except Exception as exc:
+            self.log(f"OpenCV CPU parallel setup skipped: {exc}")
 
     def _set_contact_gate_status(self, value):
         if hasattr(self, "contact_gate_var"):
@@ -2845,9 +3101,8 @@ class AllInOneTesterGUI:
                         status = f"CONTACT dP {delta:+.2f} hPa"
                         if not self.contact_pressure_zero_request_sent:
                             self.contact_pressure_zero_request_sent = True
-                            request_camera_zero = True
                             log_message = (
-                                "Pressure contact detected; capturing camera zero at first contact "
+                                "Pressure contact detected; using pre-contact camera zero "
                                 f"(dP={delta:+.2f} hPa)."
                             )
                     else:
@@ -2976,6 +3231,70 @@ class AllInOneTesterGUI:
         self._set_button_enabled(start_button, not running)
         self._set_button_enabled(stop_button, running)
 
+    def _set_stepper_direction(self, direction):
+        normalized = str(direction).strip().lower()
+        if normalized not in {"up", "down"}:
+            return
+        self.stepper_direction_var.set(normalized)
+        self._refresh_stepper_direction_buttons()
+
+    def _register_stepper_direction_button(self, direction, button):
+        if not hasattr(self, "_stepper_direction_buttons"):
+            self._stepper_direction_buttons = []
+        self._stepper_direction_buttons.append((str(direction).strip().lower(), button))
+        self._refresh_stepper_direction_buttons()
+
+    def _refresh_stepper_direction_buttons(self):
+        current = str(self.stepper_direction_var.get()).strip().lower()
+        if current not in {"up", "down"}:
+            current = "up"
+            self.stepper_direction_var.set(current)
+        for direction, button in getattr(self, "_stepper_direction_buttons", []):
+            try:
+                button.configure(
+                    style="StepperDirActive.TButton" if direction == current else "StepperDir.TButton"
+                )
+            except tk.TclError:
+                continue
+
+    def _set_stepper_direction_buttons_enabled(self, enabled):
+        for _direction, button in getattr(self, "_stepper_direction_buttons", []):
+            self._set_button_enabled(button, enabled)
+
+    def _build_stepper_direction_buttons(
+        self,
+        parent,
+        *,
+        row=None,
+        column=None,
+        sticky="ew",
+        padx=0,
+        pady=0,
+        frame_style="TFrame",
+    ):
+        frame = ttk.Frame(parent, style=frame_style)
+        frame.columnconfigure(0, weight=1)
+        frame.columnconfigure(1, weight=1)
+        up_btn = ttk.Button(
+            frame,
+            text="Up",
+            style="StepperDir.TButton",
+            command=lambda: self._set_stepper_direction("up"),
+        )
+        up_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        down_btn = ttk.Button(
+            frame,
+            text="Down",
+            style="StepperDir.TButton",
+            command=lambda: self._set_stepper_direction("down"),
+        )
+        down_btn.grid(row=0, column=1, sticky="ew")
+        self._register_stepper_direction_button("up", up_btn)
+        self._register_stepper_direction_button("down", down_btn)
+        if row is not None and column is not None:
+            frame.grid(row=row, column=column, sticky=sticky, padx=padx, pady=pady)
+        return frame
+
     def _set_camera_controls(self, running):
         self._set_start_stop_controls(self.camera_start_btn, self.camera_stop_btn, running)
 
@@ -2984,6 +3303,7 @@ class AllInOneTesterGUI:
 
     def _set_stepper_controls(self, running):
         self._set_start_stop_controls(self.stepper_start_btn, self.stepper_stop_btn, running)
+        self._set_stepper_direction_buttons_enabled(not running)
 
     def _set_pressure_controls(self, running):
         self._set_start_stop_controls(self.pressure_start_btn, self.pressure_stop_btn, running)
@@ -3175,32 +3495,50 @@ class AllInOneTesterGUI:
         target_h = max(1, int(src_height * scale))
         return target_w, target_h
 
-    def _render_blob_frame(self, payload):
-        if Image is None or ImageTk is None:
-            return
+    @staticmethod
+    def _resize_preview_bgr(frame_bgr, cv2):
+        max_width = max(0, int(GUI_PREVIEW_MAX_WIDTH))
+        max_height = max(0, int(GUI_PREVIEW_MAX_HEIGHT))
+        if frame_bgr is None or (max_width <= 0 and max_height <= 0):
+            return frame_bgr
 
-        frame_rgb = payload.get("frame_rgb")
-        if frame_rgb is None:
-            return
+        height, width = frame_bgr.shape[:2]
+        scale_candidates = []
+        if max_width > 0:
+            scale_candidates.append(max_width / float(max(1, width)))
+        if max_height > 0:
+            scale_candidates.append(max_height / float(max(1, height)))
+        scale = min(scale_candidates) if scale_candidates else 1.0
+        if scale >= 1.0:
+            return frame_bgr
 
-        resample_mode = Image.LANCZOS
-        if hasattr(Image, "Resampling"):
-            resample_mode = Image.Resampling.LANCZOS
-
-        pil_image = Image.fromarray(frame_rgb)
-        container_width = max(320, int(self.blob_preview_label.winfo_width()))
-        container_height = max(240, int(self.blob_preview_label.winfo_height()))
-        target_size = self._fit_preview_size(
-            pil_image.width,
-            pil_image.height,
-            container_width,
-            container_height,
+        target_size = (
+            max(1, int(width * scale)),
+            max(1, int(height * scale)),
         )
-        if target_size != pil_image.size:
-            pil_image = pil_image.resize(target_size, resample_mode)
+        return cv2.resize(frame_bgr, target_size, interpolation=cv2.INTER_AREA)
 
-        self.blob_photo = ImageTk.PhotoImage(image=pil_image)
-        self.blob_preview_label.configure(image=self.blob_photo, text="")
+    def _render_blob_frame(self, payload):
+        frame_rgb = payload.get("frame_rgb")
+        if frame_rgb is not None and Image is not None and ImageTk is not None:
+            resample_mode = Image.BILINEAR
+            if hasattr(Image, "Resampling"):
+                resample_mode = Image.Resampling.BILINEAR
+
+            pil_image = Image.fromarray(frame_rgb)
+            container_width = max(320, int(self.blob_preview_label.winfo_width()))
+            container_height = max(240, int(self.blob_preview_label.winfo_height()))
+            target_size = self._fit_preview_size(
+                pil_image.width,
+                pil_image.height,
+                container_width,
+                container_height,
+            )
+            if target_size != pil_image.size:
+                pil_image = pil_image.resize(target_size, resample_mode)
+
+            self.blob_photo = ImageTk.PhotoImage(image=pil_image)
+            self.blob_preview_label.configure(image=self.blob_photo, text="")
 
         self.blob_dot_count_var.set(str(payload.get("dot_count", "-")))
         self.blob_pick_mode_var.set(str(payload.get("picked_mode", "-")))
@@ -3290,31 +3628,26 @@ class AllInOneTesterGUI:
             pass
 
     def _render_flow_frame(self, payload):
-        if Image is None or ImageTk is None:
-            return
-
         frame_rgb = payload.get("frame_rgb")
-        if frame_rgb is None:
-            return
+        if frame_rgb is not None and Image is not None and ImageTk is not None:
+            resample_mode = Image.BILINEAR
+            if hasattr(Image, "Resampling"):
+                resample_mode = Image.Resampling.BILINEAR
 
-        resample_mode = Image.LANCZOS
-        if hasattr(Image, "Resampling"):
-            resample_mode = Image.Resampling.LANCZOS
+            pil_image = Image.fromarray(frame_rgb)
+            container_width = max(320, int(self.flow_preview_label.winfo_width()))
+            container_height = max(240, int(self.flow_preview_label.winfo_height()))
+            target_size = self._fit_preview_size(
+                pil_image.width,
+                pil_image.height,
+                container_width,
+                container_height,
+            )
+            if target_size != pil_image.size:
+                pil_image = pil_image.resize(target_size, resample_mode)
 
-        pil_image = Image.fromarray(frame_rgb)
-        container_width = max(320, int(self.flow_preview_label.winfo_width()))
-        container_height = max(240, int(self.flow_preview_label.winfo_height()))
-        target_size = self._fit_preview_size(
-            pil_image.width,
-            pil_image.height,
-            container_width,
-            container_height,
-        )
-        if target_size != pil_image.size:
-            pil_image = pil_image.resize(target_size, resample_mode)
-
-        self.flow_photo = ImageTk.PhotoImage(image=pil_image)
-        self.flow_preview_label.configure(image=self.flow_photo, text="")
+            self.flow_photo = ImageTk.PhotoImage(image=pil_image)
+            self.flow_preview_label.configure(image=self.flow_photo, text="")
 
         point_count = payload.get("point_count")
         if isinstance(point_count, int):
@@ -3513,6 +3846,7 @@ class AllInOneTesterGUI:
                 "binary",
                 "blob",
                 "optical_flow_2d",
+                "surface_2d",
                 "surface_3d",
             ),
             state="readonly",
@@ -3681,10 +4015,15 @@ class AllInOneTesterGUI:
         frame_counter = 0
         fps = 0.0
         fps_start = time.perf_counter()
+        preview_period = 0.0
+        if GUI_PREVIEW_TARGET_FPS > 0:
+            preview_period = 1.0 / max(0.1, GUI_PREVIEW_TARGET_FPS)
+        next_preview_at = 0.0
 
         try:
             pipe = self.blob_module
             cv2 = self.blob_cv2
+            self._configure_cv2_parallel(cv2)
             params = dict(self.flow_params)
 
             stream = pipe.open_camera_stream(
@@ -3780,16 +4119,19 @@ class AllInOneTesterGUI:
                     frame_counter = 0
                     fps_start = now
 
-                frame_rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
-                self._enqueue_flow_frame(
-                    {
-                        "frame_rgb": frame_rgb,
-                        "point_count": len(valid_new),
-                        "mean_disp": mean_disp,
-                        "max_disp": max_disp,
-                        "fps": fps,
-                    }
-                )
+                if preview_period <= 0.0 or now >= next_preview_at:
+                    preview_bgr = self._resize_preview_bgr(display, cv2)
+                    frame_rgb = cv2.cvtColor(preview_bgr, cv2.COLOR_BGR2RGB)
+                    next_preview_at = now + preview_period
+                    self._enqueue_flow_frame(
+                        {
+                            "frame_rgb": frame_rgb,
+                            "point_count": len(valid_new),
+                            "mean_disp": mean_disp,
+                            "max_disp": max_disp,
+                            "fps": fps,
+                        }
+                    )
 
                 prev_gray = gray
                 prev_pts = np.array(valid_new, dtype=np.float32).reshape(-1, 1, 2)
@@ -3966,7 +4308,7 @@ class AllInOneTesterGUI:
             raise ValueError("Mode must be auto, dark, or bright.")
 
         view_type = self.blob_view_type_var.get().strip().lower()
-        if self._is_3d_object_mode():
+        if self._is_3d_object_mode() and view_type not in {"surface_2d", "surface_3d"}:
             view_type = "surface_3d"
             self.blob_view_type_var.set("surface_3d")
         if view_type == "optical_flow":
@@ -3983,12 +4325,13 @@ class AllInOneTesterGUI:
             "binary",
             "blob",
             "optical_flow_2d",
+            "surface_2d",
             "surface_3d",
             "optical_flow_3d",
         }
         if view_type not in valid_view_types:
             raise ValueError(
-                "Output type must be one of: auto, mosaic, overlay, vector, heatmap, pointcloud, binary, blob, optical_flow_2d, surface_3d, optical_flow_3d."
+                "Output type must be one of: auto, mosaic, overlay, vector, heatmap, pointcloud, binary, blob, optical_flow_2d, surface_2d, surface_3d, optical_flow_3d."
             )
 
         vision_backend = self.vision_backend_var.get().strip().lower().replace(" ", "_")
@@ -5036,13 +5379,13 @@ class AllInOneTesterGUI:
             self.force_calibration_model_var = tk.StringVar(value="F = a*dP + b")
             self.force_calibration_live_pair_var = tk.StringVar(value="Pressure -, dP -, load -")
             self.force_cycle_shape_var = tk.StringVar(value="sample")
-            self.force_cycle_depth_target_var = tk.StringVar(value="-2.5")
+            self.force_cycle_depth_target_var = tk.StringVar(value="limit")
             self.force_cycle_report_sample_count_var = tk.StringVar(value="10")
             self.force_cycle_trial_var = tk.StringVar(value="1")
         elif not hasattr(self, "force_cycle_shape_var"):
             self.force_cycle_shape_var = tk.StringVar(value="sample")
         if not hasattr(self, "force_cycle_depth_target_var"):
-            self.force_cycle_depth_target_var = tk.StringVar(value="-2.5")
+            self.force_cycle_depth_target_var = tk.StringVar(value="limit")
         if not hasattr(self, "force_cycle_report_sample_count_var"):
             self.force_cycle_report_sample_count_var = tk.StringVar(value="10")
         if not hasattr(self, "force_cycle_trial_var"):
@@ -5218,16 +5561,8 @@ class AllInOneTesterGUI:
             row=6, column=1, sticky="ew", pady=(8, 0)
         )
 
-        ttk.Label(parent, text="Target depth (mm):").grid(row=7, column=0, sticky="w", pady=(8, 0))
-        ttk.Combobox(
-            parent,
-            textvariable=self.force_cycle_depth_target_var,
-            values=("-2.5", "-5.0", "-7.5", "-10.0", "limit"),
-            width=10,
-        ).grid(row=7, column=1, sticky="ew", pady=(8, 0))
-
         report = ttk.Frame(parent)
-        report.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        report.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         report.columnconfigure(1, weight=1)
         report.columnconfigure(3, weight=1)
         ttk.Label(report, text="Report samples:").grid(row=0, column=0, sticky="w", padx=(0, 6))
@@ -5248,7 +5583,7 @@ class AllInOneTesterGUI:
         ).grid(row=0, column=3, sticky="ew")
 
         actions = ttk.Frame(parent)
-        actions.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        actions.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(12, 0))
         for col in range(3):
             actions.columnconfigure(col, weight=1)
         ttk.Button(actions, text="Set P Zero", command=self.set_force_pressure_zero).grid(
@@ -5487,18 +5822,7 @@ class AllInOneTesterGUI:
         return value if value in {10, 25, 30} else None
 
     def _force_cycle_target_depth_mm(self):
-        text = str(self.force_cycle_depth_target_var.get() or "").strip().lower()
-        if text in {"", "limit", "lim", "max"}:
-            return None
-        text = text.replace("mm", "").strip()
-        try:
-            value = float(text)
-        except (TypeError, ValueError):
-            return -2.5
-        value = -abs(float(value))
-        if abs(value) < 0.05:
-            return -2.5
-        return float(np.clip(value, -25.0, -0.05))
+        return None
 
     def _force_cycle_report_trial(self):
         text = str(self.force_cycle_trial_var.get() or "1").strip()
@@ -6236,7 +6560,7 @@ class AllInOneTesterGUI:
         self.force_cycle_requested_shape_name = self._clean_force_cycle_shape_name(
             self.force_cycle_shape_var.get()
         )
-        self.force_cycle_requested_target_depth_mm = self._force_cycle_target_depth_mm()
+        self.force_cycle_requested_target_depth_mm = None
         self.force_cycle_requested_report_sample_target = self._force_cycle_report_sample_target()
         self.force_cycle_requested_trial = self._force_cycle_report_trial()
         if not self._is_blob_running():
@@ -6373,14 +6697,16 @@ class AllInOneTesterGUI:
     def _force_cycle_worker(self):
         started_at = None
         completed = False
+        abort_status = None
         try:
             if not self._force_cycle_wait_sensor_ready():
+                abort_status = "Force cycle aborted: pressure/load-cell samples were not ready."
                 return
             started_at = time.monotonic()
             shape_name = getattr(self, "force_cycle_requested_shape_name", "sample")
             report_sample_target = getattr(self, "force_cycle_requested_report_sample_target", None)
             trial = getattr(self, "force_cycle_requested_trial", 1)
-            target_depth_mm = getattr(self, "force_cycle_requested_target_depth_mm", None)
+            target_depth_mm = None
             self._start_force_cycle_capture(
                 started_at,
                 shape_name,
@@ -6390,39 +6716,28 @@ class AllInOneTesterGUI:
             )
             self._append_force_cycle_sample(now=started_at, force=True)
 
-            if target_depth_mm is None:
-                down_seconds = self._force_cycle_move_until_limit_timed("down", 1, "Limit 2")
-            else:
-                mm_per_second = float(FORCE_CYCLE_STEPPER_FREQUENCY_HZ) * float(STEPPER_MM_PER_PULSE)
-                if mm_per_second <= 0:
-                    self.log("Force cycle aborted: stepper mm/s is invalid.")
-                    return
-                requested_depth_mm = abs(float(target_depth_mm))
-                requested_seconds = requested_depth_mm / mm_per_second
-                if requested_seconds > FORCE_CYCLE_LIMIT_MAX_SECONDS:
-                    self.log(
-                        f"Force cycle target {requested_depth_mm:.1f} mm exceeds max cycle time; "
-                        f"clipping to {FORCE_CYCLE_LIMIT_MAX_SECONDS:.1f}s."
-                    )
-                    requested_seconds = FORCE_CYCLE_LIMIT_MAX_SECONDS
-                down_seconds = self._force_cycle_move_for_seconds_timed(
-                    "down",
-                    requested_seconds,
-                    f"down to {target_depth_mm:.1f} mm target",
-                )
+            self._set_var(self.force_calibration_status_var, "Force cycle moving down to Limit 2.")
+            down_seconds = self._force_cycle_move_until_limit_timed("down", 1, "Limit 2")
             if down_seconds is None:
+                abort_status = "Force cycle aborted during down stroke. Check Limit 2 and stepper movement."
                 return
             if down_seconds <= 0.05:
-                self.log("Force cycle aborted: down stroke time was too short to return safely.")
+                abort_status = (
+                    "Force cycle aborted: down stroke time was too short. "
+                    "Limit 2 may already be triggered/noisy."
+                )
+                self.log(abort_status)
                 return
             self._set_force_cycle_phase("settle", down_seconds=down_seconds)
             if not self._force_cycle_sleep():
+                abort_status = "Force cycle stopped during settle."
                 return
             if not self._force_cycle_move_for_seconds(
                 "up",
                 down_seconds,
                 f"return up for {down_seconds:.2f}s",
             ):
+                abort_status = "Force cycle aborted during return up stroke."
                 return
             self._set_force_cycle_phase("complete", down_seconds=down_seconds)
             completed = True
@@ -6439,7 +6754,7 @@ class AllInOneTesterGUI:
                 self.log("Force cycle stopped by user.")
                 self._set_var(self.force_calibration_status_var, "Force cycle stopped.")
             elif not completed:
-                self._set_var(self.force_calibration_status_var, "Force cycle aborted.")
+                self._set_var(self.force_calibration_status_var, abort_status or "Force cycle aborted.")
             self._stop_force_cycle_capture()
             self.force_cycle_stop_event.clear()
             self.force_cycle_thread = None
@@ -7694,6 +8009,7 @@ class AllInOneTesterGUI:
     ):
         view_type = str(params.get("view_type", "overlay")).strip().lower()
         remote_preview = REMOTE_VISION_PREVIEW_ENABLED or view_type in {
+            "surface_2d",
             "surface_3d",
             "optical_flow_3d",
             "pointcloud",
@@ -7705,6 +8021,7 @@ class AllInOneTesterGUI:
             "preview": "1" if remote_preview else "0",
             "points": "1" if include_points else "0",
             "view": view_type,
+            "measurement_mode": params.get("measurement_mode", "flat_deform"),
             "surface_reset": "1" if surface_reset else "0",
             "mode": params.get("mode", "auto"),
             "use_roi": "1" if params.get("use_roi", True) else "0",
@@ -7866,10 +8183,17 @@ class AllInOneTesterGUI:
         contact_zero_pending = False
         contact_zero_ready = False
         contact_zero_samples = []
+        contact_zero_gray_samples = []
+        clahe_cache = {}
+        preview_period = 0.0
+        if GUI_PREVIEW_TARGET_FPS > 0:
+            preview_period = 1.0 / max(0.1, GUI_PREVIEW_TARGET_FPS)
+        next_preview_at = 0.0
 
         try:
             pipe = self.blob_module
             cv2 = self.blob_cv2
+            self._configure_cv2_parallel(cv2)
             params = dict(self.blob_params)
             remote_backend = params.get("vision_backend") == "remote_cuda"
             remote_reset_reference_pending = remote_backend
@@ -7953,6 +8277,7 @@ class AllInOneTesterGUI:
                         frame_bgr,
                         cv2,
                         params.get("illum_method", "clahe_bg"),
+                        clahe_cache,
                     )
 
                 if remote_backend:
@@ -8011,10 +8336,12 @@ class AllInOneTesterGUI:
                         self.surface_contact_ema = None
                         self.surface_contact_baseline = None
                         self.surface_contact_display_ema = None
+                        self.surface_gray_baseline = None
                         self.surface_zero_ready = False
                         contact_zero_pending = False
                         contact_zero_ready = False
                         contact_zero_samples.clear()
+                        contact_zero_gray_samples.clear()
                         surface_display_cache = None
                         surface_distance_text_cache = ""
                         surface_mean_cache = None
@@ -8029,10 +8356,12 @@ class AllInOneTesterGUI:
                             self.surface_contact_ema = None
                             self.surface_contact_baseline = None
                             self.surface_contact_display_ema = None
+                            self.surface_gray_baseline = None
                             self.surface_zero_ready = False
                             contact_zero_pending = True
                             contact_zero_ready = False
                             contact_zero_samples.clear()
+                            contact_zero_gray_samples.clear()
                             surface_display_cache = None
                             surface_distance_text_cache = ""
                             surface_mean_cache = None
@@ -8066,7 +8395,7 @@ class AllInOneTesterGUI:
                     deform_surface_scale = None
                     deform_gate = None
                     remote_surface_rendered = (
-                        display_mode in {"surface_3d", "optical_flow_3d"}
+                        display_mode in {"surface_2d", "surface_3d", "optical_flow_3d"}
                         and remote_preview_bgr is not None
                         and bool(remote_payload.get("surface_rendered"))
                     )
@@ -8108,7 +8437,7 @@ class AllInOneTesterGUI:
                         else:
                             self._refresh_contact_depth_readouts(None, update_camera=True)
                             distance_text = status_text
-                    elif display_mode in {"surface_3d", "optical_flow_3d"}:
+                    elif display_mode in {"surface_2d", "surface_3d", "optical_flow_3d"}:
                         flow_gray = cv2.cvtColor(frame_for_detection, cv2.COLOR_BGR2GRAY)
                         height_map, ellipse_mask, scale = self._build_surface_height_map(
                             centroids,
@@ -8128,34 +8457,53 @@ class AllInOneTesterGUI:
                             )
                             base_map = tactile_frame.base_map if tactile_frame is not None else None
                             contact_stats = None
+                            contact_map_for_display = None
+                            render_contact_map = None
+                            stats_contact_map = None
                             gate = self._pressure_contact_gate_snapshot()
                             gate_blocks_contact = False
+                            gate_waiting_pressure = False
+                            surface_title = "2D contact pressure map"
                             if raw_contact_map is not None and base_map is not None:
-                                gate_blocks_contact = bool(gate["enabled"]) and not bool(gate["contact"])
+                                gate_blocks_contact = (
+                                    bool(gate["enabled"])
+                                    and bool(gate.get("ready", True))
+                                    and not bool(gate["contact"])
+                                )
+                                gate_waiting_pressure = bool(gate["enabled"]) and not bool(
+                                    gate.get("ready", True)
+                                )
                                 if gate_blocks_contact:
-                                    contact_zero_pending = False
-                                    contact_zero_ready = False
-                                    contact_zero_active = False
-                                    contact_zero_samples.clear()
-                                    self.surface_contact_baseline = None
-                                    self.surface_contact_display_ema = None
-                                    self.surface_zero_ready = False
-                                    contact_map_for_display = np.zeros_like(raw_contact_map, dtype=np.float32)
-                                else:
-                                    if gate["enabled"] and not contact_zero_ready and not contact_zero_pending:
+                                    if not contact_zero_ready and not contact_zero_pending:
                                         contact_zero_pending = True
                                         contact_zero_samples.clear()
+                                        contact_zero_gray_samples.clear()
                                         self.surface_contact_baseline = None
                                         self.surface_contact_display_ema = None
+                                        self.surface_gray_baseline = None
                                         self.surface_zero_ready = False
                                     contact_zero_active = bool(centroids) and contact_zero_pending
+                                elif gate_waiting_pressure:
+                                    contact_zero_active = False
+                                elif bool(gate["enabled"]) and not contact_zero_ready:
+                                    contact_zero_active = False
+                                else:
+                                    contact_zero_active = bool(centroids) and contact_zero_pending
 
-                                if not gate_blocks_contact and contact_zero_active:
+                                if contact_zero_active:
                                     contact_zero_samples.append(raw_contact_map.astype(np.float32).copy())
+                                    contact_zero_gray_samples.append(flow_gray.astype(np.float32).copy())
                                     if len(contact_zero_samples) >= CONTACT_ZERO_SAMPLE_COUNT:
                                         self.surface_contact_baseline = np.median(
                                             np.stack(
                                                 contact_zero_samples[-CONTACT_ZERO_SAMPLE_COUNT:],
+                                                axis=0,
+                                            ),
+                                            axis=0,
+                                        ).astype(np.float32)
+                                        self.surface_gray_baseline = np.median(
+                                            np.stack(
+                                                contact_zero_gray_samples[-CONTACT_ZERO_SAMPLE_COUNT:],
                                                 axis=0,
                                             ),
                                             axis=0,
@@ -8165,12 +8513,15 @@ class AllInOneTesterGUI:
                                             dtype=np.float32,
                                         )
                                         contact_zero_samples.clear()
+                                        contact_zero_gray_samples.clear()
                                         contact_zero_pending = False
                                         contact_zero_ready = True
                                         self.surface_zero_ready = True
                                         self.log("Remote CUDA contact zero captured from averaged contact maps.")
                                     contact_map_for_display = np.zeros_like(raw_contact_map, dtype=np.float32)
-                                elif not gate_blocks_contact and (
+                                elif gate_blocks_contact or gate_waiting_pressure:
+                                    contact_map_for_display = np.zeros_like(raw_contact_map, dtype=np.float32)
+                                elif (
                                     contact_zero_ready
                                     and self.surface_contact_baseline is not None
                                     and self.surface_contact_baseline.shape == raw_contact_map.shape
@@ -8196,15 +8547,27 @@ class AllInOneTesterGUI:
                                 else:
                                     contact_map_for_display = np.zeros_like(raw_contact_map, dtype=np.float32)
 
-                                height_map = surface_from_contact_map(
-                                    contact_map_for_display,
-                                    base_map,
-                                    ellipse_mask,
-                                    tactile_config,
-                                    cv2=cv2,
+                                render_contact_map, stats_contact_map, surface_title = (
+                                    self._interpret_surface_contact_map(
+                                        contact_map_for_display,
+                                        ellipse_mask,
+                                        display_mode,
+                                        cv2,
+                                        current_gray=flow_gray,
+                                    )
                                 )
+                                if display_mode == "surface_2d":
+                                    height_map = base_map
+                                else:
+                                    height_map = surface_from_contact_map(
+                                        render_contact_map,
+                                        base_map,
+                                        ellipse_mask,
+                                        tactile_config,
+                                        cv2=cv2,
+                                    )
                                 contact_stats = summarize_contact_map(
-                                    contact_map_for_display,
+                                    stats_contact_map,
                                     ellipse_mask,
                                     tactile_config.contact_area_threshold,
                                 )
@@ -8253,14 +8616,25 @@ class AllInOneTesterGUI:
                                 ),
                             )
 
-                            display_bgr = self._build_flow_3d_plot(
-                                flow_gray,
-                                height_map,
-                                cv2,
-                                roi_mask=ellipse_mask,
-                                camera_gray_frame=flow_gray,
-                                surface_history=surface_graph_history,
-                            )
+                            if display_mode == "surface_2d":
+                                display_bgr = self._build_surface_2d_plot(
+                                    flow_gray,
+                                    render_contact_map,
+                                    cv2,
+                                    roi_mask=ellipse_mask,
+                                    camera_gray_frame=flow_gray,
+                                    surface_history=surface_graph_history,
+                                    title=surface_title,
+                                )
+                            else:
+                                display_bgr = self._build_flow_3d_plot(
+                                    flow_gray,
+                                    height_map,
+                                    cv2,
+                                    roi_mask=ellipse_mask,
+                                    camera_gray_frame=flow_gray,
+                                    surface_history=surface_graph_history,
+                                )
                             if contact_stats is not None and contact_stats["ready"]:
                                 camera_depth_mm = self._estimate_camera_depth_mm(contact_stats)
                                 if gate_blocks_contact:
@@ -8359,8 +8733,6 @@ class AllInOneTesterGUI:
                         (255, 245, 80),
                         2,
                     )
-                    frame_rgb_preview = cv2.cvtColor(display_bgr, cv2.COLOR_BGR2RGB)
-
                     frame_counter += 1
                     now = time.perf_counter()
                     elapsed = now - fps_start
@@ -8390,21 +8762,25 @@ class AllInOneTesterGUI:
                         ),
                     )
 
-                    self._enqueue_blob_frame(
-                        {
-                            "frame_rgb": frame_rgb_preview,
-                            "dot_count": remote_dot_count,
-                            "picked_mode": f"remote CUDA | {display_mode}",
-                            "fps": fps,
-                            "frame_ms": frame_ms,
-                            "mean_disp": flow_distance_mean,
-                            "max_disp": flow_distance_max,
-                            "missing_ratio": missing_ratio,
-                            "new_tracks": new_count,
-                            "lost_tracks": lost_count,
-                            "distance_text": distance_text,
-                        }
-                    )
+                    if preview_period <= 0.0 or now >= next_preview_at:
+                        preview_bgr = self._resize_preview_bgr(display_bgr, cv2)
+                        frame_rgb_preview = cv2.cvtColor(preview_bgr, cv2.COLOR_BGR2RGB)
+                        next_preview_at = now + preview_period
+                        self._enqueue_blob_frame(
+                            {
+                                "frame_rgb": frame_rgb_preview,
+                                "dot_count": remote_dot_count,
+                                "picked_mode": f"remote CUDA | {display_mode}",
+                                "fps": fps,
+                                "frame_ms": frame_ms,
+                                "mean_disp": flow_distance_mean,
+                                "max_disp": flow_distance_max,
+                                "missing_ratio": missing_ratio,
+                                "new_tracks": new_count,
+                                "lost_tracks": lost_count,
+                                "distance_text": distance_text,
+                            }
+                        )
 
                     if self.blob_snapshot_event.is_set():
                         self.blob_snapshot_event.clear()
@@ -8452,10 +8828,12 @@ class AllInOneTesterGUI:
                     self.surface_contact_ema = None
                     self.surface_contact_baseline = None
                     self.surface_contact_display_ema = None
+                    self.surface_gray_baseline = None
                     self.surface_zero_ready = False
                     contact_zero_pending = False
                     contact_zero_ready = False
                     contact_zero_samples.clear()
+                    contact_zero_gray_samples.clear()
                     surface_display_cache = None
                     surface_distance_text_cache = ""
                     surface_mean_cache = None
@@ -8477,10 +8855,12 @@ class AllInOneTesterGUI:
                     self.surface_contact_ema = None
                     self.surface_contact_baseline = None
                     self.surface_contact_display_ema = None
+                    self.surface_gray_baseline = None
                     self.surface_zero_ready = False
                     contact_zero_pending = False
                     contact_zero_ready = False
                     contact_zero_samples.clear()
+                    contact_zero_gray_samples.clear()
                     surface_display_cache = None
                     surface_distance_text_cache = ""
                     surface_mean_cache = None
@@ -8496,10 +8876,12 @@ class AllInOneTesterGUI:
                         self.surface_contact_ema = None
                         self.surface_contact_baseline = None
                         self.surface_contact_display_ema = None
+                        self.surface_gray_baseline = None
                         self.surface_zero_ready = False
                         contact_zero_pending = True
                         contact_zero_ready = False
                         contact_zero_samples.clear()
+                        contact_zero_gray_samples.clear()
                         surface_display_cache = None
                         surface_distance_text_cache = ""
                         surface_mean_cache = None
@@ -8581,7 +8963,7 @@ class AllInOneTesterGUI:
                     display_bgr = heatmap_vis
                 elif display_mode == "pointcloud":
                     display_bgr = pointcloud_vis
-                elif display_mode in {"optical_flow_2d", "surface_3d"}:
+                elif display_mode in {"optical_flow_2d", "surface_2d", "surface_3d"}:
                     flow_gray = cv2.cvtColor(frame_for_detection, cv2.COLOR_BGR2GRAY)
                     display_bgr = frame_bgr.copy()
 
@@ -8699,34 +9081,53 @@ class AllInOneTesterGUI:
                                 )
                                 base_map = tactile_frame.base_map if tactile_frame is not None else None
                                 contact_stats = None
+                                contact_map_for_display = None
+                                render_contact_map = None
+                                stats_contact_map = None
                                 gate = self._pressure_contact_gate_snapshot()
                                 gate_blocks_contact = False
+                                gate_waiting_pressure = False
+                                surface_title = "2D contact pressure map"
                                 if raw_contact_map is not None and base_map is not None:
-                                    gate_blocks_contact = bool(gate["enabled"]) and not bool(gate["contact"])
+                                    gate_blocks_contact = (
+                                        bool(gate["enabled"])
+                                        and bool(gate.get("ready", True))
+                                        and not bool(gate["contact"])
+                                    )
+                                    gate_waiting_pressure = bool(gate["enabled"]) and not bool(
+                                        gate.get("ready", True)
+                                    )
                                     if gate_blocks_contact:
-                                        contact_zero_pending = False
-                                        contact_zero_ready = False
-                                        contact_zero_active = False
-                                        contact_zero_samples.clear()
-                                        self.surface_contact_baseline = None
-                                        self.surface_contact_display_ema = None
-                                        self.surface_zero_ready = False
-                                        contact_map_for_display = np.zeros_like(raw_contact_map, dtype=np.float32)
-                                    else:
-                                        if gate["enabled"] and not contact_zero_ready and not contact_zero_pending:
+                                        if not contact_zero_ready and not contact_zero_pending:
                                             contact_zero_pending = True
                                             contact_zero_samples.clear()
+                                            contact_zero_gray_samples.clear()
                                             self.surface_contact_baseline = None
                                             self.surface_contact_display_ema = None
+                                            self.surface_gray_baseline = None
                                             self.surface_zero_ready = False
                                         contact_zero_active = bool(centroids) and contact_zero_pending
+                                    elif gate_waiting_pressure:
+                                        contact_zero_active = False
+                                    elif bool(gate["enabled"]) and not contact_zero_ready:
+                                        contact_zero_active = False
+                                    else:
+                                        contact_zero_active = bool(centroids) and contact_zero_pending
 
-                                    if not gate_blocks_contact and contact_zero_active:
+                                    if contact_zero_active:
                                         contact_zero_samples.append(raw_contact_map.astype(np.float32).copy())
+                                        contact_zero_gray_samples.append(flow_gray.astype(np.float32).copy())
                                         if len(contact_zero_samples) >= CONTACT_ZERO_SAMPLE_COUNT:
                                             self.surface_contact_baseline = np.median(
                                                 np.stack(
                                                     contact_zero_samples[-CONTACT_ZERO_SAMPLE_COUNT:],
+                                                    axis=0,
+                                                ),
+                                                axis=0,
+                                            ).astype(np.float32)
+                                            self.surface_gray_baseline = np.median(
+                                                np.stack(
+                                                    contact_zero_gray_samples[-CONTACT_ZERO_SAMPLE_COUNT:],
                                                     axis=0,
                                                 ),
                                                 axis=0,
@@ -8736,12 +9137,15 @@ class AllInOneTesterGUI:
                                                 dtype=np.float32,
                                             )
                                             contact_zero_samples.clear()
+                                            contact_zero_gray_samples.clear()
                                             contact_zero_pending = False
                                             contact_zero_ready = True
                                             self.surface_zero_ready = True
                                             self.log("Contact zero captured from averaged contact maps.")
                                         contact_map_for_display = np.zeros_like(raw_contact_map, dtype=np.float32)
-                                    elif not gate_blocks_contact and (
+                                    elif gate_blocks_contact or gate_waiting_pressure:
+                                        contact_map_for_display = np.zeros_like(raw_contact_map, dtype=np.float32)
+                                    elif (
                                         contact_zero_ready
                                         and self.surface_contact_baseline is not None
                                         and self.surface_contact_baseline.shape == raw_contact_map.shape
@@ -8767,15 +9171,27 @@ class AllInOneTesterGUI:
                                     else:
                                         contact_map_for_display = np.zeros_like(raw_contact_map, dtype=np.float32)
 
-                                    height_map = surface_from_contact_map(
-                                        contact_map_for_display,
-                                        base_map,
-                                        ellipse_mask,
-                                        tactile_config,
-                                        cv2=cv2,
+                                    render_contact_map, stats_contact_map, surface_title = (
+                                        self._interpret_surface_contact_map(
+                                            contact_map_for_display,
+                                            ellipse_mask,
+                                            display_mode,
+                                            cv2,
+                                            current_gray=flow_gray,
+                                        )
                                     )
+                                    if display_mode == "surface_2d":
+                                        height_map = base_map
+                                    else:
+                                        height_map = surface_from_contact_map(
+                                            render_contact_map,
+                                            base_map,
+                                            ellipse_mask,
+                                            tactile_config,
+                                            cv2=cv2,
+                                        )
                                     contact_stats = summarize_contact_map(
-                                        contact_map_for_display,
+                                        stats_contact_map,
                                         ellipse_mask,
                                         tactile_config.contact_area_threshold,
                                     )
@@ -8821,14 +9237,25 @@ class AllInOneTesterGUI:
                                         )
                                     ),
                                 )
-                                display_bgr = self._build_flow_3d_plot(
-                                    flow_gray,
-                                    height_map,
-                                    cv2,
-                                    roi_mask=ellipse_mask,
-                                    camera_gray_frame=flow_gray,
-                                    surface_history=surface_graph_history,
-                                )
+                                if display_mode == "surface_2d":
+                                    display_bgr = self._build_surface_2d_plot(
+                                        flow_gray,
+                                        render_contact_map,
+                                        cv2,
+                                        roi_mask=ellipse_mask,
+                                        camera_gray_frame=flow_gray,
+                                        surface_history=surface_graph_history,
+                                        title=surface_title,
+                                    )
+                                else:
+                                    display_bgr = self._build_flow_3d_plot(
+                                        flow_gray,
+                                        height_map,
+                                        cv2,
+                                        roi_mask=ellipse_mask,
+                                        camera_gray_frame=flow_gray,
+                                        surface_history=surface_graph_history,
+                                    )
 
                                 flow_distance_mean = mean_disp
                                 flow_distance_max = max_disp
@@ -8953,7 +9380,6 @@ class AllInOneTesterGUI:
                         self.log(f"Robustness: {summary_text}")
 
                 frame_bgr = display_bgr
-                frame_rgb_preview = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
                 frame_counter += 1
                 now = time.perf_counter()
@@ -8978,21 +9404,25 @@ class AllInOneTesterGUI:
                     gate=deform_gate,
                 )
 
-                self._enqueue_blob_frame(
-                    {
-                        "frame_rgb": frame_rgb_preview,
-                        "dot_count": len(centroids),
-                        "picked_mode": payload_mode,
-                        "fps": fps,
-                        "frame_ms": frame_ms,
-                        "mean_disp": payload_mean_disp,
-                        "max_disp": payload_max_disp,
-                        "missing_ratio": missing_ratio,
-                        "new_tracks": new_count,
-                        "lost_tracks": lost_count,
-                        "distance_text": distance_text,
-                    }
-                )
+                if preview_period <= 0.0 or now >= next_preview_at:
+                    preview_bgr = self._resize_preview_bgr(frame_bgr, cv2)
+                    frame_rgb_preview = cv2.cvtColor(preview_bgr, cv2.COLOR_BGR2RGB)
+                    next_preview_at = now + preview_period
+                    self._enqueue_blob_frame(
+                        {
+                            "frame_rgb": frame_rgb_preview,
+                            "dot_count": len(centroids),
+                            "picked_mode": payload_mode,
+                            "fps": fps,
+                            "frame_ms": frame_ms,
+                            "mean_disp": payload_mean_disp,
+                            "max_disp": payload_max_disp,
+                            "missing_ratio": missing_ratio,
+                            "new_tracks": new_count,
+                            "lost_tracks": lost_count,
+                            "distance_text": distance_text,
+                        }
+                    )
 
                 if self.blob_snapshot_event.is_set():
                     self.blob_snapshot_event.clear()

@@ -440,6 +440,30 @@ class AllInOneTesterGUI:
 
         style.configure("Danger.TButton", background="#a34b2a", foreground="#ffffff")
         style.map("Danger.TButton", background=[("active", "#8d3f23")])
+        style.configure(
+            "StepperDir.TButton",
+            padding=(8, 4),
+            background=COLOR_PANEL,
+            foreground=COLOR_TEXT,
+            bordercolor=COLOR_BORDER,
+        )
+        style.map(
+            "StepperDir.TButton",
+            background=[("active", COLOR_ACCENT_SOFT), ("disabled", "#edf1f2")],
+            foreground=[("disabled", "#7d8a8d")],
+        )
+        style.configure(
+            "StepperDirActive.TButton",
+            padding=(8, 4),
+            background=COLOR_ACCENT,
+            foreground="#ffffff",
+            bordercolor=COLOR_ACCENT,
+        )
+        style.map(
+            "StepperDirActive.TButton",
+            background=[("active", "#0a5f5a"), ("disabled", "#6aa89c")],
+            foreground=[("disabled", "#eef8f6")],
+        )
 
     def _build_ui(self):
         main = ttk.Frame(self.root, padding=12, style="App.TFrame")
@@ -793,14 +817,7 @@ class AllInOneTesterGUI:
         ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
 
         ttk.Label(tab, text="Direction:").grid(row=1, column=0, sticky="w")
-        direction_combo = ttk.Combobox(
-            tab,
-            textvariable=self.stepper_direction_var,
-            values=("up", "down"),
-            state="readonly",
-            width=10,
-        )
-        direction_combo.grid(row=1, column=1, sticky="w")
+        self._build_stepper_direction_buttons(tab, row=1, column=1, sticky="w")
 
         ttk.Label(tab, text="Seconds:").grid(row=1, column=2, sticky="w", padx=(16, 0))
         ttk.Entry(tab, textvariable=self.stepper_seconds_var, width=10).grid(
@@ -2976,6 +2993,70 @@ class AllInOneTesterGUI:
         self._set_button_enabled(start_button, not running)
         self._set_button_enabled(stop_button, running)
 
+    def _set_stepper_direction(self, direction):
+        normalized = str(direction).strip().lower()
+        if normalized not in {"up", "down"}:
+            return
+        self.stepper_direction_var.set(normalized)
+        self._refresh_stepper_direction_buttons()
+
+    def _register_stepper_direction_button(self, direction, button):
+        if not hasattr(self, "_stepper_direction_buttons"):
+            self._stepper_direction_buttons = []
+        self._stepper_direction_buttons.append((str(direction).strip().lower(), button))
+        self._refresh_stepper_direction_buttons()
+
+    def _refresh_stepper_direction_buttons(self):
+        current = str(self.stepper_direction_var.get()).strip().lower()
+        if current not in {"up", "down"}:
+            current = "up"
+            self.stepper_direction_var.set(current)
+        for direction, button in getattr(self, "_stepper_direction_buttons", []):
+            try:
+                button.configure(
+                    style="StepperDirActive.TButton" if direction == current else "StepperDir.TButton"
+                )
+            except tk.TclError:
+                continue
+
+    def _set_stepper_direction_buttons_enabled(self, enabled):
+        for _direction, button in getattr(self, "_stepper_direction_buttons", []):
+            self._set_button_enabled(button, enabled)
+
+    def _build_stepper_direction_buttons(
+        self,
+        parent,
+        *,
+        row=None,
+        column=None,
+        sticky="ew",
+        padx=0,
+        pady=0,
+        frame_style="TFrame",
+    ):
+        frame = ttk.Frame(parent, style=frame_style)
+        frame.columnconfigure(0, weight=1)
+        frame.columnconfigure(1, weight=1)
+        up_btn = ttk.Button(
+            frame,
+            text="Up",
+            style="StepperDir.TButton",
+            command=lambda: self._set_stepper_direction("up"),
+        )
+        up_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        down_btn = ttk.Button(
+            frame,
+            text="Down",
+            style="StepperDir.TButton",
+            command=lambda: self._set_stepper_direction("down"),
+        )
+        down_btn.grid(row=0, column=1, sticky="ew")
+        self._register_stepper_direction_button("up", up_btn)
+        self._register_stepper_direction_button("down", down_btn)
+        if row is not None and column is not None:
+            frame.grid(row=row, column=column, sticky=sticky, padx=padx, pady=pady)
+        return frame
+
     def _set_camera_controls(self, running):
         self._set_start_stop_controls(self.camera_start_btn, self.camera_stop_btn, running)
 
@@ -2984,6 +3065,7 @@ class AllInOneTesterGUI:
 
     def _set_stepper_controls(self, running):
         self._set_start_stop_controls(self.stepper_start_btn, self.stepper_stop_btn, running)
+        self._set_stepper_direction_buttons_enabled(not running)
 
     def _set_pressure_controls(self, running):
         self._set_start_stop_controls(self.pressure_start_btn, self.pressure_stop_btn, running)
@@ -5036,13 +5118,13 @@ class AllInOneTesterGUI:
             self.force_calibration_model_var = tk.StringVar(value="F = a*dP + b")
             self.force_calibration_live_pair_var = tk.StringVar(value="Pressure -, dP -, load -")
             self.force_cycle_shape_var = tk.StringVar(value="sample")
-            self.force_cycle_depth_target_var = tk.StringVar(value="-2.5")
+            self.force_cycle_depth_target_var = tk.StringVar(value="limit")
             self.force_cycle_report_sample_count_var = tk.StringVar(value="10")
             self.force_cycle_trial_var = tk.StringVar(value="1")
         elif not hasattr(self, "force_cycle_shape_var"):
             self.force_cycle_shape_var = tk.StringVar(value="sample")
         if not hasattr(self, "force_cycle_depth_target_var"):
-            self.force_cycle_depth_target_var = tk.StringVar(value="-2.5")
+            self.force_cycle_depth_target_var = tk.StringVar(value="limit")
         if not hasattr(self, "force_cycle_report_sample_count_var"):
             self.force_cycle_report_sample_count_var = tk.StringVar(value="10")
         if not hasattr(self, "force_cycle_trial_var"):
@@ -5218,16 +5300,8 @@ class AllInOneTesterGUI:
             row=6, column=1, sticky="ew", pady=(8, 0)
         )
 
-        ttk.Label(parent, text="Target depth (mm):").grid(row=7, column=0, sticky="w", pady=(8, 0))
-        ttk.Combobox(
-            parent,
-            textvariable=self.force_cycle_depth_target_var,
-            values=("-2.5", "-5.0", "-7.5", "-10.0", "limit"),
-            width=10,
-        ).grid(row=7, column=1, sticky="ew", pady=(8, 0))
-
         report = ttk.Frame(parent)
-        report.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        report.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         report.columnconfigure(1, weight=1)
         report.columnconfigure(3, weight=1)
         ttk.Label(report, text="Report samples:").grid(row=0, column=0, sticky="w", padx=(0, 6))
@@ -5248,7 +5322,7 @@ class AllInOneTesterGUI:
         ).grid(row=0, column=3, sticky="ew")
 
         actions = ttk.Frame(parent)
-        actions.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        actions.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(12, 0))
         for col in range(3):
             actions.columnconfigure(col, weight=1)
         ttk.Button(actions, text="Set P Zero", command=self.set_force_pressure_zero).grid(
@@ -5487,18 +5561,7 @@ class AllInOneTesterGUI:
         return value if value in {10, 25, 30} else None
 
     def _force_cycle_target_depth_mm(self):
-        text = str(self.force_cycle_depth_target_var.get() or "").strip().lower()
-        if text in {"", "limit", "lim", "max"}:
-            return None
-        text = text.replace("mm", "").strip()
-        try:
-            value = float(text)
-        except (TypeError, ValueError):
-            return -2.5
-        value = -abs(float(value))
-        if abs(value) < 0.05:
-            return -2.5
-        return float(np.clip(value, -25.0, -0.05))
+        return None
 
     def _force_cycle_report_trial(self):
         text = str(self.force_cycle_trial_var.get() or "1").strip()
@@ -6236,7 +6299,7 @@ class AllInOneTesterGUI:
         self.force_cycle_requested_shape_name = self._clean_force_cycle_shape_name(
             self.force_cycle_shape_var.get()
         )
-        self.force_cycle_requested_target_depth_mm = self._force_cycle_target_depth_mm()
+        self.force_cycle_requested_target_depth_mm = None
         self.force_cycle_requested_report_sample_target = self._force_cycle_report_sample_target()
         self.force_cycle_requested_trial = self._force_cycle_report_trial()
         if not self._is_blob_running():
@@ -6373,14 +6436,16 @@ class AllInOneTesterGUI:
     def _force_cycle_worker(self):
         started_at = None
         completed = False
+        abort_status = None
         try:
             if not self._force_cycle_wait_sensor_ready():
+                abort_status = "Force cycle aborted: pressure/load-cell samples were not ready."
                 return
             started_at = time.monotonic()
             shape_name = getattr(self, "force_cycle_requested_shape_name", "sample")
             report_sample_target = getattr(self, "force_cycle_requested_report_sample_target", None)
             trial = getattr(self, "force_cycle_requested_trial", 1)
-            target_depth_mm = getattr(self, "force_cycle_requested_target_depth_mm", None)
+            target_depth_mm = None
             self._start_force_cycle_capture(
                 started_at,
                 shape_name,
@@ -6390,39 +6455,28 @@ class AllInOneTesterGUI:
             )
             self._append_force_cycle_sample(now=started_at, force=True)
 
-            if target_depth_mm is None:
-                down_seconds = self._force_cycle_move_until_limit_timed("down", 1, "Limit 2")
-            else:
-                mm_per_second = float(FORCE_CYCLE_STEPPER_FREQUENCY_HZ) * float(STEPPER_MM_PER_PULSE)
-                if mm_per_second <= 0:
-                    self.log("Force cycle aborted: stepper mm/s is invalid.")
-                    return
-                requested_depth_mm = abs(float(target_depth_mm))
-                requested_seconds = requested_depth_mm / mm_per_second
-                if requested_seconds > FORCE_CYCLE_LIMIT_MAX_SECONDS:
-                    self.log(
-                        f"Force cycle target {requested_depth_mm:.1f} mm exceeds max cycle time; "
-                        f"clipping to {FORCE_CYCLE_LIMIT_MAX_SECONDS:.1f}s."
-                    )
-                    requested_seconds = FORCE_CYCLE_LIMIT_MAX_SECONDS
-                down_seconds = self._force_cycle_move_for_seconds_timed(
-                    "down",
-                    requested_seconds,
-                    f"down to {target_depth_mm:.1f} mm target",
-                )
+            self._set_var(self.force_calibration_status_var, "Force cycle moving down to Limit 2.")
+            down_seconds = self._force_cycle_move_until_limit_timed("down", 1, "Limit 2")
             if down_seconds is None:
+                abort_status = "Force cycle aborted during down stroke. Check Limit 2 and stepper movement."
                 return
             if down_seconds <= 0.05:
-                self.log("Force cycle aborted: down stroke time was too short to return safely.")
+                abort_status = (
+                    "Force cycle aborted: down stroke time was too short. "
+                    "Limit 2 may already be triggered/noisy."
+                )
+                self.log(abort_status)
                 return
             self._set_force_cycle_phase("settle", down_seconds=down_seconds)
             if not self._force_cycle_sleep():
+                abort_status = "Force cycle stopped during settle."
                 return
             if not self._force_cycle_move_for_seconds(
                 "up",
                 down_seconds,
                 f"return up for {down_seconds:.2f}s",
             ):
+                abort_status = "Force cycle aborted during return up stroke."
                 return
             self._set_force_cycle_phase("complete", down_seconds=down_seconds)
             completed = True
@@ -6439,7 +6493,7 @@ class AllInOneTesterGUI:
                 self.log("Force cycle stopped by user.")
                 self._set_var(self.force_calibration_status_var, "Force cycle stopped.")
             elif not completed:
-                self._set_var(self.force_calibration_status_var, "Force cycle aborted.")
+                self._set_var(self.force_calibration_status_var, abort_status or "Force cycle aborted.")
             self._stop_force_cycle_capture()
             self.force_cycle_stop_event.clear()
             self.force_cycle_thread = None

@@ -16,9 +16,14 @@ class TactileContactConfig:
     use_roi: bool = True
     gain: float = 1.0
     smooth: float = 1.4
-    min_contact_scale_px: float = 0.45
-    residual_floor_mad: float = 1.4
-    contact_area_threshold: float = 0.08
+    min_contact_scale_px: float = 0.28
+    residual_floor_mad: float = 1.0
+    contact_area_threshold: float = 0.06
+    spatial_sigma_fraction: float = 0.10
+    spatial_sigma_min_px: float = 5.0
+    signal_gamma: float = 0.72
+    strain_blend: float = 0.68
+    interior_fill_blend: float = 0.68
 
 
 @dataclass
@@ -116,7 +121,79 @@ def _ellipse_mask(frame_shape, cx, cy, rx, ry):
     return (nx * nx + ny * ny) <= 1.0
 
 
-def _low_res_contact_map(points_arr, signal_arr, frame_shape, config, cv2):
+def _normalize_field(values, mask):
+    if values is None:
+        return None
+    norm = np.zeros_like(values, dtype=np.float32)
+    active = np.asarray(values, dtype=np.float32)[mask]
+    active = active[np.isfinite(active)]
+    if active.size == 0:
+        return norm
+    low = float(np.percentile(active, 35.0))
+    high = float(np.percentile(active, 97.0))
+    if high <= low + 1e-6:
+        high = low + 1e-6
+    norm = np.clip((np.asarray(values, dtype=np.float32) - low) / (high - low), 0.0, 1.0)
+    return np.where(mask, norm, 0.0).astype(np.float32)
+
+
+def _interior_fill_map(points_arr, signal_arr, cx, cy, rx, ry, grid_mask, grid_w, grid_h, cv2):
+    if cv2 is None:
+        return np.zeros((grid_h, grid_w), dtype=np.float32)
+    if points_arr is None or signal_arr is None or len(points_arr) < 3:
+        return np.zeros((grid_h, grid_w), dtype=np.float32)
+
+    active_threshold = max(0.16, float(np.percentile(signal_arr, 72.0)))
+    active_points = points_arr[signal_arr >= active_threshold]
+    active_signal = signal_arr[signal_arr >= active_threshold]
+    if len(active_points) < 3 or active_signal.size == 0:
+        return np.zeros((grid_h, grid_w), dtype=np.float32)
+
+    px = ((active_points[:, 0] - (cx - rx)) / max(2.0 * rx, 1e-6)) * max(1, grid_w - 1)
+    py = ((active_points[:, 1] - (cy - ry)) / max(2.0 * ry, 1e-6)) * max(1, grid_h - 1)
+    low_points = np.stack(
+        [
+            np.clip(px, 0.0, float(max(0, grid_w - 1))),
+            np.clip(py, 0.0, float(max(0, grid_h - 1))),
+        ],
+        axis=1,
+    ).astype(np.float32)
+    hull = cv2.convexHull(low_points.reshape(-1, 1, 2))
+    if hull is None or len(hull) < 3:
+        return np.zeros((grid_h, grid_w), dtype=np.float32)
+
+    hull_mask = np.zeros((grid_h, grid_w), dtype=np.uint8)
+    cv2.fillConvexPoly(hull_mask, hull.astype(np.int32), 255, lineType=cv2.LINE_AA)
+    hull_mask = np.where(grid_mask, hull_mask, 0).astype(np.uint8)
+    if int(np.count_nonzero(hull_mask)) < 12:
+        return np.zeros((grid_h, grid_w), dtype=np.float32)
+
+    dist = cv2.distanceTransform((hull_mask > 0).astype(np.uint8), cv2.DIST_L2, 3)
+    max_dist = float(np.max(dist))
+    if max_dist <= 1e-6:
+        return np.zeros((grid_h, grid_w), dtype=np.float32)
+
+    weights = np.clip(active_signal.astype(np.float32), 1e-6, None)
+    center_x = float(np.average(low_points[:, 0], weights=weights))
+    center_y = float(np.average(low_points[:, 1], weights=weights))
+    sigma_x = max(2.0, float(np.sqrt(np.average((low_points[:, 0] - center_x) ** 2, weights=weights))) * 0.95)
+    sigma_y = max(2.0, float(np.sqrt(np.average((low_points[:, 1] - center_y) ** 2, weights=weights))) * 0.95)
+    yy, xx = np.indices((grid_h, grid_w), dtype=np.float32)
+    gaussian = np.exp(
+        -0.5
+        * (
+            ((xx - center_x) / max(sigma_x, 1e-6)) ** 2
+            + ((yy - center_y) / max(sigma_y, 1e-6)) ** 2
+        )
+    ).astype(np.float32)
+    fill = (gaussian * np.power(np.clip(dist / max_dist, 0.0, 1.0), 0.55)).astype(np.float32)
+    strength = float(np.clip(np.percentile(active_signal, 88.0), 0.0, 1.0))
+    fill = np.where(grid_mask, fill * strength, 0.0).astype(np.float32)
+    fill = cv2.GaussianBlur(fill, (0, 0), sigmaX=1.0, sigmaY=1.0)
+    return np.where(grid_mask, np.clip(fill, 0.0, 1.0), 0.0).astype(np.float32)
+
+
+def _low_res_contact_map(points_arr, vectors_arr, signal_arr, frame_shape, config, cv2):
     height_px, width_px = frame_shape[:2]
     cx, cy, rx, ry, ratio = _surface_geometry(points_arr, frame_shape, config)
 
@@ -138,7 +215,9 @@ def _low_res_contact_map(points_arr, signal_arr, frame_shape, config, cv2):
     dy = gy[..., None] - points_arr[:, 1]
     dist2 = dx * dx + dy * dy
 
-    sigma = max(8.0, min(rx, ry) * 0.22)
+    sigma_fraction = float(np.clip(getattr(config, "spatial_sigma_fraction", 0.10), 0.04, 0.35))
+    sigma_min_px = max(1.0, float(getattr(config, "spatial_sigma_min_px", 5.0)))
+    sigma = max(sigma_min_px, min(rx, ry) * sigma_fraction)
     weights = np.exp(-dist2 / (2.0 * sigma * sigma)).astype(np.float32)
     weight_sum = np.sum(weights, axis=-1)
     contact_low = np.sum(weights * signal_arr, axis=-1)
@@ -147,6 +226,21 @@ def _low_res_contact_map(points_arr, signal_arr, frame_shape, config, cv2):
         weight_sum,
         out=np.zeros_like(contact_low),
         where=weight_sum > 1e-6,
+    )
+
+    signal_weights = weights * signal_arr.reshape(1, 1, -1)
+    signal_weight_sum = np.sum(signal_weights, axis=-1)
+    vec_x_low = np.divide(
+        np.sum(signal_weights * vectors_arr[:, 0], axis=-1),
+        signal_weight_sum,
+        out=np.zeros_like(contact_low),
+        where=signal_weight_sum > 1e-6,
+    )
+    vec_y_low = np.divide(
+        np.sum(signal_weights * vectors_arr[:, 1], axis=-1),
+        signal_weight_sum,
+        out=np.zeros_like(contact_low),
+        where=signal_weight_sum > 1e-6,
     )
 
     if np.any(grid_mask):
@@ -161,6 +255,48 @@ def _low_res_contact_map(points_arr, signal_arr, frame_shape, config, cv2):
     if cv2 is not None:
         contact_low = cv2.GaussianBlur(contact_low, (0, 0), sigmaX=1.0, sigmaY=1.0)
         contact_low = np.where(grid_mask, contact_low, 0.0).astype(np.float32)
+
+    vec_x_low = np.where(grid_mask, vec_x_low * confidence, 0.0).astype(np.float32)
+    vec_y_low = np.where(grid_mask, vec_y_low * confidence, 0.0).astype(np.float32)
+    if cv2 is not None:
+        vec_x_low = cv2.GaussianBlur(vec_x_low, (0, 0), sigmaX=1.0, sigmaY=1.0)
+        vec_y_low = cv2.GaussianBlur(vec_y_low, (0, 0), sigmaX=1.0, sigmaY=1.0)
+        vec_x_low = np.where(grid_mask, vec_x_low, 0.0).astype(np.float32)
+        vec_y_low = np.where(grid_mask, vec_y_low, 0.0).astype(np.float32)
+
+    grid_dx = float(abs(grid_x[1] - grid_x[0])) if grid_w > 1 else 1.0
+    grid_dy = float(abs(grid_y[1] - grid_y[0])) if grid_h > 1 else 1.0
+    dux_dx = np.gradient(vec_x_low, grid_dx, axis=1)
+    duy_dy = np.gradient(vec_y_low, grid_dy, axis=0)
+    dux_dy = np.gradient(vec_x_low, grid_dy, axis=0)
+    duy_dx = np.gradient(vec_y_low, grid_dx, axis=1)
+    strain_low = np.sqrt(
+        np.maximum(
+            0.0,
+            (dux_dx + duy_dy) ** 2 + 0.35 * ((dux_dy + duy_dx) ** 2),
+        )
+    ).astype(np.float32)
+    strain_low = _normalize_field(strain_low, grid_mask)
+    if cv2 is not None:
+        strain_low = cv2.GaussianBlur(strain_low, (0, 0), sigmaX=1.2, sigmaY=1.2)
+        strain_low = np.where(grid_mask, strain_low, 0.0).astype(np.float32)
+
+    strain_blend = float(np.clip(getattr(config, "strain_blend", 0.68), 0.0, 1.0))
+    if strain_blend > 0.0:
+        contact_low = np.where(
+            grid_mask,
+            ((1.0 - strain_blend) * contact_low) + (strain_blend * strain_low),
+            0.0,
+        ).astype(np.float32)
+
+    fill_low = _interior_fill_map(points_arr, signal_arr, cx, cy, rx, ry, grid_mask, grid_w, grid_h, cv2)
+    fill_blend = float(np.clip(getattr(config, "interior_fill_blend", 0.68), 0.0, 1.0))
+    if fill_blend > 0.0:
+        contact_low = np.where(
+            grid_mask,
+            ((1.0 - fill_blend) * contact_low) + (fill_blend * fill_low),
+            0.0,
+        ).astype(np.float32)
 
     ellipse_mask = _ellipse_mask((height_px, width_px), cx, cy, rx, ry)
     contact_full = _resize_to_frame(contact_low, (width_px, height_px), cv2)
@@ -259,11 +395,14 @@ def build_tactile_contact_frame(
     )
     scale = max(float(config.min_contact_scale_px), observed_scale)
     if previous_scale_px is not None and np.isfinite(previous_scale_px):
-        scale = max(float(config.min_contact_scale_px), (0.85 * previous_scale_px) + (0.15 * scale))
+        scale = max(float(config.min_contact_scale_px), (0.65 * previous_scale_px) + (0.35 * scale))
 
     signal_norm = np.clip(raw_signal / max(scale, 1e-6), 0.0, 1.0)
+    signal_gamma = float(np.clip(getattr(config, "signal_gamma", 0.72), 0.45, 1.5))
+    signal_norm = np.power(signal_norm, signal_gamma).astype(np.float32)
     contact_map, base_map, ellipse_mask = _low_res_contact_map(
         points_arr,
+        residual_vectors,
         signal_norm,
         frame_shape,
         config,

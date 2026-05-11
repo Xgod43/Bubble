@@ -48,7 +48,6 @@ def main() -> int:
     check_import("libcamera controls", "libcamera", required=False)
     check_import("Adafruit Blinka board module", "board", required=False)
     check_import("MPRLS pressure module", "adafruit_mprls", required=False)
-    check_import("pywebview desktop shell", "webview", required=False)
 
     hx_paths = [
         ROOT / "library" / "hx711py" / "hx711v0_5_1.py",
@@ -62,15 +61,14 @@ def main() -> int:
     check_file("Native detector build", ROOT / "native" / "build" / "libbubble_detect.so", required=False)
     runner_path = ROOT / "native" / "build" / ("stepper_runner.exe" if sys.platform.startswith("win") else "stepper_runner")
     check_file("Native stepper runner", runner_path, required=False)
-    check_file("Exported Next.js UI", ROOT / "nextjs-gui" / "out" / "index.html", required=False)
 
     try:
         from backend.mission_control import MissionControlState
 
         MissionControlState().build_snapshot()
-        print("[OK]   Desktop backend state")
+        print("[OK]   Mission-control backend state")
     except Exception as exc:
-        print(f"[FAIL] Desktop backend state: {exc}")
+        print(f"[FAIL] Mission-control backend state: {exc}")
         ok = False
 
     print()

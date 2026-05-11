@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib
 import sys
 import traceback
 from pathlib import Path
@@ -9,24 +8,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-
-
-def desktop_frontend_ready() -> bool:
-    return (ROOT / "nextjs-gui" / "out" / "index.html").exists()
-
-
-def can_launch_desktop_shell() -> bool:
-    try:
-        importlib.import_module("webview")
-        return True
-    except Exception:
-        return False
-
-
-def launch_desktop_app() -> None:
-    from desktop_app.main import main as desktop_main
-
-    desktop_main()
 
 
 def launch_modern_python_gui() -> None:
@@ -57,13 +38,6 @@ def main() -> None:
         return
     except Exception as exc:
         write_launch_diagnostic("modern_python_gui", exc)
-
-    if desktop_frontend_ready() and can_launch_desktop_shell():
-        try:
-            launch_desktop_app()
-            return
-        except Exception as exc:
-            write_launch_diagnostic("desktop_app", exc)
 
     launch_legacy_gui()
 
